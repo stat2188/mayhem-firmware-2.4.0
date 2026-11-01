@@ -1,0 +1,898 @@
+#ifndef DRONE_TYPES_HPP
+#define DRONE_TYPES_HPP
+
+#include <cstdint>
+#include <cstddef>
+#include <array>
+#include "freqman_types.hpp"
+
+namespace drone_analyzer {
+
+/**
+ * @brief Type alias for frequency in Hz
+ */
+using FreqHz = uint64_t;
+
+/**
+ * @brief Inclusive frequency range [start_hz, end_hz] (POD, 16 bytes)
+ * @note A slot is DISABLED iff both fields are 0 (the default).
+ * @note A slot is VALID iff start_hz > 0 && end_hz > 0 && start_hz <= end_hz.
+ * @note UI-side representation only (drone_sweep_view WindowData). The
+ *       persisted/config storage is the MHz mirror (uint32 pairs — see
+ *       ScanConfig / SettingsStruct); the detection gate expands MHz→Hz —
+ *       see SweepProcessor::is_detection_window_allowed().
+ */
+struct FreqRangeHz {
+    FreqHz start_hz{0};  //< range lower bound (Hz); 0 = unset
+    FreqHz end_hz{0};    //< range upper bound (Hz); 0 = unset
+};
+
+/**
+ * @brief Type alias for signal strength (RSSI)
+ */
+using RssiValue = int32_t;
+
+/**
+ * @brief Type alias for system time (ChibiOS)
+ */
+using SystemTime = uint32_t;
+
+/**
+ * @brief Drone type classification
+ */
+enum class DroneType : uint8_t {
+    UNKNOWN = 0,
+    DJI = 1,
+    PARROT = 2,
+    YUNEEC = 3,
+    DR_3DR = 4,
+    AUTEL = 5,
+    HOBBY = 6,
+    FPV = 7,
+    CUSTOM = 8,
+    OTHER = 255
+};
+
+/**
+ * @brief Threat level classification
+ */
+enum class ThreatLevel : uint8_t {
+    NONE = 0,
+    LOW = 1,
+    MEDIUM = 2,
+    HIGH = 3,
+    CRITICAL = 4
+};
+
+/**
+ * @brief Scanning mode
+ * @note SPECTROMETER: Wideband spectrum analysis using 20MHz slices (like Looking Glass)
+ */
+enum class ScanningMode : uint8_t {
+    SEQUENTIAL = 0,
+};
+
+/**
+ * @brief Scanner state
+ */
+enum class ScannerState : uint8_t {
+    IDLE = 0,
+    SCANNING = 1,
+    LOCKING = 2,
+    TRACKING = 3,
+    PAUSED = 4,
+    ERROR = 5
+};
+
+/**
+ * @brief Movement trend for tracked drones
+ */
+enum class MovementTrend : uint8_t {
+    UNKNOWN = 0,
+    STATIC = 1,
+    APPROACHING = 2,
+    RECEDING = 3
+};
+
+
+/**
+ * @brief Error codes for EDA operations
+ * @note All errors are recoverable or have fallback behavior
+ */
+enum class ErrorCode : uint8_t {
+    SUCCESS = 0,
+    
+    // Hardware errors (1-9)
+    HARDWARE_NOT_INITIALIZED = 1,
+    HARDWARE_TIMEOUT = 2,
+    HARDWARE_FAILURE = 3,
+    SPI_FAILURE = 4,
+    PLL_LOCK_FAILURE = 5,
+    
+    // Database errors (10-19)
+    DATABASE_NOT_LOADED = 10,
+    DATABASE_LOAD_TIMEOUT = 11,
+    DATABASE_CORRUPTED = 12,
+    DATABASE_EMPTY = 13,
+    DATABASE_FORMAT_INVALID = 14,
+    
+    // Buffer errors (20-29)
+    BUFFER_EMPTY = 20,
+    BUFFER_FULL = 21,
+    BUFFER_INVALID = 22,
+    
+    // Synchronization errors (30-39)
+    MUTEX_TIMEOUT = 30,
+    MUTEX_LOCK_FAILED = 31,
+    SEMAPHORE_TIMEOUT = 32,
+    
+    // Initialization errors (40-49)
+    INITIALIZATION_FAILED = 40,
+    INITIALIZATION_INCOMPLETE = 41,
+    
+    // General errors (50-59)
+    INVALID_PARAMETER = 50,
+    NOT_IMPLEMENTED = 51,
+    FILE_SYSTEM_ERROR = 52,
+    UNKNOWN_ERROR = 255
+};
+
+/**
+ * @brief Result type similar to std::optional<T> with error code
+ * @note No heap allocation, uses static storage
+ * @tparam T Type of value to store
+ */
+template<typename T>
+class ErrorResult {
+public:
+    ErrorResult() noexcept
+        : has_value_(false), error_(ErrorCode::UNKNOWN_ERROR), value_{} {}
+
+    explicit ErrorResult(const T& value) noexcept
+        : has_value_(true), error_(ErrorCode::SUCCESS), value_(value) {}
+
+    explicit ErrorResult(ErrorCode error) noexcept
+        : has_value_(false), error_(error), value_{} {}
+
+    [[nodiscard]] bool has_value() const noexcept {
+        return has_value_;
+    }
+
+    [[nodiscard]] bool is_valid() const noexcept {
+        return has_value_ || error_ == ErrorCode::SUCCESS;
+    }
+
+    [[nodiscard]] ErrorCode error() const noexcept {
+        return error_;
+    }
+
+    [[nodiscard]] const T& value() const noexcept {
+        return value_;
+    }
+
+    [[nodiscard]] T value_or(const T& default_value) const noexcept {
+        return has_value_ ? value_ : default_value;
+    }
+
+    [[nodiscard]] static ErrorResult<T> success(const T& value) noexcept {
+        return ErrorResult<T>(value);
+    }
+
+    [[nodiscard]] static ErrorResult<T> failure(ErrorCode error) noexcept {
+        return ErrorResult<T>(error);
+    }
+
+private:
+    bool has_value_;
+    ErrorCode error_;
+    T value_;
+};
+
+// ============================================================================
+// Mahalanobis Statistics (POD type - no heap allocation)
+// ============================================================================
+
+/**
+ * @brief Mahalanobis statistics for outlier detection
+ * @note POD type - no virtual functions, no heap allocation
+ * @note Stored in Q8.8 fixed-point format
+ */
+struct MahalanobisStatistics {
+    using FeatureVector = std::array<int16_t, 2>;
+
+    FeatureVector mean{};           ///< Running mean (Q8.8)
+    FeatureVector variance{};       ///< Running variance (Q8.8)
+    std::array<FeatureVector, 8> history{};  ///< Sample history
+    uint8_t sample_count{0};     ///< Number of samples collected
+    uint8_t history_index{0};    ///< Circular buffer index
+    FreqHz last_tuned_frequency{0}; ///< Previous tuned frequency for drift measurement
+};
+
+template<>
+class ErrorResult<void> {
+public:
+    ErrorResult() noexcept
+        : error_(ErrorCode::SUCCESS) {}
+
+    explicit ErrorResult(ErrorCode error) noexcept
+        : error_(error) {}
+
+    [[nodiscard]] bool is_valid() const noexcept {
+        return error_ == ErrorCode::SUCCESS;
+    }
+
+    [[nodiscard]] ErrorCode error() const noexcept {
+        return error_;
+    }
+
+    [[nodiscard]] static ErrorResult<void> success() noexcept {
+        return ErrorResult<void>();
+    }
+
+    [[nodiscard]] static ErrorResult<void> failure(ErrorCode error) noexcept {
+        return ErrorResult<void>(error);
+    }
+
+private:
+    ErrorCode error_;
+};
+
+// ============================================================================
+// Struct Definitions (must appear before functions that use them)
+// ============================================================================
+
+/**
+ * @brief Configurable RSSI threat level thresholds (dBm)
+ * @note Passed to TrackedDrone::update_rssi() for threat classification
+ */
+struct ThreatThresholds {
+    int32_t low;
+    int32_t medium;
+    int32_t high;
+    int32_t critical;
+};
+
+/**
+ * @brief Tracked drone data structure (~160 bytes with alignment)
+ * @note No virtual functions, no vtable
+ * @note Memory layout optimized for cache efficiency
+ * @note Size breakdown: 128B base fields + 48B Mahalanobis + 8B sweep fields
+ *       + trend hysteresis. 16 drones × 160B = 2,560B BSS.
+ */
+struct TrackedDrone {
+    FreqHz frequency;                    // 8 bytes (uint64_t)
+    FreqHz measured_frequency_{0};       // 8 bytes — bin-corrected detected frequency for display
+    DroneType drone_type;              // 1 byte (uint8_t)
+    uint8_t label_idx_{0};              // 1 byte — detection-range LABEL index
+                                        // (RANGE_NAMES, 0 = none). Fills the
+                                        // existing alignment pad → sizeof
+                                        // TrackedDrone stays ~160 B.
+    ThreatLevel threat_level;           // 1 byte (uint8_t)
+    uint8_t update_count;              // 1 byte
+    SystemTime last_seen;              // 4 bytes (uint32_t on ChibiOS)
+    RssiValue rssi;                    // 4 bytes
+    int16_t rssi_history_[6];              // 12 bytes (6 × int16_t) — RSSI_HISTORY_SIZE
+    SystemTime timestamp_history_[6];       // 24 bytes (6 × uint32_t) — must match RSSI_HISTORY_SIZE
+    uint16_t history_index_;          // 2 bytes — monotonic write cursor (uint16: no wrap at 256)
+    uint8_t missed_cycles_;             // 1 byte — consecutive scans without detection
+    int16_t last_rssi_;                 // 2 bytes — RSSI from previous cycle (for decay)
+    uint8_t rssi_decrease_counter_;     // 1 bytes — consecutive cycles with RSSI decrease
+    bool rssi_increased_;               // 1 byte — set true when new RSSI > previous
+    SystemTime last_increase_time_;     // 4 bytes — timestamp when RSSI last increased (for time-based decay)
+    SystemTime created_time_;           // 4 bytes — timestamp when drone was first detected (min lifetime)
+
+    // Sweep-aware decay fields (cycle-based for sweep mode)
+    SystemTime last_seen_time_;         // 4 bytes — timestamp when drone was last seen (ANY detection)
+    uint8_t sweep_cycles_missed_{0};    // 1 byte — consecutive full sweep cycles without seeing this drone
+    static constexpr uint8_t MAX_SWEEP_CYCLES_MISSED = 3;  // Legacy fallback when CYC==0 (normally CYC drives the budget — see apply_rssi_decay)
+
+    // ========================================================================
+    // Sweep-mode trend tracking (cycle-peak comparison)
+    // In sweep mode, rssi_history_ is contaminated by mixed frequencies.
+    // We track per-cycle peak RSSI instead and compare consecutive cycles.
+    // ========================================================================
+    bool sweep_mode_active_{false};             // 1 byte — true when drone detected in sweep mode
+    static constexpr int16_t SWEEP_CYCLE_PEAK_INVALID_DBM = -200;  // sentinel (below RSSI_MIN_DBM)
+    int16_t last_cycle_peak_rssi_{SWEEP_CYCLE_PEAK_INVALID_DBM};  // 2 bytes — peak RSSI accumulating this sweep cycle (sentinel = not yet seen)
+    int16_t prev_cycle_peak_rssi_{SWEEP_CYCLE_PEAK_INVALID_DBM};  // 2 bytes — peak RSSI from previous cycle (sentinel = not yet available)
+    bool has_prev_cycle_peak_{false};           // 1 byte — true after a cycle with a real peak has completed
+
+    // ========================================================================
+    // Trend hysteresis (prevents icon flicker)
+    // A new raw trend must agree for TREND_HYSTERESIS_COUNT consecutive
+    // evaluations before the displayed trend changes.
+    // Mutable: modified by const get_movement_trend() for hysteresis state.
+    //
+    // @invariant These fields are ONLY meaningful on the PERSISTENT
+    //            TrackedDrone objects owned by DroneScanner::tracked_drones_.
+    //            get_tracked_drones() evaluates the hysteresis on the
+    //            originals before copying, so copies carry the resolved
+    //            state and DisplayDroneEntry sees a stable trend across the
+    //            sentinel gap after finalize_sweep_cycle(). Do NOT evaluate
+    //            get_movement_trend() on throwaway copies as the sole
+    //            hysteresis carrier — the state would be discarded and every
+    //            UNKNOWN gap would display '-' (UNKNOWN).
+    // ========================================================================
+    mutable MovementTrend cached_trend_{MovementTrend::UNKNOWN};
+    mutable uint8_t trend_hold_count_{0};
+    static constexpr uint8_t TREND_HYSTERESIS_COUNT = 3;
+
+    // ========================================================================
+    // Mahalanobis statistics
+    // ========================================================================
+
+    /**
+     * @brief Mahalanobis statistics for this tracked drone
+     * @note Used for outlier detection
+     */
+    MahalanobisStatistics mahalanobis_stats_;
+
+    /**
+     * @brief Get reference to Mahalanobis statistics
+     */
+    [[nodiscard]] MahalanobisStatistics& get_mahalanobis_stats() noexcept {
+        return mahalanobis_stats_;
+    }
+
+    /**
+     * @brief Get const reference to Mahalanobis statistics
+     */
+    [[nodiscard]] const MahalanobisStatistics& get_mahalanobis_stats() const noexcept {
+        return mahalanobis_stats_;
+    }
+
+    // Total: ~128 bytes base fields + 48 bytes MahalanobisStatistics + ~16 bytes sweep/hysteresis
+    // = ~160 bytes (no vtable, no virtual functions). 16 drones × 160B = 2,560B BSS.
+    
+    /**
+     * @brief Default constructor
+     */
+    TrackedDrone() noexcept;
+    
+    /**
+     * @brief Constructor with initial values
+     */
+    TrackedDrone(
+        FreqHz freq,
+        DroneType type,
+        ThreatLevel threat
+    ) noexcept;
+    
+    /**
+     * @brief Update drone with new RSSI reading
+     * @note rssi (display/peak) is only updated when new_rssi is stronger —
+     *       weaker detections refresh history and last_seen but do NOT overwrite
+     *       the displayed RSSI or the threat classification baseline.
+     *       last_rssi_ (trend baseline) is always updated to track signal trajectory.
+     */
+    void update_rssi(RssiValue new_rssi, SystemTime timestamp, const ThreatThresholds& thresholds) noexcept;
+
+    /**
+     * @brief Set the bin-corrected (measured) frequency
+     * @param freq Actual detected RF frequency from FFT peak (Hz)
+     * @note Stored separately from `frequency` (the tune/DB key) so the
+     *       tracking identity stays stable while the display value is exact.
+     * @warning MRG ANTI-REWRITE RULE: this must only be called for the
+     *          STRONGEST observation of the record. Prefer
+     *          anchor_signature(), which applies that rule for both the key
+     *          and the display value at once — writing it from every weak
+     *          detection makes the UI frequency jitter and lets a train of
+     *          weak samples walk the record across the whole match radius.
+     */
+    void set_measured_frequency(FreqHz freq) noexcept { measured_frequency_ = freq; }
+
+    /**
+     * @brief True when an observation is STRICTLY stronger than the record peak
+     * @param observed_rssi RSSI of the observation (dBm)
+     * @return true when this observation is a new record peak for the entry
+     * @note The reference is `rssi` — the monotonic display peak.
+     *       update_rssi() only ever RAISES it (weaker detections never lower
+     *       it), so it is an exact "strongest observation so far" mark.
+     * @note WEAKER detections must never move the record's signature (see
+     *       anchor_signature()): a train of weak samples inside the MRG radius
+     *       would otherwise walk the tracking key away from the real emitter
+     *       and make the displayed frequency jitter frame to frame.
+     * @note Stack: 0 B. Flash: ~8 bytes (single 16-bit compare).
+     */
+    [[nodiscard]] bool is_record_peak(RssiValue observed_rssi) const noexcept {
+        return observed_rssi > rssi;
+    }
+
+    /**
+     * @brief Pin this entry's signature (matching key + displayed frequency)
+     *        onto ONE observation
+     * @param freq Match/tracking frequency of that observation (Hz)
+     * @param measured_freq Bin-corrected frequency to display for that same
+     *                      observation, 0 = none available → the key itself is
+     *                      shown (get_display_frequency() fallback)
+     * @pre The caller ruled the observation in via is_record_peak() BEFORE
+     *      update_rssi() folded the same sample into the record: the
+     *      comparison there is against `rssi`, which update_rssi() raises.
+     * @note MRG ANTI-REWRITE RULE: only the strongest observation may redefine
+     *       WHO the record describes. Weaker repeats still refresh history,
+     *       trend, decay clocks and last_seen (via update_rssi()/observe_rssi())
+     *       — they simply keep the strongest signature.
+     * @note Both fields are written together so the displayed frequency can
+     *       never describe a different observation than the matching key.
+     * @note Stack: 0 B. Flash: ~24 bytes.
+     */
+    void anchor_signature(FreqHz freq, FreqHz measured_freq = 0) noexcept {
+        frequency = freq;
+        measured_frequency_ = (measured_freq != 0) ? measured_freq : freq;
+    }
+
+    /**
+     * @brief Get the frequency to display
+     * @return Bin-corrected measured frequency if set, else the tuning key
+     */
+    [[nodiscard]] FreqHz get_display_frequency() const noexcept {
+        return (measured_frequency_ != 0) ? measured_frequency_ : frequency;
+    }
+
+    /**
+     * @brief Get average RSSI from history
+     */
+    [[nodiscard]] RssiValue get_average_rssi() const noexcept;
+    
+    /**
+     * @brief Get movement trend based on RSSI history
+     */
+    [[nodiscard]] MovementTrend get_movement_trend() const noexcept;
+
+    /**
+     * @brief Get current threat level
+     */
+    [[nodiscard]] ThreatLevel get_threat() const noexcept {
+        return threat_level;
+    }
+
+    /**
+     * @brief Check if drone is stale (not seen recently)
+     */
+    [[nodiscard]] bool is_stale(SystemTime current_time, SystemTime timeout_ms) const noexcept;
+
+    /**
+     * @brief Decay threat level by one step (CRITICAL→HIGH→MEDIUM→LOW→NONE)
+     * @return true if threat is now NONE (should be removed)
+     */
+    bool decay_threat() noexcept;
+
+    /**
+     * @brief Mark drone as seen at current time (for sweep-aware decay)
+     * @param now Current system time
+     * @param peak_rssi Current sweep-frame peak RSSI for this drone
+     * @note Resets sweep_cycles_missed_. Only sets rssi_increased_ when
+     *       peak_rssi actually exceeds the previous cycle's peak, allowing
+     *       apply_rssi_decay() to trigger threat decay when the signal weakens.
+     */
+    void mark_seen(SystemTime now, RssiValue peak_rssi) noexcept {
+        last_seen_time_ = now;
+        sweep_cycles_missed_ = 0;
+        // Only flag as "increased" when the new cycle peak exceeds the previous
+        // cycle's peak. Previously this was unconditionally true, which prevented
+        // apply_rssi_decay() from ever activating in sweep mode.
+        if (prev_cycle_peak_rssi_ != SWEEP_CYCLE_PEAK_INVALID_DBM
+            && peak_rssi > prev_cycle_peak_rssi_) {
+            rssi_increased_ = true;
+            last_increase_time_ = now;
+        }
+    }
+
+    /**
+     * @brief Increment missed sweep cycle counter
+     * @note Called at end of each full sweep cycle when drone was NOT seen
+     */
+    void increment_missed_cycle() noexcept {
+        if (sweep_cycles_missed_ < 255) {
+            ++sweep_cycles_missed_;
+        }
+    }
+
+    /**
+     * @brief Update cycle-peak RSSI for sweep-mode trend tracking
+     * @param peak_rssi Peak RSSI detected in current sweep frame
+     * @note Called from apply_sweep_tracking() per detection in sweep mode.
+     *       Tracks the maximum RSSI across all frequencies in one sweep cycle.
+     * @pre finalize_sweep_cycle() resets last_cycle_peak_rssi_ to the sentinel
+     *      at each pair boundary, so this accumulator is per-cycle, not monotonic.
+     */
+    void update_cycle_peak(RssiValue peak_rssi) noexcept {
+        sweep_mode_active_ = true;
+        if (peak_rssi > last_cycle_peak_rssi_) {
+            last_cycle_peak_rssi_ = static_cast<int16_t>(peak_rssi);
+        }
+    }
+
+    /**
+     * @brief Hand off cycle-peak at sweep cycle boundary
+     * @note Called at pair_complete (full sweep round-robin pass done).
+     *       If the drone produced a real peak this pass, copies it to
+     *       prev_cycle_peak_rssi_ and resets last_cycle_peak_rssi_ to the
+     *       sentinel. If the drone was not seen this pass, both values are
+     *       left untouched so prev_cycle_peak_rssi_ keeps the most recent
+     *       real peak. get_movement_trend() gates on the sentinel, so a
+     *       half-cycle gap never produces false RECEDING from the sentinel.
+     */
+    void finalize_sweep_cycle() noexcept {
+        if (last_cycle_peak_rssi_ != SWEEP_CYCLE_PEAK_INVALID_DBM) {
+            prev_cycle_peak_rssi_ = last_cycle_peak_rssi_;
+            has_prev_cycle_peak_ = true;
+            last_cycle_peak_rssi_ = SWEEP_CYCLE_PEAK_INVALID_DBM;
+        }
+    }
+
+    /**
+     * @brief Clear sweep-mode flag when returning to normal scanning
+     * @note Called from apply_rssi_decay(false) to re-enable rssi_history_-based trend
+     */
+    void clear_sweep_mode() noexcept {
+        sweep_mode_active_ = false;
+    }
+
+    /**
+     * @brief Reset missed cycles counter (drone was detected)
+     */
+    void reset_missed() noexcept { missed_cycles_ = 0; }
+
+    /**
+     * @brief Increment missed cycles counter
+     */
+    void increment_missed() noexcept { missed_cycles_++; }
+
+    /**
+     * @brief Get missed cycles count
+     */
+    [[nodiscard]] uint8_t get_missed_cycles() const noexcept { return missed_cycles_; }
+
+    /**
+     * @brief Record an RSSI observation WITHOUT threat reclassification
+     * @param observed_rssi Raw RSSI sample (dBm)
+     * @param timestamp Sample time (ms)
+     * @note Used by the RSSI-variance noise gate: the sample refreshes the
+     *       history (so the variance can recover below the threshold instead
+     *       of staying frozen above it) and keeps last_seen fresh (the
+     *       tracker stays alive while the noisy signal persists), but the
+     *       threat level is deliberately NOT re-evaluated from chaotic samples.
+     */
+    void observe_rssi(RssiValue observed_rssi, SystemTime timestamp) noexcept {
+        // Array-size derivation instead of RSSI_HISTORY_SIZE / TIMESTAMP_HISTORY_SIZE:
+        // this header must not include constants.hpp (constants.hpp includes THIS
+        // header — circular). constants.hpp static_asserts both sizes == 6 and
+        // that they match rssi_history_[6] / timestamp_history_[6] declared below.
+        constexpr size_t rssi_history_len = sizeof(rssi_history_) / sizeof(rssi_history_[0]);
+        constexpr size_t timestamp_history_len = sizeof(timestamp_history_) / sizeof(timestamp_history_[0]);
+        const size_t write_idx = history_index_ % rssi_history_len;
+        rssi_history_[write_idx] = static_cast<int16_t>(observed_rssi);
+        timestamp_history_[write_idx % timestamp_history_len] = timestamp;
+        history_index_++;
+        if (update_count < rssi_history_len) {
+            update_count++;
+        }
+        last_seen = timestamp;
+    }
+
+    /**
+     * @brief Merge another tracked drone into this one (duplicate consolidation)
+     * @param other Entry being absorbed (the caller drops it right afterwards)
+     * @note Called when two tracker entries lie within the MRG radius of the
+     *       ANCHOR of the same detection (the strongest in-radius entry): the
+     *       anchor absorbs the duplicates, so its RSSI history, sweep cycle
+     *       peaks and decay state continue as ONE continuous stream — the
+     *       close-frequency detection then updates the anchor exactly as if
+     *       it had always been the only ("current") entry for that emitter.
+     *       Lower-severity threats NEVER displace higher-severity ones —
+     *       CRITICAL always survives over LOW regardless of age or strength
+     *       (anchor order: threat, then recent_strength, then oldest).
+     *       See DroneScanner::match_and_consolidate_drone_internal().
+     * @note Fixed-size merge: at most 6 + 6 = 12 history samples, the newest
+     *       6 (by timestamp) survive. Stack: ~128 bytes. No heap. No loops
+     *       longer than 12 iterations (insertion sort, max 66 comparisons).
+     * @note Trend continuity: last_rssi_ is restored from the merged history's
+     *       newest sample so the next update_rssi() comparison is against the
+     *       correct chronological predecessor. Trend hysteresis is adopted from
+     *       the absorbed drone when the anchor's cached_trend_ is UNKNOWN
+     *       (newly created drone), preventing trend resets after merges.
+     * @pre this != &other
+     * @pre Caller holds DATA_MUTEX, or has exclusive tracker access
+     *      (sweep mode: scanner thread stopped, UI thread idle)
+     */
+    void absorb_from(const TrackedDrone& other) noexcept;
+
+
+    /**
+     * @brief Calculate RSSI variance from history (integer arithmetic)
+     * @return Variance value (0 if insufficient samples)
+     * @note Real drones: variance < 25 (stable signal)
+     * @note Noise: variance > 100 (chaotic fluctuations)
+     * @note Uses int16_t history, promotes to int32_t for variance calc
+     */
+    [[nodiscard]] uint32_t calculate_rssi_variance() const noexcept {
+        if (history_index_ < 2) return 0;
+        const uint8_t n = (history_index_ < 6) ? history_index_ : 6;
+        int32_t sum = 0;
+        for (uint8_t i = 0; i < n; ++i) {
+            sum += static_cast<int32_t>(rssi_history_[i]);
+        }
+        const int32_t mean = sum / static_cast<int32_t>(n);
+        uint32_t variance = 0;
+        for (uint8_t i = 0; i < n; ++i) {
+            const int32_t diff = static_cast<int32_t>(rssi_history_[i]) - mean;
+            variance += static_cast<uint32_t>(diff * diff);
+        }
+        return variance / static_cast<uint32_t>(n);
+    }
+};
+
+/**
+ * @brief Display drone entry for UI (~48 bytes with alignment)
+ * @note POD type, no vtable.
+ */
+struct DisplayDroneEntry {
+    FreqHz frequency;           // 8 bytes - Drone frequency
+    DroneType type;             // 1 byte (uint8_t)
+    ThreatLevel threat;         // 1 byte (uint8_t)
+    RssiValue rssi;            // 4 bytes
+    SystemTime last_seen;       // 4 bytes
+    char type_name[16];         // 16 bytes
+    uint32_t display_color;     // 4 bytes (RGBA)
+    MovementTrend trend;        // 1 byte (uint8_t)
+    int16_t last_rssi;          // 2 bytes — latest RSSI sample (render-sort key,
+                                // matches TrackedDrone::last_rssi_)
+    // Total: 48 bytes (no vtable, POD type; int16 fills existing padding)
+    
+    /**
+     * @brief Default constructor
+     */
+    DisplayDroneEntry() noexcept;
+    
+    /**
+     * @brief Constructor from TrackedDrone
+     */
+    explicit DisplayDroneEntry(const TrackedDrone& drone) noexcept;
+    
+    /**
+     * @brief Set display color based on threat level
+     */
+    void set_color_from_threat() noexcept;
+    
+    /**
+     * @brief Get type name string
+     */
+    [[nodiscard]] const char* get_type_name() const noexcept;
+};
+
+/**
+ * @brief Scanner state snapshot
+ */
+struct ScannerStateSnapshot {
+    ThreatLevel max_detected_threat;
+    size_t approaching_count;
+    size_t static_count;
+    size_t receding_count;
+    bool scanning_active;
+    bool is_fresh;
+    
+    /**
+     * @brief Default constructor
+     */
+    ScannerStateSnapshot() noexcept;
+};
+
+/**
+ * @brief Display data for UI updates
+ */
+struct DisplayData {
+    DisplayDroneEntry drones[12];     // 12 × ~64 = ~768 bytes
+    size_t drone_count;
+    ScannerStateSnapshot state;
+    
+    /**
+     * @brief Default constructor
+     */
+    DisplayData() noexcept;
+    
+    /**
+     * @brief Clear display data
+     */
+    void clear() noexcept;
+};
+
+// ============================================================================
+// FreqmanDB Embedded-Compatible Types
+// ============================================================================
+
+/**
+ * @brief freqman_type is defined in freqman_types.hpp
+ * @note No heap allocation, embedded-safe enum definition
+ */
+
+/**
+ * @brief Embedded-compatible freqman entry (no std::string, no heap)
+ * @note 80 bytes total, aligned for 8-byte access
+ * @note Replaces std::string-based freqman_entry from Mayhem core
+ */
+struct freqman_entry_fixed {
+    int64_t frequency_a{0};
+    int64_t frequency_b{0};
+    char description[32];  // Fixed-size array, no std::string
+    freqman_type type{static_cast<freqman_type>(0)};
+    uint8_t modulation{255};  // freqman_invalid_index
+    uint8_t bandwidth{255};
+    uint8_t step{255};
+    uint8_t tone{255};
+    
+    // Total: 8 + 8 + 32 + 1 + 1 + 1 + 1 + 1 = 53 bytes (padded to 56)
+    
+    /**
+     * @brief Default constructor
+     */
+    freqman_entry_fixed() noexcept;
+    
+    /**
+     * @brief Constructor with values
+     */
+    freqman_entry_fixed(
+        int64_t freq_a,
+        int64_t freq_b,
+        const char* desc,
+        freqman_type t
+    ) noexcept;
+    
+    /**
+     * @brief Copy description safely
+     * @param src Source string
+     * @return ErrorCode::SUCCESS if copied, error otherwise
+     */
+    [[nodiscard]] ErrorCode set_description(const char* src) noexcept;
+    
+    /**
+     * @brief Check if entry is valid
+     */
+    [[nodiscard]] bool is_valid() const noexcept;
+};
+
+// ============================================================================
+// Validation Functions
+// ============================================================================
+
+/**
+ * @brief Validate spectrum data buffer
+ * @param spectrum_data Spectrum data buffer
+ * @param length Buffer length
+ * @return ErrorCode::SUCCESS if valid, error code otherwise
+ */
+[[nodiscard]] inline ErrorCode validate_spectrum_buffer(
+    const uint8_t* spectrum_data,
+    size_t length
+) noexcept {
+    if (spectrum_data == nullptr) {
+        return ErrorCode::BUFFER_INVALID;
+    }
+    if (length == 0) {
+        return ErrorCode::BUFFER_EMPTY;
+    }
+    if (length > 256) {
+        return ErrorCode::BUFFER_INVALID;
+    }
+    return ErrorCode::SUCCESS;
+}
+
+/**
+ * @brief Validate drone list buffer
+ * @param drones Drone list buffer
+ * @param count Number of drones
+ * @param max_count Maximum allowed count
+ * @return ErrorCode::SUCCESS if valid, error code otherwise
+ */
+[[nodiscard]] inline ErrorCode validate_drone_buffer(
+    const DisplayDroneEntry* drones,
+    size_t count,
+    size_t max_count
+) noexcept {
+    if (drones == nullptr) {
+        return ErrorCode::BUFFER_INVALID;
+    }
+    if (count > max_count) {
+        return ErrorCode::BUFFER_FULL;
+    }
+    return ErrorCode::SUCCESS;
+}
+
+// ============================================================================
+// Utility Functions
+// ============================================================================
+
+/**
+ * @brief Convert error code to human-readable string
+ * @param error Error code to convert
+ * @return Static string (Flash storage)
+ */
+[[nodiscard]] inline const char* error_to_string(ErrorCode error) noexcept {
+    switch (error) {
+        case ErrorCode::SUCCESS:
+            return "Success";
+        case ErrorCode::HARDWARE_NOT_INITIALIZED:
+            return "Hardware not initialized";
+        case ErrorCode::HARDWARE_TIMEOUT:
+            return "Hardware timeout";
+        case ErrorCode::HARDWARE_FAILURE:
+            return "Hardware failure";
+        case ErrorCode::SPI_FAILURE:
+            return "SPI failure";
+        case ErrorCode::PLL_LOCK_FAILURE:
+            return "PLL lock failure";
+        case ErrorCode::DATABASE_NOT_LOADED:
+            return "Database not loaded";
+        case ErrorCode::DATABASE_LOAD_TIMEOUT:
+            return "Database load timeout";
+        case ErrorCode::DATABASE_CORRUPTED:
+            return "Database corrupted";
+        case ErrorCode::DATABASE_EMPTY:
+            return "Database empty";
+        case ErrorCode::DATABASE_FORMAT_INVALID:
+            return "Database format invalid";
+        case ErrorCode::BUFFER_EMPTY:
+            return "Buffer empty";
+        case ErrorCode::BUFFER_FULL:
+            return "Buffer full";
+        case ErrorCode::BUFFER_INVALID:
+            return "Buffer invalid";
+        case ErrorCode::MUTEX_TIMEOUT:
+            return "Mutex timeout";
+        case ErrorCode::MUTEX_LOCK_FAILED:
+            return "Mutex lock failed";
+        case ErrorCode::SEMAPHORE_TIMEOUT:
+            return "Semaphore timeout";
+        case ErrorCode::INITIALIZATION_FAILED:
+            return "Initialization failed";
+        case ErrorCode::INITIALIZATION_INCOMPLETE:
+            return "Initialization incomplete";
+        case ErrorCode::INVALID_PARAMETER:
+            return "Invalid parameter";
+        case ErrorCode::NOT_IMPLEMENTED:
+            return "Not implemented";
+        case ErrorCode::UNKNOWN_ERROR:
+        default:
+            return "Unknown error";
+    }
+}
+
+/**
+ * @brief Safe string copy with bounds checking
+ * @param dest Destination buffer
+ * @param dest_size Destination buffer size (must be >= 2)
+ * @param src Source string
+ * @return ErrorCode::SUCCESS if copied, error otherwise
+ * @note Always null-terminates destination
+ * @note No heap allocation, uses inline implementation
+ */
+[[nodiscard]] inline ErrorCode safe_str_copy(
+    char* dest,
+    size_t dest_size,
+    const char* src
+) noexcept {
+    if (dest == nullptr || src == nullptr || dest_size < 2) {
+        return ErrorCode::BUFFER_INVALID;
+    }
+
+    size_t i = 0;
+    for (; i < dest_size - 1 && src[i] != '\0'; ++i) {
+        dest[i] = src[i];
+    }
+    dest[i] = '\0';
+
+    return ErrorCode::SUCCESS;
+}
+
+/**
+ * @brief Convert drone type enum to human-readable string
+ * @param type Drone type to convert
+ * @return Static string pointer (Flash storage, no heap allocation)
+ * @note Returns pointer to constexpr string constants in Flash
+ * @note Thread-safe (read-only data)
+ */
+[[nodiscard]] const char* drone_type_to_string(DroneType type) noexcept;
+
+} // namespace drone_analyzer
+
+#endif // DRONE_TYPES_HPP

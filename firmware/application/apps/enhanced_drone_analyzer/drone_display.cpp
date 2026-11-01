@@ -1,0 +1,1728 @@
+#include <cstdint>
+#include <cstring>
+#include <cstdio>
+#include <string_view>
+
+#include "drone_display.hpp"
+#include "ui_font_fixed_5x8.hpp"
+
+namespace drone_analyzer {
+
+// ============================================================================
+// Waterfall rendering constants
+// ============================================================================
+// Section header height for waterfall/spectrum titles.
+// draw_text_small() renders with fixed_5x8 font: an 8 px glyph box
+// (with opaque background). The header covers: 1 px top border + 8 px font
+// + 1 px gap = 10 px total.
+constexpr uint16_t WF_HEADER_H = 10;
+
+// Detection-window bracket glyph geometry (red title-strip overlay).
+// 1 px horizontal rail + 3 px end ticks: the tick drop matches the mini-font
+// cap height so the outline reads as [ ] over the 8 px title glyphs while
+// staying inside the 10 px header (no collision with bars below).
+constexpr uint16_t DET_BRACKET_RAIL_H = 1;
+constexpr uint16_t DET_BRACKET_TICK_H = 3;
+
+// ============================================================================
+// Drone list layout constants (single source for render, draw, and hit-test)
+// ============================================================================
+namespace {
+
+constexpr uint16_t LIST_PAD = 3;                 // horizontal padding around text
+constexpr uint16_t THREAT_SHIFT_CHARS = 3;       // threat nudged left of Col 1's right edge
+constexpr uint16_t GAP_CHARS = 1;                // min gap between type text and threat level
+constexpr uint16_t TYPE_MAX_CHARS = 7;           // type name truncated to this for layout
+constexpr uint16_t THREAT_MAX_CHARS = 4;         // longest threat label ("CRIT")
+constexpr uint16_t ENTRY_MIN_H = 26;             // min row height — still fits 5 entries
+constexpr uint16_t ENTRY_MAX_H = 40;             // cap so tall rows don't waste space
+constexpr size_t DUAL_COLUMN_MIN_COUNT = 6;      // split into 2 columns when >= 6 detections
+
+struct EntryLayout {
+    uint16_t col_w;   // cell width (list width when single column)
+    uint16_t rows;    // row count (drone_count when single column)
+    uint16_t entry_h; // height per row
+};
+
+EntryLayout compute_entry_layout(
+    size_t drone_count,
+    uint16_t width,
+    uint16_t height,
+    bool dual_column
+) noexcept {
+    EntryLayout layout;
+    if (dual_column && drone_count >= DUAL_COLUMN_MIN_COUNT) {
+        layout.rows = static_cast<uint16_t>((drone_count + 1) / 2);
+        layout.col_w = width / 2;
+    } else {
+        layout.rows = static_cast<uint16_t>(drone_count);
+        layout.col_w = width;
+    }
+
+    uint16_t entry_h = (layout.rows > 0) ? height / layout.rows : height;
+    if (entry_h > ENTRY_MAX_H) entry_h = ENTRY_MAX_H;
+    if (entry_h < ENTRY_MIN_H) entry_h = ENTRY_MIN_H;
+    layout.entry_h = entry_h;
+    return layout;
+}
+
+/// @brief Count set bits in a byte (active-window mask popcount).
+constexpr uint8_t count_bits8(uint8_t v) noexcept {
+    v = static_cast<uint8_t>(v - ((v >> 1) & 0x55u));
+    v = static_cast<uint8_t>((v & 0x33u) + ((v >> 2) & 0x33u));
+    return static_cast<uint8_t>((v + (v >> 4)) & 0x0Fu);
+}
+
+} // namespace
+
+// ============================================================================
+// Large buffers moved from DroneDisplay members to file-scope static.
+// Saves ~960 bytes of SRAM per DroneDisplay instance (BSS, not heap).
+// Thread-safety: single-producer (UI thread only) — no concurrent access.
+// ============================================================================
+struct DisplayBuffers {
+    std::array<uint8_t, SPECTRUM_BUFFER_SIZE> spectrum_sort{};
+    uint8_t composite_persist[COMPOSITE_SIZE]{};
+    uint8_t composite_sort[COMPOSITE_SIZE]{};
+    uint8_t sweep2_persist[COMPOSITE_SIZE]{};
+    uint8_t sweep2_sort[COMPOSITE_SIZE]{};
+    // Render shadows: rendered (post noise-floor) value per column currently
+    // ON SCREEN for each sweep band. Authoritative screen copy — rebuilt by
+    // full render; used by the marker-only fast path to restore the old
+    // marker column (new data always forces a full repaint).
+    // SRAM: +480 B BSS (no heap, no stack).
+    uint8_t composite_rendered[COMPOSITE_SIZE]{};
+    uint8_t sweep2_rendered[COMPOSITE_SIZE]{};
+};
+static DisplayBuffers s_dd;
+
+// Forward declarations - write_uint/write_str are used by
+// render_sweep_waterfalls() which precedes their definitions below.
+static void write_uint(char*& buf, size_t& remaining, uint32_t value) noexcept;
+static void write_uint_pad(char*& buf, size_t& remaining, uint32_t value, int pad) noexcept;
+static void write_str(char*& buf, size_t& remaining, const char* s) noexcept;
+
+// ============================================================================
+// Waterfall RLE row renderer (OPT-1 + OPT-3)
+// ============================================================================
+// Merges adjacent bands with the same palette value into a single wider
+// fill_rectangle() call, reducing SPI transactions by ~60-70%.
+// Precomputes band boundary positions to eliminate per-band integer division.
+//
+// Stack: ~128 bytes (band_x[61] lookup + 4 locals).
+// Flash: ~256 bytes (one-shot, no heap).
+// ============================================================================
+static void render_waterfall_row_rle(
+    Painter& painter,
+    const MiniWaterfall& wf,
+    uint8_t data_row,
+    uint16_t x_start,
+    uint16_t y,
+    uint16_t total_width
+) noexcept {
+    if (total_width < 4) return;
+
+    // Precompute band boundary X positions: band_x[i] = x_start + (total_width * i) / BANDS
+    // Eliminates 60 integer divisions per row (replaced by table lookup).
+    std::array<uint16_t, MiniWaterfall::BANDS + 1> band_x{};
+    for (uint8_t i = 0; i <= MiniWaterfall::BANDS; ++i) {
+        band_x[i] = static_cast<uint16_t>(x_start + (static_cast<uint32_t>(total_width) * i) / MiniWaterfall::BANDS);
+    }
+
+    // RLE: scan bands left-to-right, merge runs of identical palette values.
+    uint8_t run_value = wf.get_pixel(data_row, 0);
+    uint8_t run_start = 0;
+
+    for (uint8_t band = 1; band <= MiniWaterfall::BANDS; ++band) {
+        const uint8_t val = (band < MiniWaterfall::BANDS)
+            ? wf.get_pixel(data_row, band) : 0;  // sentinel terminates final run
+
+        if (val == run_value && band < MiniWaterfall::BANDS) continue;
+
+        // Flush the completed run (skip black/background runs).
+        if (run_value != 0) {
+            const Color color = Color::RGB(MiniWaterfall::PALETTE[run_value]);
+            const uint16_t px_start = band_x[run_start];
+            const uint16_t px_end = band_x[band];
+            if (px_end > px_start) {
+                painter.fill_rectangle({px_start, y, static_cast<int>(px_end - px_start), 1}, color);
+            }
+        }
+
+        run_value = val;
+        run_start = band;
+    }
+}
+
+// ============================================================================
+// Constructor / Destructor
+// ============================================================================
+
+DroneDisplay::DroneDisplay(const Rect parent_rect) noexcept
+    : ui::View()
+    , display_data_()
+    , spectrum_buffer_{}
+    , sweep_waterfalls_{}
+    , sweep_wf_freq_start_{}
+    , sweep_wf_freq_end_{}
+    , active_waterfall_mask_{0}
+    , status_text_{0}
+    , spectrum_data_size_(0)
+    , spectrum_visible_(true)
+    , timeline_visible_(true)
+    , drone_list_visible_(true)
+    , status_bar_visible_(true)
+    , band1_{}
+    , band2_{1} {
+    // NOTE: band2_ MUST be {1} — BandRenderCtx::band_idx_ selects the
+    // det-window mirror (det_win_*_mhz_[band_idx]) in
+    // render_composite_full_band(). A plain {} resets band_idx_ to 0 and
+    // both bands render band-0 brackets (red brackets only in first sweep
+    // window). The mem-initializer wins over the NSDMI in the header.
+    band1_.band_idx_ = 0;
+    band2_.band_idx_ = 1;
+    // Incremental spectrum render shadows (non-owning, point into s_dd BSS).
+    band1_.shadow = s_dd.composite_rendered;
+    band2_.shadow = s_dd.sweep2_rendered;
+    set_parent_rect(parent_rect);
+    set_status_text(STATUS_READY);
+}
+
+DroneDisplay::~DroneDisplay() noexcept {
+    // Destructor - no dynamic memory to free
+}
+
+// ============================================================================
+// Paint Method
+// ============================================================================
+
+DroneDisplay::LayoutMetrics DroneDisplay::calculate_layout() const noexcept {
+    // Spectrum section: 58 px (was 50). Freed 8 px from reduced WF_HEADER_H
+    // (18→10) are reinvested here, giving dual-sweep bands 27 px each
+    // instead of 25 px — critical for chart readability in 2x mode.
+    constexpr uint16_t SPECTRUM_H = 58;
+    // Timeline (waterfall) section: WF_HEADER_H(10) + WATERFALL_MAX_ROWS(15)
+    // + 1 bottom gap = 26 px. Renderer clips at chart_h, so extra rows
+    // beyond count() are never drawn.
+    constexpr uint16_t TIMELINE_H = WF_HEADER_H + WATERFALL_MAX_ROWS + 1;
+
+    const uint16_t total_h = parent_rect().size().height();
+
+    uint16_t remaining = total_h;
+
+    const bool show_spec = (spectrum_visible_ && spectrum_data_size_ > 0) ||
+                           (composite_mode_ && composite_data_ != nullptr && composite_data_size_ > 0);
+    const bool show_tl = timeline_visible_;
+
+    const uint16_t spec_h = show_spec ? SPECTRUM_H : 0;
+    if (spec_h <= remaining) remaining -= spec_h; else remaining = 0;
+
+    const uint16_t tl_h = show_tl ? TIMELINE_H : 0;
+    if (tl_h <= remaining) remaining -= tl_h; else remaining = 0;
+
+    // No status bar reserved — the drone list stretches to the window's bottom edge.
+    const uint16_t status_h = 0;
+
+    const uint16_t drone_h = remaining;
+
+    uint16_t list_start_y = 0;
+    if (show_spec) list_start_y += spec_h;
+    if (show_tl) list_start_y += tl_h;
+
+    return LayoutMetrics{spec_h, tl_h, status_h, drone_h, list_start_y};
+}
+
+uint16_t DroneDisplay::max_visible_drones() const noexcept {
+    const auto layout = calculate_layout();
+    if (layout.drone_h < ENTRY_MIN_H) return 0;
+    const uint16_t max_rows = layout.drone_h / ENTRY_MIN_H;
+    return dual_column_mode_ ? static_cast<uint16_t>(max_rows * 2) : max_rows;
+}
+
+void DroneDisplay::paint(Painter& painter) {
+    const auto sr = screen_rect();
+    const uint16_t ox = sr.location().x();
+    const uint16_t oy = sr.location().y();
+    const uint16_t w = sr.size().width();
+
+    const auto layout = calculate_layout();
+    uint16_t y_offset = oy;
+
+    const bool show_spec = (spectrum_visible_ && spectrum_data_size_ > 0) ||
+                           (composite_mode_ && composite_data_ != nullptr && composite_data_size_ > 0);
+    const bool show_tl = timeline_visible_;
+    // NOTE: the list region stays reserved whenever the list is ENABLED,
+    // independent of how many entries exist, and it is repainted on every
+    // DIRTY_DRONES — see the DIRTY_DRONES block below. Gating that draw on
+    // `drone_count > 0` was a stale-row defect: when the visible list emptied
+    // (all tracked drones below DISPLAY_MIN_THREAT, or all decayed),
+    // DIRTY_DRONES was raised but the draw call was skipped, so the previous
+    // rows stayed painted on the panel forever. render_drone_list(count == 0)
+    // is the clear path that paints the background plus the "No drones" hint.
+
+    if (show_spec && (dirty_flags_ & DIRTY_SPEC_ANY)) {
+        if (composite_mode_ && composite_data_ != nullptr && composite_data_size_ > 0) {
+            // Detection-window config changed → drop the incremental shadows so
+            // the next band render is FULL and redraws the title strip brackets.
+            if (det_win_dirty_) {
+                band1_.shadow_valid = false;
+                band2_.shadow_valid = false;
+                det_win_dirty_ = false;
+            }
+            if (dual_sweep_mode_ && sweep2_data_ != nullptr && sweep2_data_size_ > 0) {
+                render_dual_composite(painter, ox, y_offset, w, layout.spec_h);
+            } else {
+                const bool full   = (dirty_flags_ & DIRTY_SPEC) != 0;
+                const bool data   = full || (dirty_flags_ & DIRTY_SPEC_DATA) != 0;
+                const bool marker = data || (dirty_flags_ & DIRTY_SPEC_MARKER) != 0;
+                if (marker) {
+                    // Offset only a MEASURED floor: an invalid floor means
+                    // "no percentile pass yet" → subtract nothing, exactly the
+                    // pre-offset behaviour (biasing 0 would suppress the band
+                    // for one sweep pass after every persistence reset).
+                    const uint8_t nf1 = composite_noise_floor_valid_
+                        ? apply_shelf_offset(composite_noise_floor_)
+                        : uint8_t{0};
+                    render_composite_partial_band(painter, band1_, composite_data_, composite_data_size_,
+                                                  ox, y_offset, w, layout.spec_h,
+                                                  scan_head_position_[0], nf1, data,
+                                                  sweep_freq_start_, sweep_freq_end_);
+                }
+            }
+        } else if (dirty_flags_ & DIRTY_SPEC) {
+            render_spectrum(painter, spectrum_buffer_.data(), spectrum_data_size_,
+                            ox, y_offset, w, layout.spec_h);
+        }
+    }
+    if (show_spec) y_offset += layout.spec_h;
+
+    if (show_tl && (dirty_flags_ & DIRTY_WATERFALL)) {
+        if (active_waterfall_mask_ != 0) {
+            // Sweep mode: per-window independent waterfalls.
+            // Always render (even with 0 rows) so the area is cleared and the
+            // "Waiting..." hint is shown until the first sweep pass completes.
+            render_sweep_waterfalls(painter, ox, y_offset, w, layout.timeline_h);
+        }
+    }
+    if (show_tl) y_offset += layout.timeline_h;
+
+    // Keyed on drone_list_visible_ (NOT on drone_count > 0): when every tracked
+    // drone falls below DISPLAY_MIN_THREAT the render snapshot drains to zero
+    // and this must still run ONCE so render_drone_list() takes its empty branch
+    // and clears the area — nothing else paints over it (status_h == 0, and
+    // drone_h does not depend on drone_count). The clear runs exactly once per
+    // transition because update_display_data() raises DIRTY_DRONES only on an
+    // actual snapshot change and paint() clears the flags at the end.
+    if (drone_list_visible_ && layout.drone_h > 0 && (dirty_flags_ & DIRTY_DRONES)) {
+        render_drone_list(painter, display_data_.drones, display_data_.drone_count,
+                          ox, y_offset, w, layout.drone_h);
+    }
+    if (drone_list_visible_ && layout.drone_h > 0) y_offset += layout.drone_h;
+
+    if (layout.status_h > 0 && (dirty_flags_ & DIRTY_STATUS)) {
+        render_status_bar(painter, status_text_, ox, y_offset, w, layout.status_h);
+    }
+
+    dirty_flags_ = 0;  // All sections painted — clear flags
+}
+
+// ============================================================================
+// Render Methods
+// ============================================================================
+
+void DroneDisplay::render_spectrum(
+    Painter& painter,
+    const uint8_t* spectrum_data,
+    size_t spectrum_size,
+    uint16_t start_x,
+    uint16_t start_y,
+    uint16_t width,
+    uint16_t height
+) noexcept {
+    if (spectrum_data == nullptr || spectrum_size == 0 || height < WF_HEADER_H + 6) {
+        return;
+    }
+
+    draw_rectangle(painter, start_x, start_y, width, height, COLOR_BACKGROUND);
+    draw_rectangle(painter, start_x, start_y, width, 1, COLOR_UNKNOWN_THREAT);
+    draw_text_small(painter, "SPECTRUM +/-1MHz", start_x + 2, start_y + 1, COLOR_TEXT);
+
+    constexpr uint16_t MIN_BAR_WIDTH = 2;
+    const uint16_t usable_width = width - 4;
+    const uint16_t bar_count = static_cast<uint16_t>(spectrum_size);
+    uint16_t bar_width = usable_width / bar_count;
+    if (bar_width < MIN_BAR_WIDTH) bar_width = MIN_BAR_WIDTH;
+
+    const uint16_t chart_start_x = start_x + 2;
+    const uint16_t chart_start_y = start_y + WF_HEADER_H;
+    const uint16_t chart_height = height - WF_HEADER_H - 2;
+    if (chart_height < 4) return;
+
+    // Noise floor and margin filtering are pre-computed in set_spectrum_data()
+    // Here we only draw — pure paint, no DSP
+    for (size_t i = 0; i < spectrum_size; ++i) {
+        if (i >= FFT_DC_SPIKE_START && i < FFT_DC_SPIKE_END) continue;
+
+        const uint8_t value = spectrum_data[i];
+        if (value < min_color_power_) continue;
+
+        const uint16_t bar_height = (static_cast<uint16_t>(value) * chart_height) >> 8;
+        const uint16_t x = chart_start_x + static_cast<uint16_t>(i) * bar_width;
+        const uint16_t y = chart_start_y + chart_height - bar_height;
+
+        uint32_t color = COLOR_LOW_THREAT;
+        if (value > 200) color = COLOR_CRITICAL_THREAT;
+        else if (value > 150) color = COLOR_HIGH_THREAT;
+        else if (value > 100) color = COLOR_MEDIUM_THREAT;
+
+        if (bar_height > 0) {
+            draw_rectangle(painter, x, y, bar_width, bar_height, color);
+        }
+    }
+}
+
+void DroneDisplay::render_sweep_waterfalls(
+    Painter& painter,
+    uint16_t start_x,
+    uint16_t start_y,
+    uint16_t width,
+    uint16_t height
+) noexcept {
+    if (width < 10 || height < 4 || active_waterfall_mask_ == 0) return;
+
+    const uint16_t chart_start_y = start_y + WF_HEADER_H;
+    const uint16_t chart_h = (height > WF_HEADER_H + 1) ? (height - WF_HEADER_H - 1) : 4;
+    const uint16_t chart_start_x = start_x + 2;
+    const uint16_t chart_w = (width > 4) ? (width - 4) : width;
+
+    const uint8_t active_count = count_bits8(active_waterfall_mask_);
+    if (active_count == 0) return;
+    const uint16_t win_w = chart_w / active_count;
+    if (win_w < 2) return;
+
+    // Header: always clear + redraw (cheap, 1 row of text)
+    draw_rectangle(painter, start_x, start_y, width, WF_HEADER_H, COLOR_BACKGROUND);
+    draw_rectangle(painter, start_x, start_y, width, 1, COLOR_UNKNOWN_THREAT);
+
+    bool any_label = false;
+    for (uint8_t j = 0; j < NUM_SWEEP_WATERFALLS; ++j) {
+        if (sweep_wf_freq_start_[j] > 0) { any_label = true; break; }
+    }
+    if (!any_label) {
+        draw_text_small(painter, "Waiting...", chart_start_x, start_y + 1, COLOR_UNKNOWN_THREAT);
+    }
+    uint8_t hdr_slot = 0;
+    for (uint8_t j = 0; j < NUM_SWEEP_WATERFALLS; ++j) {
+        if ((active_waterfall_mask_ & (1u << j)) == 0) continue;
+        const uint16_t jx = chart_start_x + static_cast<uint16_t>(hdr_slot) * win_w;
+        if (sweep_wf_freq_start_[j] > 0) {
+            char label[12];
+            const uint32_t mhz = static_cast<uint32_t>(sweep_wf_freq_start_[j] / 1000000ULL);
+            char* dst = label;
+            size_t rem = sizeof(label);
+            write_uint(dst, rem, mhz);
+            write_str(dst, rem, "M");
+            *dst = '\0';
+            draw_text_small(painter, label, jx + 1, start_y + 1, COLOR_TEXT);
+        }
+        ++hdr_slot;
+    }
+
+    // Data rows: clear + redraw ONLY dirty windows' columns.
+    // Clean windows keep their previous pixels on screen — no SPI cost.
+    // Saves ~75% of RLE row renders when 1 of 4 windows completes a pass.
+    uint8_t slot = 0;
+    for (uint8_t i = 0; i < NUM_SWEEP_WATERFALLS; ++i) {
+        if ((active_waterfall_mask_ & (1u << i)) == 0) continue;
+
+        const uint16_t wx = chart_start_x + static_cast<uint16_t>(slot) * win_w;
+        const uint16_t slot_w = chart_w - static_cast<uint16_t>(slot) * win_w;
+        const uint16_t this_w = (slot_w < win_w) ? slot_w : win_w;
+
+        if (dirty_waterfall_windows_ & (1u << i)) {
+            // Clear this window's column (separator + data area)
+            const uint16_t clear_x = (slot > 0) ? wx - 1 : wx;
+            const uint16_t clear_w = (slot > 0) ? this_w + 1 : this_w;
+            draw_rectangle(painter, clear_x, chart_start_y, clear_w, chart_h, COLOR_BACKGROUND);
+
+            // Separator (re-draw after clear)
+            if (slot > 0) {
+                draw_rectangle(painter, wx - 1, chart_start_y, 1, chart_h, COLOR_UNKNOWN_THREAT);
+            }
+
+            // Render all data rows for this window
+            if (this_w >= 4 && sweep_waterfalls_[i].count() > 0) {
+                const uint8_t row_count = sweep_waterfalls_[i].count();
+                const uint8_t max_visible = (chart_h < row_count) ? static_cast<uint8_t>(chart_h) : row_count;
+                for (uint8_t vis_row = 0; vis_row < max_visible; ++vis_row) {
+                    const uint16_t py = chart_start_y + vis_row;
+                    const uint8_t data_row = static_cast<uint8_t>(
+                        static_cast<int>(row_count) - 1 - static_cast<int>(vis_row));
+                    render_waterfall_row_rle(painter, sweep_waterfalls_[i], data_row, wx, py, this_w);
+                }
+            }
+        }
+        ++slot;
+    }
+
+    dirty_waterfall_windows_ = 0;
+}
+
+void DroneDisplay::render_drone_list(
+    Painter& painter,
+    const DisplayDroneEntry* drones,
+    size_t drone_count,
+    uint16_t start_x,
+    uint16_t start_y,
+    uint16_t width,
+    uint16_t height
+) noexcept {
+    // Validate input
+    if (drones == nullptr || drone_count == 0) {
+        draw_rectangle(painter, start_x, start_y, width, height, COLOR_BACKGROUND);
+        draw_rectangle(painter, start_x, start_y, width, 1, COLOR_UNKNOWN_THREAT);
+        draw_text(painter, STATUS_NO_SIGNALS, start_x + 2, start_y + 4, COLOR_UNKNOWN_THREAT);
+        return;
+    }
+    
+    // Draw background with border
+    draw_rectangle(painter, start_x, start_y, width, height, COLOR_BACKGROUND);
+    draw_rectangle(painter, start_x, start_y, width, 1, COLOR_UNKNOWN_THREAT);  // Top border
+    
+    // No header row — the drone entry list fills the full section height.
+    // Dual column kicks in when enabled and >= DUAL_COLUMN_MIN_COUNT detections.
+    const uint16_t list_start_y = start_y;
+    const EntryLayout layout = compute_entry_layout(drone_count, width, height, dual_column_mode_);
+
+    if (layout.col_w < width) {
+        // Dual column: left cell = row index, right cell = row + rows.
+        for (uint16_t row = 0; row < layout.rows; ++row) {
+            const uint16_t y = list_start_y + row * layout.entry_h;
+            if (y + layout.entry_h > start_y + height) break;  // Don't overflow
+            draw_drone_entry(painter, drones[row], start_x, y, layout.col_w, layout.entry_h);
+            const size_t right_idx = static_cast<size_t>(row) + layout.rows;
+            if (right_idx < drone_count) {
+                draw_drone_entry(painter, drones[right_idx], start_x + layout.col_w, y,
+                                 layout.col_w, layout.entry_h);
+            }
+        }
+    } else {
+        // Single column (default)
+        for (size_t i = 0; i < drone_count; ++i) {
+            const uint16_t y = list_start_y + static_cast<uint16_t>(i) * layout.entry_h;
+            if (y + layout.entry_h > start_y + height) break;  // Don't overflow
+            draw_drone_entry(painter, drones[i], start_x, y, width, layout.entry_h);
+        }
+    }
+}
+
+void DroneDisplay::render_status_bar(
+    Painter& painter,
+    const char* status_text,
+    uint16_t start_x,
+    uint16_t start_y,
+    uint16_t width,
+    uint16_t height
+) noexcept {
+    // Validate input
+    if (status_text == nullptr || height < 4) {
+        return;
+    }
+    
+    // Draw background with top border
+    draw_rectangle(painter, start_x, start_y, width, height, COLOR_BACKGROUND);
+    draw_rectangle(painter, start_x, start_y, width, 1, COLOR_UNKNOWN_THREAT);
+    
+    // Draw status text centered vertically
+    const uint16_t text_y = start_y + (height > 10 ? 4 : 1);
+    draw_text(painter, status_text, start_x + 4, text_y, COLOR_TEXT);
+}
+
+// ============================================================================
+// Data Management
+// ============================================================================
+
+ErrorCode DroneDisplay::update_display_data(const DisplayData& display_data) noexcept {
+    const ErrorCode error = validate_drone_buffer(
+        display_data.drones,
+        display_data.drone_count,
+        MAX_DISPLAYED_DRONES
+    );
+    if (error != ErrorCode::SUCCESS) {
+        return error;
+    }
+    // Skip update if drone list unchanged — avoids 800B copy + DIRTY_DRONES
+    // + full drone list repaint. Called at 10 Hz; most ticks have no changes.
+    if (display_data.drone_count == display_data_.drone_count &&
+        std::memcmp(display_data.drones, display_data_.drones,
+                    display_data.drone_count * sizeof(DisplayDroneEntry)) == 0) {
+        return ErrorCode::SUCCESS;
+    }
+    display_data_ = display_data;
+    dirty_flags_ |= DIRTY_DRONES;
+    set_dirty();
+    return ErrorCode::SUCCESS;
+}
+
+const DisplayData& DroneDisplay::get_display_data() const noexcept {
+    return display_data_;
+}
+
+void DroneDisplay::clear_display(Painter& painter) noexcept {
+    draw_rectangle(painter, 0, 0, DISPLAY_WIDTH, DISPLAY_HEIGHT, COLOR_BACKGROUND);
+}
+
+ErrorCode DroneDisplay::set_spectrum_data(
+    const uint8_t* spectrum_data,
+    size_t spectrum_size
+) noexcept {
+    const ErrorCode error = validate_spectrum_data(spectrum_data, spectrum_size);
+    if (error != ErrorCode::SUCCESS) {
+        return error;
+    }
+
+    const size_t count = (spectrum_size < spectrum_buffer_.size()) ? spectrum_size : spectrum_buffer_.size();
+    spectrum_data_size_ = count;
+
+    // Pre-filter: apply display margin filter during copy (not during paint)
+    // This moves noise floor computation out of the hot paint() path
+    // display_margin_ is separate from spectrum_shape_margin_ (detection margin)
+    // Default: 0 = show full spectrum (no filtering)
+    if (display_margin_ > 0) {
+        // Quickselect median — O(n) vs O(n²) insertion sort
+        // Use class member buffer to avoid stack allocation (was: uint8_t sorted[240])
+        size_t sort_count = 0;
+        for (size_t i = 0; i < count && sort_count < s_dd.spectrum_sort.size(); ++i) {
+            if (i >= FFT_DC_SPIKE_START && i < FFT_DC_SPIKE_END) continue;
+            s_dd.spectrum_sort[sort_count++] = spectrum_data[i];
+        }
+        if (sort_count > 0) {
+            const size_t k = sort_count / 2;
+            size_t qs_left = 0;
+            size_t qs_right = sort_count - 1;
+            while (qs_left < qs_right) {
+                const size_t pivot_idx = qs_left + (qs_right - qs_left) / 2;
+                const uint8_t pivot = s_dd.spectrum_sort[pivot_idx];
+                s_dd.spectrum_sort[pivot_idx] = s_dd.spectrum_sort[qs_right];
+                s_dd.spectrum_sort[qs_right] = pivot;
+                size_t store = qs_left;
+                for (size_t i = qs_left; i < qs_right; ++i) {
+                    if (s_dd.spectrum_sort[i] < pivot) {
+                        const uint8_t t = s_dd.spectrum_sort[store];
+                        s_dd.spectrum_sort[store] = s_dd.spectrum_sort[i];
+                        s_dd.spectrum_sort[i] = t;
+                        ++store;
+                    }
+                }
+                {
+                    const uint8_t t = s_dd.spectrum_sort[store];
+                    s_dd.spectrum_sort[store] = s_dd.spectrum_sort[qs_right];
+                    s_dd.spectrum_sort[qs_right] = t;
+                }
+                if (store == k) break;
+                if (store < k) qs_left = store + 1;
+                else qs_right = store - 1;
+            }
+            const uint8_t noise_floor = s_dd.spectrum_sort[k];
+            const uint8_t display_threshold = noise_floor + display_margin_;
+            for (size_t i = 0; i < count; ++i) {
+                const uint8_t val = spectrum_data[i];
+                spectrum_buffer_[i] = (val >= display_threshold) ? val : 0;
+            }
+        } else {
+            for (size_t i = 0; i < count; ++i) {
+                spectrum_buffer_[i] = spectrum_data[i];
+            }
+        }
+    } else {
+        for (size_t i = 0; i < count; ++i) {
+            spectrum_buffer_[i] = spectrum_data[i];
+        }
+    }
+
+    dirty_flags_ |= DIRTY_SPEC;
+    set_dirty();
+    return ErrorCode::SUCCESS;
+}
+
+void DroneDisplay::push_sweep_waterfall_window(
+    uint8_t window_index,
+    const uint8_t* composite_240,
+    FreqHz freq_start,
+    FreqHz freq_end
+) noexcept {
+    if (window_index >= NUM_SWEEP_WATERFALLS || composite_240 == nullptr) return;
+    sweep_waterfalls_[window_index].push_row(composite_240);
+    sweep_wf_freq_start_[window_index] = freq_start;
+    sweep_wf_freq_end_[window_index] = freq_end;
+    dirty_waterfall_windows_ |= (1u << window_index);
+    dirty_flags_ |= DIRTY_WATERFALL;
+    set_dirty();
+}
+
+void DroneDisplay::set_active_sweep_windows(uint8_t enabled_mask) noexcept {
+    const uint8_t new_mask = enabled_mask & static_cast<uint8_t>((1u << NUM_SWEEP_WATERFALLS) - 1u);
+    if (new_mask != active_waterfall_mask_) {
+        active_waterfall_mask_ = new_mask;
+        dirty_waterfall_windows_ = new_mask;  // Mark newly-active windows dirty
+    }
+}
+
+void DroneDisplay::set_status_text(const char* status_text) noexcept {
+    if (status_text == nullptr) {
+        return;
+    }
+    size_t i = 0;
+    while (i < MAX_TEXT_LENGTH - 1 && status_text[i] != '\0') {
+        status_text_[i] = status_text[i];
+        ++i;
+    }
+    status_text_[i] = '\0';
+    dirty_flags_ |= DIRTY_STATUS;
+    set_dirty();
+}
+
+const char* DroneDisplay::get_status_text() const noexcept {
+    return status_text_;
+}
+
+// ============================================================================
+// Drawing Helpers
+// ============================================================================
+
+void DroneDisplay::draw_spectrum_line(
+    Painter& painter,
+    uint16_t x,
+    uint16_t y,
+    uint32_t color
+) noexcept {
+    draw_rectangle(painter, x, y, 1, 1, color);
+}
+
+void DroneDisplay::draw_drone_entry(
+    Painter& painter,
+    const DisplayDroneEntry& drone,
+    uint16_t x,
+    uint16_t y,
+    uint16_t width,
+    uint16_t height
+) noexcept {
+    // Draw entry separator line
+    draw_rectangle(painter, x, y + height - 1, width, 1, COLOR_UNKNOWN_THREAT);
+
+    const uint16_t char_w = Theme::getInstance()->fg_light->font.char_width();
+
+    // --- Line 1: Type + Threat (merged into one draw_text call) ---
+    const char* type_name = drone.get_type_name();
+    const size_t type_len = std::strlen(type_name);
+    const size_t type_chars = (type_len > TYPE_MAX_CHARS) ? TYPE_MAX_CHARS : type_len;
+
+    const char* threat_str = "";
+    switch (drone.threat) {
+        case ThreatLevel::CRITICAL: threat_str = "CRIT"; break;
+        case ThreatLevel::HIGH:     threat_str = "HIGH"; break;
+        case ThreatLevel::MEDIUM:   threat_str = "MED";  break;
+        case ThreatLevel::LOW:      threat_str = "LOW";  break;
+        default:                    threat_str = "---";  break;
+    }
+
+    // Format "TYPE  CRIT" into one buffer — saves one draw_text call
+    char line1_buf[TYPE_MAX_CHARS + 1 + THREAT_MAX_CHARS + 1];
+    size_t pos = 0;
+    for (size_t i = 0; i < type_chars && pos < sizeof(line1_buf) - 1; ++i) {
+        line1_buf[pos++] = type_name[i];
+    }
+    line1_buf[pos++] = ' ';
+    for (const char* p = threat_str; *p != '\0' && pos < sizeof(line1_buf) - 1; ++p) {
+        line1_buf[pos++] = *p;
+    }
+    line1_buf[pos] = '\0';
+    draw_text(painter, line1_buf, x + LIST_PAD, y + 2, drone.display_color);
+
+    // --- Line 2: Frequency + RSSI (merged) + Trend (separate, right-aligned) ---
+    char freq_buffer[16];
+    format_frequency(drone.frequency, freq_buffer, sizeof(freq_buffer));
+
+    char rssi_buffer[16];
+    format_rssi(drone.rssi, rssi_buffer, sizeof(rssi_buffer));
+
+    // Format "123.456 -45" — saves one draw_text + one strlen for RSSI positioning
+    char line2_buf[32];
+    pos = 0;
+    for (const char* p = freq_buffer; *p != '\0' && pos < sizeof(line2_buf) - 1; ++p) {
+        line2_buf[pos++] = *p;
+    }
+    line2_buf[pos++] = ' ';
+    for (const char* p = rssi_buffer; *p != '\0' && pos < sizeof(line2_buf) - 1; ++p) {
+        line2_buf[pos++] = *p;
+    }
+    line2_buf[pos] = '\0';
+    draw_text(painter, line2_buf, x + LIST_PAD, y + 12, COLOR_TEXT);
+
+    // Trend symbol right-aligned
+    char trend_symbol = MOVEMENT_TREND_SYMBOL_UNKNOWN;
+    switch (drone.trend) {
+        case MovementTrend::APPROACHING: trend_symbol = MOVEMENT_TREND_SYMBOL_APPROACHING; break;
+        case MovementTrend::RECEDING:    trend_symbol = MOVEMENT_TREND_SYMBOL_RECEEDING; break;
+        case MovementTrend::STATIC:      trend_symbol = MOVEMENT_TREND_SYMBOL_STATIC; break;
+        default:                         trend_symbol = MOVEMENT_TREND_SYMBOL_UNKNOWN; break;
+    }
+    char trend_buffer[2] = {trend_symbol, '\0'};
+    const uint16_t trend_x = x + width - LIST_PAD - char_w;
+    draw_text(painter, trend_buffer, trend_x, y + 12, COLOR_TEXT);
+}
+
+void DroneDisplay::draw_text(
+    Painter& painter,
+    const char* text,
+    uint16_t x,
+    uint16_t y,
+    uint32_t color
+) noexcept {
+    if (text == nullptr) {
+        return;
+    }
+
+    const Color fg_color = Color::RGB(color);
+    const Color bg_color = Color::black();
+
+    painter.draw_string(
+        Point{x, y},
+        Theme::getInstance()->fg_light->font,
+        fg_color,
+        bg_color,
+        std::string_view(text)
+    );
+}
+
+void DroneDisplay::draw_text(
+    Painter& painter,
+    std::string_view text,
+    uint16_t x,
+    uint16_t y,
+    uint32_t color
+) noexcept {
+    if (text.empty()) {
+        return;
+    }
+
+    const Color fg_color = Color::RGB(color);
+    const Color bg_color = Color::black();
+
+    painter.draw_string(
+        Point{x, y},
+        Theme::getInstance()->fg_light->font,
+        fg_color,
+        bg_color,
+        text
+    );
+}
+
+void DroneDisplay::draw_text_small(
+    Painter& painter,
+    const char* text,
+    uint16_t x,
+    uint16_t y,
+    uint32_t color
+) noexcept {
+    if (text == nullptr) {
+        return;
+    }
+
+    const Color fg_color = Color::RGB(color);
+    const Color bg_color = Color::black();
+
+    painter.draw_string(
+        Point{x, y},
+        ui::font::fixed_5x8,
+        fg_color,
+        bg_color,
+        std::string_view(text)
+    );
+}
+
+void DroneDisplay::draw_text_small(
+    Painter& painter,
+    std::string_view text,
+    uint16_t x,
+    uint16_t y,
+    uint32_t color
+) noexcept {
+    if (text.empty()) {
+        return;
+    }
+
+    const Color fg_color = Color::RGB(color);
+    const Color bg_color = Color::black();
+
+    painter.draw_string(
+        Point{x, y},
+        ui::font::fixed_5x8,
+        fg_color,
+        bg_color,
+        text
+    );
+}
+
+void DroneDisplay::draw_rectangle(
+    Painter& painter,
+    uint16_t x,
+    uint16_t y,
+    uint16_t width,
+    uint16_t height,
+    uint32_t color,
+    bool fill
+) noexcept {
+    const Color rect_color = Color::RGB(color);
+    const Rect rect{x, y, width, height};
+
+    if (fill) {
+        painter.fill_rectangle(rect, rect_color);
+    } else {
+        painter.draw_rectangle(rect, rect_color);
+    }
+}
+
+// ============================================================================
+// Utility Methods
+// ============================================================================
+
+uint16_t DroneDisplay::map_rssi_to_height(
+    RssiValue rssi,
+    uint16_t max_height
+) const noexcept {
+    const int32_t rssi_range = RSSI_MAX_DBM - RSSI_MIN_DBM;
+    const int32_t rssi_clamped = clamp(rssi, RSSI_MIN_DBM, RSSI_MAX_DBM);
+    const int32_t rssi_normalized = rssi_clamped - RSSI_MIN_DBM;
+    return static_cast<uint16_t>((rssi_normalized * max_height) / rssi_range);
+}
+
+uint32_t DroneDisplay::get_threat_color(ThreatLevel threat) const noexcept {
+    switch (threat) {
+        case ThreatLevel::LOW:
+            return COLOR_LOW_THREAT;
+        case ThreatLevel::MEDIUM:
+            return COLOR_MEDIUM_THREAT;
+        case ThreatLevel::HIGH:
+            return COLOR_HIGH_THREAT;
+        case ThreatLevel::CRITICAL:
+            return COLOR_CRITICAL_THREAT;
+        default:
+            return COLOR_UNKNOWN_THREAT;
+    }
+}
+
+static void write_uint(char*& buf, size_t& remaining, uint32_t value) noexcept {
+    char tmp[10];
+    int len = 0;
+    if (value == 0) {
+        tmp[len++] = '0';
+    } else {
+        while (value > 0 && len < 10) {
+            tmp[len++] = '0' + static_cast<char>(value % 10);
+            value /= 10;
+        }
+    }
+    for (int i = len - 1; i >= 0 && remaining > 1; --i) {
+        *buf++ = tmp[i];
+        --remaining;
+    }
+}
+
+static void write_uint_pad(char*& buf, size_t& remaining, uint32_t value, int pad) noexcept {
+    char tmp[10];
+    int len = 0;
+    while (len < pad) {
+        tmp[len++] = '0' + static_cast<char>(value % 10);
+        value /= 10;
+    }
+    for (int i = len - 1; i >= 0 && remaining > 1; --i) {
+        *buf++ = tmp[i];
+        --remaining;
+    }
+}
+
+static void write_str(char*& buf, size_t& remaining, const char* s) noexcept {
+    while (*s != '\0' && remaining > 1) {
+        *buf++ = *s++;
+        --remaining;
+    }
+}
+
+void DroneDisplay::format_frequency(
+    FreqHz frequency,
+    char* buffer,
+    size_t buffer_size
+) const noexcept {
+    if (buffer == nullptr || buffer_size < 16) {
+        return;
+    }
+
+    const uint32_t mhz = static_cast<uint32_t>(frequency / 1'000'000ULL);
+    const uint32_t khz = static_cast<uint32_t>((frequency % 1'000'000ULL) / 1'000ULL);
+
+    char* buf = buffer;
+    size_t remaining = buffer_size;
+    write_uint(buf, remaining, mhz);
+    if (remaining > 1) { *buf++ = '.'; --remaining; }
+    write_uint_pad(buf, remaining, khz, 3);
+    *buf = '\0';
+}
+
+void DroneDisplay::format_rssi(
+    RssiValue rssi,
+    char* buffer,
+    size_t buffer_size
+) const noexcept {
+    if (buffer == nullptr || buffer_size < 8) {
+        return;
+    }
+
+    char* buf = buffer;
+    size_t remaining = buffer_size;
+
+    if (rssi < 0) {
+        if (remaining > 1) { *buf++ = '-'; --remaining; }
+        rssi = -rssi;
+    }
+
+    write_uint(buf, remaining, static_cast<uint32_t>(rssi));
+    *buf = '\0';
+}
+
+ErrorCode DroneDisplay::validate_spectrum_data(
+    const uint8_t* spectrum_data,
+    size_t spectrum_size
+) const noexcept {
+    return validate_spectrum_buffer(spectrum_data, spectrum_size);
+}
+
+uint16_t DroneDisplay::clamp(
+    int32_t value,
+    int32_t min,
+    int32_t max
+) const noexcept {
+    if (value < min) {
+        return static_cast<uint16_t>(min);
+    }
+    if (value > max) {
+        return static_cast<uint16_t>(max);
+    }
+    return static_cast<uint16_t>(value);
+}
+
+void DroneDisplay::set_composite_data(const uint8_t* data, size_t size) noexcept {
+    if (data == nullptr || size == 0) {
+        composite_data_ = nullptr;
+        composite_data_size_ = 0;
+        return;
+    }
+
+    const size_t copy_n = (size < COMPOSITE_SIZE) ? size : COMPOSITE_SIZE;
+
+    // Apply EMA persistence: keep old data unless new data has a higher peak.
+    // Effectively max(raw, old * DECAY), which holds peaks steady between passes
+    // while letting noise floor decay toward zero.
+    //
+    // CHANGE-DETECTION: the EMA loop tracks whether any persist byte actually
+    // moved. When nothing changed (duplicate display-only frame, decay fully
+    // converged) the repaint is skipped entirely — update_sweep_pair_display()
+    // pushes the composite on EVERY spectrum frame, so without this gate the
+    // band repainted at frame rate with zero visual delta. The nullptr→data
+    // and size-change transitions force the dirty flag because the spectrum
+    // area layout (show_spec / bar_count) depends on them.
+    bool any_changed = (composite_data_ == nullptr) || (copy_n != composite_data_size_);
+    if (!composite_persist_initialized_) {
+        for (size_t i = 0; i < copy_n; ++i) {
+            s_dd.composite_persist[i] = data[i];
+        }
+        composite_persist_initialized_ = true;
+        any_changed = true;
+    } else {
+        for (size_t i = 0; i < copy_n; ++i) {
+            const uint8_t old = s_dd.composite_persist[i];
+            const uint16_t decayed = (static_cast<uint16_t>(old)
+                                      * SWEEP_PERSISTENCE_DECAY_Q8) >> 8;
+            const uint8_t next = (data[i] > static_cast<uint8_t>(decayed))
+                ? data[i]
+                : static_cast<uint8_t>(decayed);
+            if (next != old) {
+                s_dd.composite_persist[i] = next;
+                any_changed = true;
+            }
+        }
+    }
+
+    composite_data_ = s_dd.composite_persist;
+    composite_data_size_ = copy_n;
+    if (!any_changed) {
+        return;
+    }
+    // Data changed → incremental neighbour-aware band repaint (the white
+    // envelope line is a cross-column construct — see
+    // render_composite_partial_band for the neighbour-expansion diff).
+    dirty_flags_ |= DIRTY_SPEC_DATA;
+    set_dirty();
+}
+
+void DroneDisplay::reset_composite_persistence() noexcept {
+    // Drop EMA state so the next set_composite_data() rebuilds the buffer from
+    // scratch (it enters the "not initialized" branch and copies the raw data).
+    std::memset(s_dd.composite_persist, 0, COMPOSITE_SIZE);
+    composite_persist_initialized_ = false;
+    composite_noise_floor_ = 0;
+    composite_noise_floor_valid_ = false;
+    // Also reset band 2 persistence (dual-sweep mode).
+    std::memset(s_dd.sweep2_persist, 0, COMPOSITE_SIZE);
+    sweep2_persist_initialized_ = false;
+    sweep2_noise_floor_ = 0;
+    sweep2_noise_floor_valid_ = false;
+    dirty_flags_ = DIRTY_ALL;
+    set_dirty();
+    // DO NOT null composite_data_ or composite_data_size_ here.
+    // Nulling them causes calculate_layout() to collapse the spectrum area
+    // (show_spec = false), letting the timeline take over the display —
+    // this is the root cause of "sweep does 1 pass, then hangs, replaced
+    // by timeline" bug. The zeroed persist buffer renders as empty bars
+    // (invisible) until the next set_composite_data() fills it with fresh data.
+}
+
+// ============================================================================
+// Noise floor computation (called once per sweep-pass, not per frame)
+// ============================================================================
+
+static void quickselect_pctile(
+    uint8_t* buf,
+    size_t n,
+    size_t k,
+    uint8_t& output
+) noexcept {
+    if (n == 0) return;
+    if (k >= n) k = n - 1;
+    size_t ql = 0;
+    size_t qr = n - 1;
+    while (ql < qr) {
+        const size_t pv = ql + (qr - ql) / 2;
+        const uint8_t pivot = buf[pv];
+        buf[pv] = buf[qr];
+        buf[qr] = pivot;
+        size_t st = ql;
+        for (size_t i = ql; i < qr; ++i) {
+            if (buf[i] < pivot) {
+                const uint8_t t = buf[st];
+                buf[st] = buf[i];
+                buf[i] = t;
+                ++st;
+            }
+        }
+        {
+            const uint8_t t = buf[st];
+            buf[st] = buf[qr];
+            buf[qr] = t;
+        }
+        if (st == k) break;
+        if (st < k) ql = st + 1;
+        else qr = st - 1;
+    }
+    output = buf[k];
+}
+
+void DroneDisplay::update_noise_floor() noexcept {
+    // Band 1: quickselect on composite persistence buffer.
+    if (composite_data_size_ > 0) {
+        for (size_t i = 0; i < composite_data_size_; ++i) {
+            s_dd.composite_sort[i] = s_dd.composite_persist[i];
+        }
+        size_t k = (composite_data_size_ * SWEEP_NOISE_FLOOR_PERCENTILE) / 100;
+        if (k >= composite_data_size_) k = composite_data_size_ - 1;
+        quickselect_pctile(s_dd.composite_sort, composite_data_size_, k, composite_noise_floor_);
+        composite_noise_floor_valid_ = true;
+    }
+
+    // Band 2: quickselect on sweep2 persistence buffer.
+    if (sweep2_data_size_ > 0) {
+        for (size_t i = 0; i < sweep2_data_size_; ++i) {
+            s_dd.sweep2_sort[i] = s_dd.sweep2_persist[i];
+        }
+        size_t k2 = (sweep2_data_size_ * SWEEP_NOISE_FLOOR_PERCENTILE) / 100;
+        if (k2 >= sweep2_data_size_) k2 = sweep2_data_size_ - 1;
+        quickselect_pctile(s_dd.sweep2_sort, sweep2_data_size_, k2, sweep2_noise_floor_);
+        sweep2_noise_floor_valid_ = true;
+    }
+    // Noise floor is auto-detected in render_composite_partial_band() via
+    // last_noise_floor: if it changed → automatic full band repaint (need_full).
+    // New composite data triggers the neighbour-aware INCREMENTAL repaint
+    // (changed columns + their right neighbours), not a full repaint.
+    dirty_flags_ |= DIRTY_SPEC_DATA;
+    set_dirty();
+}
+
+uint8_t DroneDisplay::apply_shelf_offset(uint8_t nf) const noexcept {
+    const int16_t v = static_cast<int16_t>(nf) + static_cast<int16_t>(shelf_offset_);
+    if (v < 0) return 0;
+    if (v > 255) return 255;
+    return static_cast<uint8_t>(v);
+}
+
+// ============================================================================
+// Envelope bar drawing (render_composite_full_band; the partial path mirrors
+// the same draw order inline)
+// ============================================================================
+
+void DroneDisplay::draw_bar_with_envelope(
+    Painter& painter,
+    uint16_t x,
+    uint16_t y,
+    uint16_t bar_height,
+    uint32_t color,
+    EnvelopeState& state
+) noexcept {
+    if (color == COLOR_BACKGROUND || bar_height == 0) {
+        state.gap_count++;
+        if (state.gap_count > EnvelopeState::MAX_GAP) {
+            state.prev_valid = false;
+        }
+        return;
+    }
+
+    draw_rectangle(painter, x, y, 1, bar_height, color);
+
+    // Envelope: draw connector from previous active pixel, then dot.
+    if (state.prev_valid && state.gap_count == 0 && y != state.prev_y) {
+        const uint16_t lo = (y < state.prev_y) ? y : state.prev_y;
+        const uint16_t hi = (y < state.prev_y) ? state.prev_y : y;
+        draw_rectangle(painter, x, lo, 1, hi - lo + 1, COLOR_TEXT);
+    } else if (state.prev_valid && state.gap_count > 0
+               && state.gap_count <= EnvelopeState::MAX_GAP) {
+        const uint16_t lo = (y < state.prev_y) ? y : state.prev_y;
+        const uint16_t hi = (y < state.prev_y) ? state.prev_y : y;
+        draw_rectangle(painter, x, lo, 1, hi - lo + 1, COLOR_TEXT);
+    }
+    draw_rectangle(painter, x, y, 1, 1, COLOR_TEXT);
+
+    state.prev_y = y;
+    state.prev_valid = true;
+    state.gap_count = 0;
+}
+
+void DroneDisplay::render_composite_full_band(
+    Painter& painter,
+    BandRenderCtx& band,
+    const uint8_t* composite_data,
+    size_t composite_size,
+    uint16_t start_x,
+    uint16_t start_y,
+    uint16_t width,
+    uint16_t height,
+    int16_t scan_head,
+    uint8_t noise_floor,
+    FreqHz title_start,
+    FreqHz title_end
+) noexcept {
+    if (composite_data == nullptr || composite_size == 0 || height < WF_HEADER_H + 6 || band.shadow == nullptr) {
+        return;
+    }
+
+    draw_rectangle(painter, start_x, start_y, width, height, COLOR_BACKGROUND);
+    draw_rectangle(painter, start_x, start_y, width, 1, COLOR_UNKNOWN_THREAT);
+
+    // Title: compact frequency range (e.g. "5700M-5900M")
+    if (title_start < title_end) {
+        char title_buf[20];
+        const uint32_t mhz_lo = static_cast<uint32_t>(title_start / 1000000ULL);
+        const uint32_t mhz_hi = static_cast<uint32_t>(title_end / 1000000ULL);
+        char* dst = title_buf;
+        size_t rem = sizeof(title_buf);
+        write_uint(dst, rem, mhz_lo);
+        write_str(dst, rem, "M-");
+        write_uint(dst, rem, mhz_hi);
+        write_str(dst, rem, "M");
+        *dst = '\0';
+        draw_text_small(painter, title_buf, start_x + 2, start_y + 1, COLOR_TEXT);
+    } else {
+        draw_text_small(painter, "SWEEP", start_x + 2, start_y + 1, COLOR_TEXT);
+    }
+
+    const uint16_t chart_start_x = start_x + 2;
+    const uint16_t chart_start_y = start_y + WF_HEADER_H;
+    const uint16_t chart_height = height - WF_HEADER_H - 2;
+    if (chart_height < 4) return;
+
+    const uint16_t chart_w = (width > 4) ? (width - 4) : 0;
+    const uint16_t bar_count = static_cast<uint16_t>(
+        (composite_size <= chart_w) ? composite_size : chart_w);
+
+    // Red detection-window brackets over the title strip (SWP From/To ranges
+    // of the window shown on this band). Band index is carried by the render
+    // context (fixed at construction) — no pointer-identity assumptions (M1).
+    const uint8_t band_idx = band.band_idx_;
+    draw_detection_brackets(painter, band_idx, title_start, title_end,
+                            composite_size, bar_count, chart_start_x, start_y + 1);
+
+    // Compute display threshold: subtract noise floor + margin from all power values.
+    // This eliminates the visible noise baseline while preserving signal peaks.
+    // noise_floor parameter allows per-band noise floor in dual-sweep mode.
+    const uint8_t display_threshold = min_color_power_;
+
+    // White envelope state: connects bar tops (classical spectrum analyzer look).
+    // Envelope only draws on above-threshold bars — eliminates the sub-threshold
+    // white dot line that previously appeared at the chart bottom.
+    // Stack: ~6 bytes (EnvelopeState struct).
+    const uint16_t envelope_y0 = static_cast<uint16_t>(chart_start_y + chart_height);
+    EnvelopeState envelope{envelope_y0, false, 0};
+
+    for (uint16_t i = 0; i < bar_count; ++i) {
+        uint8_t power = composite_data[i];
+
+        // Subtract noise floor — reused for both bar color and envelope.
+        if (power > noise_floor) {
+            power -= noise_floor;
+        } else {
+            power = 0;
+        }
+
+        const uint16_t x = chart_start_x + i;
+
+        // Bar color from noise-subtracted power
+        uint32_t color = COLOR_BACKGROUND;
+        if (power >= display_threshold) {
+            if (power > 200) color = COLOR_CRITICAL_THREAT;
+            else if (power > 150) color = COLOR_HIGH_THREAT;
+            else if (power > 100) color = COLOR_MEDIUM_THREAT;
+            else color = COLOR_LOW_THREAT;
+        }
+
+        const uint16_t bar_height = (static_cast<uint16_t>(power) * chart_height) >> 8;
+        const uint16_t final_height = (bar_height > 0) ? bar_height : 1;
+        const uint16_t y = chart_start_y + chart_height - final_height;
+
+        draw_bar_with_envelope(painter, x, y, final_height, color, envelope);
+
+        // Shadow = exactly what was drawn: the post noise-floor value fully
+        // determines color, bar height and dot of this column (1 byte/column).
+        band.shadow[i] = power;
+    }
+
+    // Real-time scan-head marker: 1-px white vertical line at current pixel_index.
+    if (scan_head >= 0 && static_cast<uint16_t>(scan_head) < bar_count) {
+        const uint16_t hx = chart_start_x + static_cast<uint16_t>(scan_head);
+        painter.draw_rectangle({hx, chart_start_y, 1, chart_height}, Color::white());
+        band.marker_on_screen = scan_head;
+    } else {
+        band.marker_on_screen = -1;
+    }
+
+    // Snapshot every screen-visible input — mismatch later forces full repaint.
+    band.shadow_valid = true;
+    band.last_noise_floor = noise_floor;
+    band.last_threshold = min_color_power_;
+    band.last_x = start_x;
+    band.last_y = start_y;
+    band.last_w = width;
+    band.last_h = height;
+    band.last_title_start = title_start;
+    band.last_title_end = title_end;
+}
+
+void DroneDisplay::draw_detection_brackets(
+    Painter& painter,
+    uint8_t band_idx,
+    FreqHz f_min,
+    FreqHz f_max,
+    size_t composite_size,
+    uint16_t bar_count,
+    uint16_t chart_start_x,
+    uint16_t title_y
+) noexcept {
+    if (band_idx >= DET_WIN_BAND_COUNT || !det_win_active_[band_idx]) return;
+    if (f_min == 0 || f_max <= f_min || composite_size == 0 || bar_count == 0) return;
+
+    const FreqHz range = f_max - f_min;
+    // Inverse of the composite mapping in SweepProcessor::process_frame():
+    // index = (freq - f_min) * composite_size / range → on-screen pixel X is
+    // chart_start_x + index (the exact anchor the bars use).
+    for (uint8_t i = 0; i < DETECTION_WINDOWS_PER_WINDOW; ++i) {
+        const uint32_t start_mhz = det_win_start_mhz_[band_idx][i];
+        const uint32_t end_mhz = det_win_end_mhz_[band_idx][i];
+        // Single source of truth: constants.hpp::is_det_win_slot_active()
+        // — the exact rule the scanner gate applies at detection time (M2).
+        if (!is_det_win_slot_active(start_mhz, end_mhz)) continue;
+
+        // MHz → Hz expansion in u64 — 7200e6 cannot overflow.
+        const FreqHz lo = static_cast<FreqHz>(start_mhz) * MHZ;
+        const FreqHz hi = static_cast<FreqHz>(end_mhz) * MHZ;
+
+        // u64 intermediates: (lo - f_min) up to ~7 GHz × 240 fits easily.
+        const uint16_t i0 = (lo <= f_min)
+            ? 0U
+            : static_cast<uint16_t>((lo - f_min) * composite_size / range);
+        const uint16_t i1 = (hi >= f_max)
+            ? static_cast<uint16_t>(composite_size - 1)
+            : static_cast<uint16_t>((hi - f_min) * composite_size / range);
+
+        // Clamp to the on-screen bar range (chart may be narrower than the
+        // composite); skip slots entirely off the visible right edge.
+        if (i0 >= bar_count) continue;
+        const uint16_t clamped_i1 = (i1 >= bar_count) ? static_cast<uint16_t>(bar_count - 1) : i1;
+
+        const uint16_t x0 = chart_start_x + i0;
+        const uint16_t x1 = chart_start_x + clamped_i1;
+
+        // Bracket glyph: 1px top rail + 2px down-ticks on both ends — mini-font
+        // height, drawn OVER the title text by design (per UI spec).
+        draw_rectangle(painter, x0, title_y, static_cast<uint16_t>(x1 - x0 + 1), DET_BRACKET_RAIL_H, COLOR_DET_WINDOW);
+        draw_rectangle(painter, x0, title_y, 1, DET_BRACKET_TICK_H, COLOR_DET_WINDOW);
+        draw_rectangle(painter, x1, title_y, 1, DET_BRACKET_TICK_H, COLOR_DET_WINDOW);
+    }
+}
+
+void DroneDisplay::render_composite_partial_band(
+    Painter& painter,
+    BandRenderCtx& band,
+    const uint8_t* composite_data,
+    size_t composite_size,
+    uint16_t start_x,
+    uint16_t start_y,
+    uint16_t width,
+    uint16_t height,
+    int16_t scan_head,
+    uint8_t noise_floor,
+    bool data_changed,
+    FreqHz title_start,
+    FreqHz title_end
+) noexcept {
+    if (composite_data == nullptr || composite_size == 0 || height < WF_HEADER_H + 6 || band.shadow == nullptr) {
+        return;
+    }
+
+    const uint16_t chart_start_x = start_x + 2;
+    const uint16_t chart_start_y = start_y + WF_HEADER_H;
+    const uint16_t chart_height = height - WF_HEADER_H - 2;
+    if (chart_height < 4) return;
+
+    const uint16_t chart_w = (width > 4) ? (width - 4) : 0;
+    const uint16_t bar_count = static_cast<uint16_t>(
+        (composite_size <= chart_w) ? composite_size : chart_w);
+
+    // Guard: any screen-visible input changed since last paint → full repaint.
+    // Covers threshold, noise floor, layout shifts, sweep title range
+    // (title strip + detection brackets are full-render only) and the very
+    // first paint.
+    const bool need_full = !band.shadow_valid
+        || band.last_x != start_x || band.last_y != start_y
+        || band.last_w != width || band.last_h != height
+        || band.last_noise_floor != noise_floor
+        || band.last_threshold != min_color_power_
+        || band.last_title_start != title_start
+        || band.last_title_end != title_end;
+
+    if (need_full) {
+        render_composite_full_band(painter, band, composite_data, composite_size,
+                                   start_x, start_y, width, height,
+                                   scan_head, noise_floor, title_start, title_end);
+        return;
+    }
+
+    // ---- NEIGHBOUR-AWARE INCREMENTAL REDRAW (data may have changed) ----
+    //
+    // The white envelope connector for the transition (i-1 → i) is drawn AT
+    // COLUMN i, spanning [min(top[i-1],top[i]), max(...)]:
+    //
+    //     connector(i) = f(top[i-1], top[i])   // cross-column dependency
+    //
+    // A naive per-column diff keyed on `p != shadow[i]` misses the case where
+    // top[i-1] moves while top[i] stays equal — the connector AT COLUMN i
+    // must move but the column is not selected (the old "envelope line goes
+    // stale" defect that motivated a full repaint). The neighbour-aware rule
+    //
+    //     redraw(i) ⟺ Δp[i] ∨ Δp[i-1]
+    //
+    // covers the dependency exactly: a column is redrawn when its OWN top
+    // changed (bar + outgoing connector) OR its LEFT neighbour's top changed
+    // (incoming connector). Δp[i-1] is tracked through loop state
+    // `prev_changed` — zero extra memory. The envelope state below is
+    // replayed over EVERY column (changed or not), mirroring the full-render
+    // loop, so any redrawn column is pixel-identical to a full repaint.
+    //
+    // Old marker column must be restored from shadow (the white marker line
+    // is on screen, but shadow holds the true data pixels for that column).
+    // A column that is both marker-restore AND data-redraw is drawn once
+    // (single branch) with the NEW data; the marker is re-drawn on top below
+    // when the column still hosts the live scan head.
+    const int16_t restore_col =
+        (band.marker_on_screen != scan_head) ? band.marker_on_screen : -1;
+
+    const uint8_t display_threshold = min_color_power_;
+
+    // White envelope state — advanced over EVERY column (unchanged ones too),
+    // exactly mirroring the full-render loop in draw_bar_with_envelope(), so
+    // redrawn columns redraw their connector from the true neighbour top.
+    // Stack: ~6 bytes.
+    const uint16_t envelope_y0 = static_cast<uint16_t>(chart_start_y + chart_height);
+    EnvelopeState env{envelope_y0, false, 0};
+
+    bool prev_changed = false;
+
+    for (uint16_t i = 0; i < bar_count; ++i) {
+        uint8_t p = composite_data[i];
+        p = (p > noise_floor) ? static_cast<uint8_t>(p - noise_floor) : static_cast<uint8_t>(0);
+
+        const bool changed = (p != band.shadow[i]);
+        // Own top moved (bar + outgoing connector) OR left neighbour moved
+        // (incoming connector at this column depends on top[i-1]).
+        const bool redraw = data_changed && (changed || prev_changed);
+        const bool is_restore =
+            (restore_col >= 0) && (static_cast<uint16_t>(restore_col) == i);
+
+        const uint16_t bar_h_raw = (static_cast<uint16_t>(p) * chart_height) >> 8;
+        const uint16_t bar_h = (bar_h_raw > 0) ? bar_h_raw : 1;
+        const uint16_t y = chart_start_y + chart_height - bar_h;
+
+        if (redraw || is_restore) {
+            const uint16_t x = chart_start_x + i;
+            draw_rectangle(painter, x, chart_start_y, 1, chart_height, COLOR_BACKGROUND);
+            if (p >= display_threshold) {
+                // Same draw order as draw_bar_with_envelope: bar → connector → dot.
+                uint32_t color = COLOR_LOW_THREAT;
+                if (p > 200)      color = COLOR_CRITICAL_THREAT;
+                else if (p > 150) color = COLOR_HIGH_THREAT;
+                else if (p > 100) color = COLOR_MEDIUM_THREAT;
+                draw_rectangle(painter, x, y, 1, bar_h, color);
+                if (env.prev_valid && (env.gap_count > 0 || y != env.prev_y)) {
+                    const uint16_t lo = (y < env.prev_y) ? y : env.prev_y;
+                    const uint16_t hi = (y < env.prev_y) ? env.prev_y : y;
+                    draw_rectangle(painter, x, lo, 1, hi - lo + 1, COLOR_TEXT);
+                }
+                draw_rectangle(painter, x, y, 1, 1, COLOR_TEXT);
+            }
+            // Live scan-head marker column was just cleared above — re-draw
+            // the white marker ON TOP (full repaint does the same: bars first,
+            // marker last). Shadow keeps the true DATA pixel (marker overdraws
+            // the screen only); restore-on-leave reads it back.
+            if (i == static_cast<uint16_t>(scan_head)) {
+                painter.draw_rectangle({x, chart_start_y, 1, chart_height}, Color::white());
+            }
+            band.shadow[i] = p;
+        }
+
+        // Advance envelope state for EVERY column — pixel-identical semantics
+        // to the full render path.
+        if (p >= display_threshold) {
+            env.prev_y = y;
+            env.prev_valid = true;
+            env.gap_count = 0;
+        } else {
+            ++env.gap_count;
+            if (env.gap_count > EnvelopeState::MAX_GAP) {
+                env.prev_valid = false;
+            }
+        }
+        prev_changed = changed;
+    }
+
+    // Marker diff: at most one white 1×chart_height line per band.
+    if (band.marker_on_screen != scan_head) {
+        if (scan_head >= 0 && static_cast<uint16_t>(scan_head) < bar_count) {
+            const uint16_t hx = chart_start_x + static_cast<uint16_t>(scan_head);
+            painter.draw_rectangle({hx, chart_start_y, 1, chart_height}, Color::white());
+            band.marker_on_screen = scan_head;
+        } else {
+            band.marker_on_screen = -1;
+        }
+    }
+}
+
+/// @brief Legacy entry point — delegates to full band render (compat wrapper).
+/// @note paint() now uses render_composite_partial_band(); kept for API
+///       stability (dead-code eliminated by the linker if truly unused).
+void DroneDisplay::render_composite(
+    Painter& painter,
+    const uint8_t* composite_data,
+    size_t composite_size,
+    uint16_t start_x,
+    uint16_t start_y,
+    uint16_t width,
+    uint16_t height,
+    int16_t scan_head,
+    uint8_t noise_floor,
+    FreqHz freq_start_override,
+    FreqHz freq_end_override
+) noexcept {
+    // Use override values if provided, otherwise fall back to member variables.
+    const FreqHz title_start = (freq_start_override != 0) ? freq_start_override : sweep_freq_start_;
+    const FreqHz title_end   = (freq_end_override != 0)   ? freq_end_override   : sweep_freq_end_;
+    render_composite_full_band(painter, band1_, composite_data, composite_size,
+                               start_x, start_y, width, height,
+                               scan_head, noise_floor, title_start, title_end);
+}
+
+void DroneDisplay::set_sweep2_data(const uint8_t* data, size_t size) noexcept {
+    if (data == nullptr || size == 0) {
+        sweep2_data_ = nullptr;
+        sweep2_data_size_ = 0;
+        return;
+    }
+
+    const size_t copy_n = (size < COMPOSITE_SIZE) ? size : COMPOSITE_SIZE;
+
+    // Apply EMA persistence for band 2 (same formula as band 1).
+    // CHANGE-DETECTION: same gate as set_composite_data — skip the repaint
+    // when the decay has converged and the pushed composite is a duplicate.
+    bool any_changed = (sweep2_data_ == nullptr) || (copy_n != sweep2_data_size_);
+    if (!sweep2_persist_initialized_) {
+        for (size_t i = 0; i < copy_n; ++i) {
+            s_dd.sweep2_persist[i] = data[i];
+        }
+        sweep2_persist_initialized_ = true;
+        any_changed = true;
+    } else {
+        for (size_t i = 0; i < copy_n; ++i) {
+            const uint8_t old = s_dd.sweep2_persist[i];
+            const uint16_t decayed = (static_cast<uint16_t>(old)
+                                      * SWEEP_PERSISTENCE_DECAY_Q8) >> 8;
+            const uint8_t next = (data[i] > static_cast<uint8_t>(decayed))
+                ? data[i]
+                : static_cast<uint8_t>(decayed);
+            if (next != old) {
+                s_dd.sweep2_persist[i] = next;
+                any_changed = true;
+            }
+        }
+    }
+
+    sweep2_data_ = s_dd.sweep2_persist;
+    sweep2_data_size_ = copy_n;
+    if (!any_changed) {
+        return;
+    }
+    // Data changed → incremental neighbour-aware band repaint (white envelope
+    // line is cross-column; see render_composite_partial_band).
+    dirty_flags_ |= DIRTY_SPEC_DATA;
+    set_dirty();
+}
+
+void DroneDisplay::set_detection_windows(
+    uint8_t band,
+    const uint32_t (&start_mhz)[DETECTION_WINDOWS_PER_WINDOW],
+    const uint32_t (&end_mhz)[DETECTION_WINDOWS_PER_WINDOW]) noexcept {
+    if (band >= DET_WIN_BAND_COUNT) return;
+    // Unchanged push (every sweep frame) → two memcmps, no repaint churn.
+    if (std::memcmp(det_win_start_mhz_[band], start_mhz, sizeof(start_mhz)) == 0 &&
+        std::memcmp(det_win_end_mhz_[band], end_mhz, sizeof(end_mhz)) == 0) {
+        return;
+    }
+    std::memcpy(det_win_start_mhz_[band], start_mhz, sizeof(start_mhz));
+    std::memcpy(det_win_end_mhz_[band], end_mhz, sizeof(end_mhz));
+
+    // Single source of truth: constants.hpp::is_det_win_slot_active()
+    // (same rule as the scanner gate; 0 = unset, inverted = inactive).
+    bool any_active = false;
+    for (uint8_t i = 0; i < DETECTION_WINDOWS_PER_WINDOW; ++i) {
+        if (is_det_win_slot_active(start_mhz[i], end_mhz[i])) {
+            any_active = true;
+            break;
+        }
+    }
+    det_win_active_[band] = any_active;
+
+    // Brackets live in the title strip, which only the FULL band renderer
+    // draws → invalidate the incremental shadows for exactly one full repaint.
+    // DIRTY_SPEC forces the full-render path immediately on the next paint.
+    det_win_dirty_ = true;
+    dirty_flags_ |= DIRTY_SPEC;
+    set_dirty();
+}
+
+void DroneDisplay::render_dual_composite(
+    Painter& painter,
+    uint16_t start_x,
+    uint16_t start_y,
+    uint16_t width,
+    uint16_t height
+) noexcept {
+    if (composite_data_ == nullptr || sweep2_data_ == nullptr || height < 8) {
+        return;
+    }
+
+    // Split height between two sweep bands
+    const uint16_t band_h = height / 2;
+    if (band_h < 4) return;
+
+    const bool full   = (dirty_flags_ & DIRTY_SPEC) != 0;
+    const bool data   = full || (dirty_flags_ & DIRTY_SPEC_DATA) != 0;
+    const bool marker = data || (dirty_flags_ & DIRTY_SPEC_MARKER) != 0;
+    if (!marker) return;  // Nothing spectrum-related to paint
+
+    // Band 1 (top half) — upper band scan head, band 1 noise floor.
+    // Band 2 (bottom half) — band 2 freq range as title override and its own
+    // independently computed noise floor. Both VALID floors get the same user
+    // shelf offset (SWEEP_SHELF_OFFSET_* coupling, see set_shelf_offset); an
+    // invalid floor stays 0 — offsetting "unknown" would bias a band until its
+    // first percentile pass.
+    const uint8_t nf1 = composite_noise_floor_valid_
+        ? apply_shelf_offset(composite_noise_floor_) : uint8_t{0};
+    const uint8_t nf2 = sweep2_noise_floor_valid_
+        ? apply_shelf_offset(sweep2_noise_floor_) : uint8_t{0};
+
+    if (full) {
+        render_composite_full_band(painter, band1_, composite_data_, composite_data_size_,
+                                   start_x, start_y, width, band_h,
+                                   scan_head_position_[0], nf1,
+                                   sweep_freq_start_, sweep_freq_end_);
+        render_composite_full_band(painter, band2_, sweep2_data_, sweep2_data_size_,
+                                   start_x, start_y + band_h, width, band_h,
+                                   scan_head_position_[1], nf2,
+                                   sweep2_freq_start_, sweep2_freq_end_);
+    } else {
+        // Incremental: each band redraws only its changed columns (+ marker).
+        render_composite_partial_band(painter, band1_, composite_data_, composite_data_size_,
+                                      start_x, start_y, width, band_h,
+                                      scan_head_position_[0], nf1, data,
+                                      sweep_freq_start_, sweep_freq_end_);
+        render_composite_partial_band(painter, band2_, sweep2_data_, sweep2_data_size_,
+                                      start_x, start_y + band_h, width, band_h,
+                                      scan_head_position_[1], nf2, data,
+                                      sweep2_freq_start_, sweep2_freq_end_);
+    }
+}
+
+int16_t DroneDisplay::hit_test(uint16_t x, uint16_t y) const noexcept {
+    if (!drone_list_visible_ || display_data_.drone_count == 0) {
+        return -1;
+    }
+
+    const uint16_t width = parent_rect().size().width();
+    if (x >= width) return -1;
+
+    // SINGLE SOURCE OF TRUTH: Use calculate_layout() — same as paint() uses
+    const auto layout = calculate_layout();
+
+    if (y < layout.list_start_y || y >= layout.list_start_y + layout.drone_h) return -1;
+
+    // No header row — entry rows begin at the section top (mirrors render_drone_list).
+    // SINGLE SOURCE OF TRUTH: compute_entry_layout() — the same helper paint() uses.
+    const uint16_t entry_y = y - layout.list_start_y;
+    const EntryLayout el = compute_entry_layout(display_data_.drone_count, width,
+                                                layout.drone_h, dual_column_mode_);
+    // Rows that actually fit — mirrors the "Don't overflow" break in render_drone_list.
+    const uint16_t visible_rows = (el.entry_h > 0) ? (layout.drone_h / el.entry_h) : 0;
+
+    if (el.col_w < width) {
+        // Dual column: pick the column by X, the row by Y. Odd count means the
+        // right column's last cell is empty → that tap returns -1.
+        const uint16_t col = (x >= el.col_w) ? 1 : 0;
+        const uint16_t row = entry_y / el.entry_h;
+        if (row >= visible_rows) return -1;
+        const size_t idx = (col == 0) ? row : (static_cast<size_t>(row) + el.rows);
+        if (idx >= display_data_.drone_count) return -1;
+        return static_cast<int16_t>(idx);
+    }
+
+    const uint16_t idx = entry_y / el.entry_h;
+    if (idx >= visible_rows) return -1;
+    if (idx >= display_data_.drone_count) return -1;
+
+    return static_cast<int16_t>(idx);
+}
+
+} // namespace drone_analyzer

@@ -1,0 +1,2351 @@
+#include <cstdint>
+#include <cstring>
+#include <array>
+#include <new>
+
+#include "ch.h"
+
+#include "ui.hpp"
+#include "ui_fileman.hpp"
+#include "scanner.hpp"
+#include "scanner_thread.hpp"
+#include "drone_settings.hpp"
+#include "settings_manager.hpp"
+#include "drone_sweep_view.hpp"
+#include "database.hpp"
+#include "hardware_controller.hpp"
+#include "audio_alerts.hpp"
+#include "audio.hpp"
+#include "constants.hpp"
+#include "sweep_sensitivity.hpp"
+#include "string_format.hpp"
+#include "baseband_api.hpp"
+// DIRECT dependency (IWYU): this TU consumes RetuneMessage,
+// ChannelStatisticsMessage and MessageHandlerRegistration — previously
+// smuggled in transitively via scanner_thread.hpp (which itself moved the
+// event_m0.hpp include into scanner_thread.cpp).
+#include "message.hpp"
+#include "portapack_persistent_memory.hpp"
+#include "portapack.hpp"
+#include "file_path.hpp"
+#include "radio.hpp"
+
+#include "drone_scanner_ui.hpp"
+
+namespace drone_analyzer {
+
+static HardwareController s_hardware;
+static DatabaseManager s_database;
+static DroneScanner s_scanner(s_database, s_hardware);
+static ScannerThread s_scanner_thread(s_scanner);
+
+// Shared workspace buffers — UI-thread only, never concurrent.
+// Single source of truth for all config/settings edits.
+// Replaces 5 separate file-level statics (~1,824 B) with 2 shared copies (~728 B),
+// saving ~1,096 B of BSS.
+ScanConfig g_workspace_cfg;
+SettingsStruct g_workspace_settings;
+
+// INVARIANT: g_workspace_cfg is UI-thread-only. The scanner thread never reads
+// it (DroneScanner uses its internal config_ under DATA_MUTEX). All readers and
+// writers here run on the UI thread, so no locking is required.
+// If a future feature must access config from another thread, protect ALL
+// readers AND writers with one consistent lock scheme — never partial locking.
+
+// ============================================================================
+// Handler registration — placement-new to allow manual lifetime control.
+// ============================================================================
+void DroneScannerUI::register_handlers() noexcept {
+    if (handlers_active_) return;
+
+    auto* const h = reinterpret_cast<HandlerStorage*>(handler_storage_);
+
+    new (&h->spectrum_config) MessageHandlerRegistration{
+        Message::ID::ChannelSpectrumConfig,
+        [this](Message* const p) {
+            const auto message = *reinterpret_cast<const ChannelSpectrumConfigMessage*>(p);
+            this->spectrum_fifo_ = message.fifo;
+        }
+    };
+    new (&h->frame_sync) MessageHandlerRegistration{
+        Message::ID::DisplayFrameSync,
+        [this](Message* const) {
+            if (!this->scanning_) return;
+            if (this->spectrum_fifo_ != nullptr) {
+                // C1: drain-to-newest per tick (sweep-aware). The M0 produces
+                // FFT frames ~2.5x faster than the ~60 Hz DisplayFrameSync
+                // consumer, so the 4-slot FIFO is permanently FULL and a plain
+                // single out() always returns a 2-4-frame-old capture. In sweep
+                // mode that staleness is pure dead air: EVERY processed step is
+                // followed by a retune, and without a drain the stale backlog
+                // had to be cleared one frame per tick (under the OLD single-out
+                // consumer: SWEEP_SETTLE_FRAMES + STALE_FIFO_FRAMES = 4 ticks
+                // ≈ 67 ms of dwell that integrates NOTHING — the backlog term is
+                // obsolete since this drain; see retune_sweep_window()).
+                // Draining to the newest frame here keeps exactly ONE frame per
+                // tick on the wire (same CPU and RF budget as before — the
+                // dropped frames were never integrated anyway) but hands the
+                // pipeline the FRESHEST capture, so after a retune only the
+                // frames that can physically be stale are dropped: exactly
+                // `len() + 1` of them, snapshotted atomically with the retune
+                // (see retune_sweep_window). The step cadence is therefore ONE
+                // tick in every case — no age predicate, no degradation during
+                // handler overrun bursts.
+                // DB-scan mode is UNTOUCHED (single out(), same cadence and the
+                // same retune-straddle guard in on_channel_spectrum) — the
+                // drain runs only while composite_active_ (sweep) is true.
+                // Detection sensitivity is PER-UNIT-TIME POSITIVE: the
+                // analyzed frames are still full 6.5 ms FFT integrations
+                // (trigger 63), only younger (post-retune instead of
+                // next-tick), and the per-second detector/TBD look count
+                // rises with the 2x slice cadence. The per-slice look COUNT is
+                // bounded by SweepWindow::spend_detector_look() so FIFO depth
+                // never becomes a hidden false-alarm bias.
+                // Threading: single consumer (this UI handler); M0 is the sole
+                // producer. FIFO::out() is the consumer-side primitive; the
+                // loop is bounded (FIFO depth is 4) so it cannot spin.
+                ChannelSpectrum& spectrum = this->spectrum_buffer_;
+                bool have_frame = false;
+                bool fallback_display_only = false;
+                if (this->composite_active_) {
+                    ChannelSpectrum& discard = this->spectrum_discard_;
+                    uint8_t drained = 0;
+                    // STALE-BUDGET ACCOUNTING (replaces the SETTLE-TICK
+                    // CLASSIFICATION + sweep_post_retune_action age verdict):
+                    //  - entry_skip (corrupt idx / first post-entry FFT via
+                    //    skip_next_fft_): EVERY queued frame is suspect —
+                    //    exact full-settle semantics (drained dropped, final
+                    //    frame handed to on_sweep_spectrum).
+                    //  - otherwise: drop EXACTLY retune_pending_frames_ oldest
+                    //    frames — the count snapshot atomically with the retune
+                    //    in retune_sweep_window() (FIFO level + the in-flight
+                    //    straddler). No timing assumption and no "oldest ==
+                    //    straddler" guess: the old age predicate
+                    //    (SWEEP_CLEAN_FRAME_MS) asked "is this tick young?"
+                    //    when the real hazard is "did a frame complete between
+                    //    the handler's FIFO drain and the retune?" — a function
+                    //    of handler latency, not of tick age. The busiest
+                    //    handler of the pass is exactly the one that retunes at
+                    //    a window boundary (3 drained frames through the S1
+                    //    detector loop + pair completion + AGC + waterfall push
+                    //    precede the retune), which is where the old assumption
+                    //    broke and a mixed-frequency straddler got painted into
+                    //    the start of the next window.
+                    const bool idx_ok = (this->active_sweep_idx_ < MAX_SWEEP_WINDOWS);
+                    const bool entry_skip = !idx_ok || this->skip_next_fft_;
+                    uint8_t stale_budget = 0;
+                    uint8_t stale_dropped = 0;
+                    if (!entry_skip) {
+                        auto& sww = this->sweep_[this->active_sweep_idx_];
+                        stale_budget = sww.retune_pending_frames_;
+                        sww.retune_pending_frames_ = 0;
+                    }
+                    const bool settle_tick = entry_skip;
+                    // Keep the newest: pop older frames into the discard buffer
+                    // (same BSS class as spectrum_buffer_, NOT the stack —
+                    // ChannelSpectrum is ~272 bytes), then pop the final frame
+                    // into spectrum_buffer_ for processing.
+                    while (this->spectrum_fifo_->out(discard)) {
+                        if (stale_budget > 0) {
+                            // PRE-RETUNE FRAME — queued at the retune instant,
+                            // or the in-flight straddler whose capture
+                            // interval contains it. Its bins either precede
+                            // the current slice center or mix the old and the
+                            // new one, so it must contribute nothing: no
+                            // composite write, no Hz credit, no detector feed
+                            // (it never reaches process_bins /
+                            // process_spectrum_sweep). Every frame BEHIND this
+                            // budget completed after the last dropped one,
+                            // i.e. after the retune + PLL lock (~200 us) —
+                            // processed as live below.
+                            // Sensitivity: these frames were discarded by the
+                            // old full-settle cadence too (whole settle tick);
+                            // the live frames behind them were processed by the
+                            // old NEXT tick — one tick earlier now.
+                            --stale_budget;
+                            ++stale_dropped;
+                            ++drained;
+                            continue;
+                        }
+                        // C2 SENSITIVITY FIX: a drained live frame is a full
+                        // 6.5 ms FFT capture at the current frequency — it must
+                        // not be thrown away. Integrate it into the composite
+                        // (max-hold at true RF positions, display-only, no
+                        // progress credit) so each sweep step recovers the
+                        // ~60% of RF integration budget the unconditional
+                        // drain used to discard (~+4 dB equivalent hold).
+                        // Detection: drained live frames now feed the sweep
+                        // detector too (see S1 below); entry_skip ticks drop
+                        // everything (above).
+                        if (!settle_tick) {
+                            this->sweep_[this->active_sweep_idx_].process_bins(discard, false);
+                            // S1 SENSITIVITY FIX: drained live frames are full
+                            // 6.5 ms FFT captures at the CURRENT slice center
+                            // (in a live tick every queued frame postdates the
+                            // last retune — see STALE-BUDGET ACCOUNTING above),
+                            // yet only the final frame reached the detector.
+                            // Feed them to the sweep detector as well: the
+                            // tracker and waterfall_history_ (TBD) now see the
+                            // ~2.5x more integration per step that the M0
+                            // actually delivers (≈ +4 dB effective), and the
+                            // TBD waterfall (TBD_MIN_FRAMES = 3) warms within
+                            // ~1 tick instead of ~3 passes.
+                            // Chronological order holds: out() pops FIFO order
+                            // (oldest first), so these samples precede the
+                            // final frame's sample — the median filter and the
+                            // per-window waterfall stay time-ordered. The
+                            // stale budget (dropped above) is OLDER still —
+                            // discarding it keeps the processed subsequence
+                            // time-ordered too.
+                            // PREFILTER (CPU fix): pure-noise drained slices
+                            // skip detector entry (quickselect + waterfall
+                            // push + CFAR + 12-step shape + TBD scan) instead
+                            // of paying ~2000+ cycles for them.
+                            // SINGLE SOURCE OF TRUTH:
+                            // sweep_sensitivity.hpp::sweep_fast_prefilter —
+                            // the SAME helper process_spectrum_sweep() calls,
+                            // so the RSSI-only bypass (spectrum_detection_
+                            // enabled=false => never gate) and the half-gate
+                            // rule exist exactly once.
+                            // Config snapshot via TryLock (fail-open):
+                            // shape_gate_margin_try() returns 0 on contention
+                            // => gate 0 => everything analyzed;
+                            // is_spectrum_shape_enabled_try() returns true
+                            // on contention => gate evaluated, but with the
+                            // same 0 margin => passes. Blocking here would
+                            // stall the 60 Hz DisplayFrameSync tick and drop
+                            // FIFO frames (= sensitivity loss).
+                            // Peak/noise scanned here: one 236-bin min/max
+                            // pass, stack ~8 B, no quickselect. The scan is
+                            // min-based: min <= p25 holds, and BOTH shelves
+                            // carry the SAME SWEEP_SHELF_OFFSET (sweep_shelf_
+                            // offset_try), so clamp(min+off) <= clamp(p25+off)
+                            // under the monotone clamp — this gate stays a
+                            // strict SUBSET of the detector's 25th-percentile
+                            // gate for EVERY offset (the un-biased min shelf
+                            // used to sit ABOVE p25+off for off < 0 and drop
+                            // frames — with their TBD votes — the detector
+                            // would have kept). It can never drop a frame the
+                            // detector would have accepted.
+                            // TBD REACHABILITY (sensitivity parity): a frame
+                            // that fails the half-gate is still ADMITTED when
+                            // it could contribute a weak-signal vote to the
+                            // multi-frame integrator. That decision belongs to
+                            // the integrator's OWN criterion (RSSI threshold
+                            // floored at the noise shelf + TBD_MIN_ELEVATION_
+                            // UNITS), not to half of the shape gate: the
+                            // half-gate discards the below-half-gate class that
+                            // TBD exists to confirm, and it RISES with the
+                            // Sensitivity knob (inverted response for weak
+                            // targets). Same helper and same threshold
+                            // derivation as the detector, which then runs only
+                            // the cheap TBD pass for such a frame (no CFAR, no
+                            // shape chain) — the CPU saving is preserved.
+                            // Dropping the frame HERE would be irrecoverable:
+                            // the detector pushes frames into waterfall_history_
+                            // BEFORE its own gate, but a frame discarded at this
+                            // level never reaches the detector and its vote is
+                            // lost outright.
+                            // The dup scan vs process_spectrum_sweep Step 1
+                            // is INTENTIONAL: it lets pure-noise drained slices
+                            // skip the whole detector, while survivors still get
+                            // the 25th-percentile + median feed inside the
+                            // detector, so TBD/median warm-up is unaffected.
+                            // No blocking locks: the sweep path runs on the
+                            // UI thread with the scanner thread stopped (see
+                            // process_spectrum_sweep() docs in scanner.hpp).
+                            bool drain_detect = true;
+                            if (this->scanner_ptr_ != nullptr) {
+                                uint8_t d_peak = 0;
+                                uint8_t d_nf = UINT8_MAX;  // min-accumulator seed
+                                const uint8_t* d_db = discard.db.data();
+                                for (size_t di = FFT_EDGE_SKIP_NARROW;
+                                     di < FFT_DC_SPIKE_START; ++di) {
+                                    const uint8_t v = d_db[di];
+                                    if (v > d_peak) d_peak = v;
+                                    if (v < d_nf) d_nf = v;
+                                }
+                                for (size_t di = FFT_DC_SPIKE_END;
+                                     di < FFT_BIN_COUNT - FFT_EDGE_SKIP_NARROW;
+                                     ++di) {
+                                    const uint8_t v = d_db[di];
+                                    if (v > d_peak) d_peak = v;
+                                    if (v < d_nf) d_nf = v;
+                                }
+                                const bool d_shape_on =
+                                    this->scanner_ptr_->is_spectrum_shape_enabled_try();
+                                // SHELF PARITY (SWEEP_SHELF_OFFSET_*): gate on
+                                // the SAME biased shelf the detector uses —
+                                // clamp(min + off) vs clamp(p25 + off) keeps the
+                                // subset proof above valid for every offset; a
+                                // contention on the accessor fails OPEN to the
+                                // MINIMUM offset (lowest shelf = loosest gate).
+                                // Stack: ~8 B (int16 temp). No heap, no FP.
+                                const int16_t d_nf_biased =
+                                    static_cast<int16_t>(d_nf) + static_cast<int16_t>(
+                                        this->scanner_ptr_->sweep_shelf_offset_try());
+                                const uint8_t d_nf_shelf = static_cast<uint8_t>(
+                                    (d_nf_biased < 0) ? 0
+                                    : (d_nf_biased > 255 ? 255 : d_nf_biased));
+                                drain_detect = sweep_fast_prefilter(
+                                    d_shape_on,
+                                    d_peak,
+                                    d_nf_shelf,
+                                    this->scanner_ptr_->shape_gate_margin_try());
+                                if (!drain_detect) {
+                                    drain_detect = sweep_tbd_frame_reachable(
+                                        d_shape_on,
+                                        d_peak,
+                                        d_nf_shelf,
+                                        this->scanner_ptr_->sweep_tbd_threshold_units_try());
+                                }
+                            }
+                            if (drain_detect && this->scanner_ptr_ != nullptr) {
+                                auto& dwin = this->sweep_[this->active_sweep_idx_];
+                                const FreqHz d_fft_freq = (this->last_tuned_freq_ != 0)
+                                    ? this->last_tuned_freq_
+                                    : dwin.f_center;
+                                // C2 DETECTOR LOOK BUDGET: one tick delivers at
+                                // most 4 detector charges for the SAME
+                                // (window, center) — 3 drained here + the final
+                                // frame in on_sweep_spectrum() — and SWEEP_MAX_
+                                // DETECTOR_LOOKS_PER_SLICE is calibrated to
+                                // exactly that, so a NORMAL slice (1 tick per
+                                // pass) is never throttled. What the cap
+                                // actually bounds is look accumulation ACROSS
+                                // ticks: WaterfallHistory (max_across_frames /
+                                // count_above_threshold) and the median filter
+                                // are both monotone in per-pass frame count, so
+                                // anything that keeps the radio on one center for
+                                // a second tick — today only the first-slice
+                                // dwell — would otherwise double that slice's
+                                // false-alarm rate relative to every interior
+                                // slice (the reported false spike at the window's
+                                // lower edge).
+                                // Charge BEFORE the detector so the composite
+                                // still absorbs the frame (process_bins already
+                                // ran above) while integration stops at the cap.
+                                if (dwin.spend_detector_look(this->active_sweep_idx_,
+                                                             d_fft_freq)) {
+                                    this->scanner_ptr_->process_spectrum_sweep(
+                                        this->active_sweep_idx_,
+                                        discard,
+                                        d_fft_freq,
+                                        dwin.f_min,
+                                        dwin.f_max
+                                    );
+                                }
+                            }
+                        }
+                        ++drained;
+                        // SWEEP_MAX_DRAIN_PER_TICK (= FIFO depth − 1): 3
+                        // stale + 1 live max — but never leave an armed
+                        // budget unspent while frames are still queued.
+                        if (stale_budget == 0 && drained >= SWEEP_MAX_DRAIN_PER_TICK) break;
+                    }
+                    if (stale_budget > 0) {
+                        // BUDGET RE-ARM: the in-flight straddler may not have
+                        // completed yet (the drain ran at the TOP of this
+                        // handler; the straddler completes up to one FFT frame
+                        // period after the retune, i.e. sooner than a normal
+                        // next tick but possible inside a DisplayFrameSync
+                        // burst). Keep the remainder armed so the NEXT tick
+                        // spends it — the first frame to arrive is exactly that
+                        // straddler (in-order completion), so nothing can slip
+                        // through, and a genuinely empty FIFO never causes a
+                        // live frame to be dropped.
+                        this->sweep_[this->active_sweep_idx_].retune_pending_frames_ =
+                            stale_budget;
+                    }
+                    have_frame = this->spectrum_fifo_->out(spectrum);
+                    // EMPTY-FIFO FALLBACK (jitter/stall safety): if the M0 did
+                    // not produce a frame this tick, the discard loop above
+                    // consumed nothing (out() returns false on empty) and
+                    // have_frame is false — except when the FIFO held only
+                    // stale-or-drained frames and no fresh one yet. In that
+                    // case the LAST popped frame is still newer than anything
+                    // the old single-out() path would have processed two ticks
+                    // later, so reuse it for DISPLAY ONLY (display_only=true):
+                    // a LIVE frame was ALREADY fed to the detector in the S1
+                    // drain loop above, and re-feeding would double TBD votes
+                    // and median weight. Stale (pre-retune) frames are never
+                    // reused — detection/drop semantics unchanged, only the
+                    // idle-tick display stall is removed.
+                    // Stack: ChannelSpectrum copy ~272 B BSS-to-BSS, no stack.
+                    // STALE-FALLBACK GUARD: reuse is valid only when the last
+                    // popped frame was a PROCESSED live frame (its re-write is
+                    // an idempotent max-hold — the progress credit for the tick
+                    // stays with on_sweep_spectrum below). When EVERY popped
+                    // frame was dropped on the retune budget, the last one is
+                    // stale: reusing it would write its mixed-frequency bins
+                    // into the composite (the fd4da6b "SWEEP рисуется
+                    // неправильно" regression class) and credit a stale frame
+                    // — suppressed; the next tick carries clean frames anyway.
+                    const bool only_stale = (stale_dropped > 0) && (drained == stale_dropped);
+                    if (!have_frame && drained > 0 && !only_stale) {
+                        spectrum = discard;
+                        have_frame = true;
+                        fallback_display_only = true;
+                    }
+                } else {
+                    // Use class member buffer instead of local stack to prevent M0 overflow
+                    have_frame = this->spectrum_fifo_->out(spectrum);
+                }
+                if (have_frame) {
+                    if (this->composite_active_) {
+                        // have_frame from fifo.out() above is live
+                        // (display_only=false); fallback reuse is display-only
+                        // (display_only=true, set above).
+                        this->on_sweep_spectrum(spectrum, fallback_display_only);
+                    } else {
+                        this->on_channel_spectrum(spectrum);
+                        this->db_scan_count_++;
+                        if (this->db_scan_count_ >= this->DB_SCANS_PER_SWEEP) {
+                            this->db_scan_count_ = 0;
+                            this->sweep_auto_mode_ = true;
+                            this->enter_sweep_mode();
+                        }
+                    }
+                }
+            }
+            this->refresh_ui();
+        }
+    };
+    new (&h->retune) MessageHandlerRegistration{
+        Message::ID::Retune,
+        [this](Message* const p) {
+            const auto message = *reinterpret_cast<const RetuneMessage*>(p);
+            this->on_retune(message.freq, message.range);
+        }
+    };
+    new (&h->channel_stats) MessageHandlerRegistration{
+        Message::ID::ChannelStatistics,
+        [this](Message* const p) {
+            const auto message = *reinterpret_cast<const ChannelStatisticsMessage*>(p);
+            this->latest_max_db_ = message.statistics.max_db;
+        }
+    };
+
+    handlers_active_ = true;
+}
+
+void DroneScannerUI::unregister_handlers() noexcept {
+    if (!handlers_active_) return;
+
+    auto* const h = reinterpret_cast<HandlerStorage*>(handler_storage_);
+    h->spectrum_config.~MessageHandlerRegistration();
+    h->frame_sync.~MessageHandlerRegistration();
+    h->retune.~MessageHandlerRegistration();
+    h->channel_stats.~MessageHandlerRegistration();
+
+    handlers_active_ = false;
+}
+
+// ============================================================================
+// Frequency snapshot access. current_frequency_ is a 32-bit field — aligned
+// 32-bit loads/stores are single-instruction and cannot tear on Cortex-M4,
+// so chSysLock() here is only a conservative barrier, not a correctness
+// requirement. All callers run on the UI thread (message handlers, sweep
+// enter/exit, keypad lambdas) — no cross-thread access exists today.
+// ============================================================================
+void DroneScannerUI::set_current_frequency_safe(FreqHz freq) noexcept {
+    chSysLock();
+    current_frequency_ = freq;
+    chSysUnlock();
+}
+
+FreqHz DroneScannerUI::get_current_frequency_safe() const noexcept {
+    chSysLock();
+    const FreqHz freq = current_frequency_;
+    chSysUnlock();
+    return freq;
+}
+
+DroneScannerUI::DroneScannerUI(NavigationView& nav) noexcept
+    : View()
+    , nav_(nav)
+    , big_display_{{BIG_FREQUENCY_X, BIG_FREQUENCY_Y, BIG_FREQUENCY_WIDTH, 52}, 0}
+    , sweep_transition_guard_()
+    , button_debounce_guard_() {
+    add_children({
+        &labels_,
+        &field_lna_,
+        &field_vga_,
+        &field_rf_amp_,
+        &field_volume_,
+        &labels_cyc_,
+        &field_rssi_dec_cyc_,
+        &big_display_,
+        &drone_display_,
+        &button_start_stop_,
+        &button_mode_,
+        &button_load_,
+        &button_settings_,
+        &button_swp_,
+        &field_shelf_offset_
+    });
+
+    // "cy" field (rssi_decrease_cycles): live decay-tuning from the main screen.
+    // FIX: this field previously had no on_change — user edits were silently
+    // discarded (display-only). Registered here, before construct_objects(),
+    // following the "callbacks first, early-return safe" pattern used by the
+    // button lambdas below: the lambda dereferences scanner_ptr_ at INVOCATION
+    // time, not registration time.
+    // Write path: established get→mutate→set pattern (see DroneSweepView).
+    // Persistence: intentionally NOT written to SD per encoder tick (flash
+    // wear + latency). The new value lives in the scanner config for the
+    // session and reaches SD via the SWP save flow, whose extract_from_config()
+    // copies the already-updated config (settings_manager.cpp:941), or via an
+    // explicit Settings save.
+    // Thread-safety: UI thread only (widget callback) — g_workspace_cfg
+    // ownership invariant in drone_scanner_ui.hpp guarantees no concurrent
+    // access; set_config() takes the scanner DATA_MUTEX internally.
+    field_rssi_dec_cyc_.on_change = [this](int32_t v) {
+        if (scanner_ptr_ == nullptr) return;
+        scanner_ptr_->get_config(g_workspace_cfg);
+        g_workspace_cfg.rssi_decrease_cycles = static_cast<uint8_t>(v);  // 1..50, fits uint8_t
+        // Cannot fail here: only rssi_decrease_cycles mutated (no validation
+        // on it), all other fields byte-identical to the accepted config.
+        (void)scanner_ptr_->set_config(g_workspace_cfg);
+    };
+
+    // Shelf offset dial (SWEEP_SHELF_OFFSET_*): ONE value drives BOTH the
+    // display floor (DroneDisplay::set_shelf_offset — render-time bias of the
+    // 15th-percentile composite floor) and the detector shelf
+    // (ScanConfig::sweep_shelf_offset — biases the per-frame p25 noise floor
+    // and width anchor in process_spectrum_sweep). The coupling is what makes
+    // "see it ⇒ relative gates admit it" hold: without the scanner half the
+    // user would reveal peaks the Step-3/shape/TBD chain still rejected.
+    // Out of range is impossible (NumberField range {-9,+9}); the double
+    // clamp in set_shelf_offset / the scanner is belt-and-braces for
+    // hand-edited settings.
+    // Persistence: session config + SD via the standard extract/deposit
+    // paths (same policy as "cy" — no per-tick SD write).
+    field_shelf_offset_.on_change = [this](int32_t v) {
+        const int8_t off = static_cast<int8_t>(v);
+        drone_display_.set_shelf_offset(off);
+        if (scanner_ptr_ == nullptr) return;
+        scanner_ptr_->get_config(g_workspace_cfg);
+        g_workspace_cfg.sweep_shelf_offset = off;
+        (void)scanner_ptr_->set_config(g_workspace_cfg);
+    };
+
+    // Register button callbacks BEFORE any early returns
+    // Buttons must always respond, even if init fails
+    //
+    // START/STOP — PRIMARY SWEEP CONTROL. Start ALWAYS means sweep:
+    // idle → enter_sweep_mode() (stops the scanner thread, reconfigures the
+    // baseband for SWEEP_SLICE_BW, starts streaming, sets scanning_ + the
+    // "Stop" label itself); paused sweep (Stop pressed mid-sweep, the mode
+    // stays armed) → resume streaming only. Stop halts whatever runs
+    // (sweep or DB — the DB button can be the active mode).
+    button_start_stop_.on_select = [this](ui::Button&) {
+        if (initialization_failed_ || scanner_ptr_ == nullptr) {
+            show_error(ErrorCode::HARDWARE_NOT_INITIALIZED, ERROR_DURATION_MS);
+            return;
+        }
+        // Debounce rapid taps that could cause race conditions
+        if (!button_debounce_guard_.try_set()) return;
+
+        if (scanning_) {
+            // Stop
+            if (composite_active_) {
+                // Stop sweep streaming (mode stays armed — Start resumes it)
+                baseband::spectrum_streaming_stop();
+                scanning_ = false;
+                button_start_stop_.set_text("Start");
+            } else {
+                // Stop normal scanning
+                scanner_thread_->set_scanning(false);
+                (void)scanner_ptr_->stop_scanning();
+                baseband::spectrum_streaming_stop();
+                scanning_ = false;
+                button_start_stop_.set_text("Start");
+            }
+        } else {
+            if (composite_active_) {
+                // Sweep paused (Stop was pressed earlier) — resume streaming
+                baseband::spectrum_streaming_start();
+                scanning_ = true;
+                button_start_stop_.set_text("Stop");
+            } else {
+                // Launch SWEEP — the primary mode (manual, not auto-cycle).
+                // enter_sweep_mode() sets scanning_ = true and the "Stop"
+                // label itself; it no-ops when composite_active_ is already
+                // true (guarded), which cannot happen in this branch.
+                this->sweep_auto_mode_ = false;
+                this->enter_sweep_mode();
+            }
+        }
+        // Clear debounce guard after handling completes
+        button_debounce_guard_.clear();
+    };
+
+    // DB BUTTON (was "Mode") — NORMAL DATABASE SCAN CONTROL.
+    // DB running → stop it (toggle). Otherwise start DB scanning:
+    // from sweep mode, exit_sweep_mode() first (restores the DB baseband
+    // config) and resume the DB frequency/index saved at sweep entry;
+    // from idle, start from the scanner's current position. The sweep
+    // auto-cycle (exit_sweep_mode's was_auto auto-restart) already starts
+    // DB itself — guarded by the !scanning_ checks below so streaming is
+    // never started twice ("Baseband Send Fail" panic).
+    button_mode_.on_select = [this](ui::Button&) {
+        if (initialization_failed_ || scanner_ptr_ == nullptr) {
+            show_error(ErrorCode::HARDWARE_NOT_INITIALIZED, ERROR_DURATION_MS);
+            return;
+        }
+        // Debounce rapid taps that could cause race conditions
+        if (!button_debounce_guard_.try_set()) return;
+
+        if (scanning_ && !composite_active_) {
+            // DB scan running — stop it
+            scanner_thread_->set_scanning(false);
+            (void)scanner_ptr_->stop_scanning();
+            baseband::spectrum_streaming_stop();
+            scanning_ = false;
+            button_start_stop_.set_text("Start");
+        } else {
+            const bool from_sweep = composite_active_;
+            if (from_sweep) {
+                // Manual sweep: no auto-restart (sweep_auto_mode_ false on the
+                // Start-button path; an auto-cycle sweep restarts DB itself).
+                this->exit_sweep_mode();
+            }
+            if (!scanning_) {
+                if (from_sweep) {
+                    // Resume the DB position saved when sweep was entered
+                    // (last_db_frequency_ == 0 on cold start → keep the
+                    // scanner's current frequency).
+                    if (last_db_frequency_ != 0) {
+                        scanner_ptr_->set_scan_frequency(last_db_frequency_);
+                    }
+                    if (database_ptr_ != nullptr) {
+                        database_ptr_->set_current_index(last_db_index_);
+                    }
+                }
+                baseband::spectrum_streaming_start();
+                (void)scanner_ptr_->start_scanning();
+                scanner_thread_->set_scanning(true);
+                scanning_ = true;
+                button_start_stop_.set_text("Stop");
+            }
+        }
+        // Clear debounce guard after state transition completes
+        button_debounce_guard_.clear();
+    };
+
+    button_load_.on_select = [this](ui::Button&) {
+        // Always clean up sweep mode before pushing sub-view
+        if (composite_active_) {
+            exit_sweep_mode(true);
+        }
+        auto open_view = nav_.push<FileLoadView>(".TXT");
+        open_view->push_dir(freqman_dir);
+        open_view->on_changed = [this](const std::filesystem::path& new_file_path) {
+            const bool was_scanning = scanning_;
+
+            // Stop scanning if active
+            if (scanning_) {
+                scanner_thread_->set_scanning(false);
+                (void)scanner_ptr_->stop_scanning();
+                baseband::spectrum_streaming_stop();
+                scanning_ = false;
+                button_start_stop_.set_text("Start");
+            }
+
+            // Extract filename stem from path — iterate native() chars directly
+            // Avoids path::string() which allocates std::string on heap
+            // native() returns const std::u16string& (reference, no copy)
+            char filename[32];
+            const auto& native_path = new_file_path.native();
+            size_t last_slash = 0;
+            size_t last_dot = 0;
+            for (size_t j = 0; j < native_path.size(); ++j) {
+                const char c = static_cast<char>(native_path[j]);
+                if (c == '/' || c == '\\') last_slash = j + 1;
+                if (c == '.') last_dot = j;
+            }
+            size_t i = 0;
+            const size_t stem_start = last_slash;
+            const size_t stem_end = (last_dot > last_slash) ? last_dot : last_slash + 31;
+            for (; i < 31 && (stem_start + i) < stem_end && (stem_start + i) < native_path.size(); ++i) {
+                filename[i] = static_cast<char>(native_path[stem_start + i]);
+            }
+            filename[i] = '\0';
+
+            // Set new database file and reload
+            database_ptr_->set_database_file(filename);
+            scanner_ptr_->clear_tracked_drones();
+
+            const ErrorCode err = database_ptr_->load_frequency_database();
+            db_loaded_ = (err == ErrorCode::SUCCESS);
+            db_entry_count_ = database_ptr_->get_database_size();
+
+            if (err == ErrorCode::SUCCESS && db_entry_count_ > 0) {
+                // Stack budget: reuse single buffer for status and alert messages
+                // (saves 64B vs separate status_buf + alert_buf)
+                char msg_buf[MAX_TEXT_LENGTH];
+                snprintf(msg_buf, sizeof(msg_buf), "%s (%lu)",
+                         filename, (unsigned long)db_entry_count_);
+                drone_display_.set_status_text(msg_buf);
+
+                snprintf(msg_buf, sizeof(msg_buf), "DB: %s loaded", filename);
+                show_alert(msg_buf, 2000);
+
+                // Reset scanner frequency to first entry in new database
+                scanner_ptr_->reset_frequency();
+
+                // Resume scanning if it was active before
+                if (was_scanning) {
+                    baseband::spectrum_streaming_start();
+                    (void)scanner_ptr_->start_scanning();
+                    scanner_thread_->set_scanning(true);
+                    scanning_ = true;
+                    button_start_stop_.set_text("Stop");
+                }
+
+                // Force UI refresh
+                drone_display_.set_dirty();
+                set_dirty();
+            } else {
+                // Stack budget: reuse msg_buf from success path (scope overlap not possible
+                // since this is the else branch, but saves a declaration)
+                char msg_buf[MAX_TEXT_LENGTH];
+                snprintf(msg_buf, sizeof(msg_buf), "Failed: %s (err %d)",
+                         filename, static_cast<int>(err));
+                show_alert(msg_buf, 3000);
+
+                // Show error in status
+                drone_display_.set_status_text("DB load error");
+                drone_display_.set_dirty();
+                set_dirty();
+            }
+        };
+    };
+
+    button_settings_.on_select = [this](ui::Button&) {
+        if (initialization_failed_ || scanner_ptr_ == nullptr) {
+            show_error(ErrorCode::HARDWARE_NOT_INITIALIZED, ERROR_DURATION_MS);
+            return;
+        }
+        // CRITICAL: Unregister message handlers BEFORE pushing sub-view.
+        // Both views register handlers for ChannelSpectrumConfig / DisplayFrameSync.
+        // Without explicit unregister, MessageHandlerMap hits chDbgPanic("MsgDblReg").
+        unregister_handlers();
+
+        // Don't auto-restart scanning after returning from Settings.
+        // Settings is a configuration view — same contract as SWP (see
+        // button_swp_ below): the user starts scanning manually with Start/DB.
+        // The previous `scanning_needs_restore_ = scanning_` made on_show()
+        // silently relaunch DB-mode scanning in on_show() after SAVE —
+        // reported as a bug ("SAVE в Settings сам запускает Database mode").
+        scanning_needs_restore_ = false;
+
+        // Save scanning state BEFORE exit_sweep_mode() clears it (line 1095).
+        // Without this, the if(scanning_) block below is skipped, leaving the
+        // scanner thread running during DroneSettingsView construction — causing
+        // M0 FIFO overflow and guru meditation.
+        const bool was_scanning = scanning_;
+
+        // Always clean up sweep mode before pushing sub-view
+        if (composite_active_) {
+            exit_sweep_mode(true);
+        }
+
+        // Stop scanning using saved state (exit_sweep_mode cleared scanning_)
+        if (was_scanning) {
+            scanner_thread_->set_scanning(false);
+            if (scanner_ptr_ != nullptr) {
+                (void)scanner_ptr_->stop_scanning();
+            }
+            baseband::spectrum_streaming_stop();
+            scanning_ = false;
+            button_start_stop_.set_text("Start");
+        }
+
+        // Stop scanner thread BEFORE push to prevent M0 FIFO overflow
+        // during DroneSettingsView constructor SD card I/O.
+        if (scanner_thread_ != nullptr) {
+            scanner_thread_->stop();
+        }
+
+        // Refresh config from scanner (SWP view may have changed sweep settings)
+        scanner_ptr_->get_config(g_workspace_cfg);
+        nav_.push<DroneSettingsView>(g_workspace_cfg, scanner_ptr_, &drone_display_);
+    };
+
+    // SWP button: open sweep settings view
+    button_swp_.on_select = [this](ui::Button&) {
+        if (initialization_failed_ || scanner_ptr_ == nullptr) {
+            show_error(ErrorCode::HARDWARE_NOT_INITIALIZED, ERROR_DURATION_MS);
+            return;
+        }
+        // CRITICAL: Unregister message handlers BEFORE pushing sub-view.
+        // Both views register handlers for ChannelSpectrumConfig / DisplayFrameSync.
+        // Without explicit unregister, MessageHandlerMap hits chDbgPanic("MsgDblReg").
+        unregister_handlers();
+
+        // Don't auto-restart scanning after returning from SWP save.
+        // SWP is a configuration view — user should manually start scanning.
+        scanning_needs_restore_ = false;
+
+        // Save scanning state BEFORE exit_sweep_mode() clears it (line 1095).
+        const bool was_scanning = scanning_;
+
+        // CRITICAL: Always clean up sweep mode BEFORE checking scanning_.
+        // If user was in sweep mode but stopped scanning (composite_active_=true,
+        // scanning_=false), exit_sweep_mode must still be called to reset
+        // composite_active_=false. Without this, on_show() auto-restarts sweep.
+        if (composite_active_) {
+            exit_sweep_mode(true);
+        }
+
+        // Stop scanning using saved state (exit_sweep_mode cleared scanning_)
+        if (was_scanning) {
+            scanner_thread_->set_scanning(false);
+            if (scanner_ptr_ != nullptr) {
+                (void)scanner_ptr_->stop_scanning();
+            }
+            baseband::spectrum_streaming_stop();
+            scanning_ = false;
+            button_start_stop_.set_text("Start");
+        }
+
+        // Stop scanner thread BEFORE push to prevent M0 FIFO overflow
+        // during DroneSweepView construction SD card I/O.
+        if (scanner_thread_ != nullptr) {
+            scanner_thread_->stop();
+        }
+
+        scanner_ptr_->get_config(g_workspace_cfg);
+        nav_.push<DroneSweepView>(g_workspace_cfg, scanner_ptr_);
+    };
+
+    // Hardware initialization (callbacks are already set, safe to early-return)
+    construct_objects();
+
+    if (scanner_ptr_ == nullptr) {
+        show_error(ErrorCode::INITIALIZATION_FAILED, ERROR_DURATION_MS);
+        initialization_failed_ = true;
+        return;
+    }
+
+    // Database load — SD card is already mounted at boot (portapack.cpp:569)
+    const auto db_result = database_ptr_->load_frequency_database();
+    db_loaded_ = (db_result == ErrorCode::SUCCESS);
+    db_entry_count_ = database_ptr_->get_database_size();
+    if (db_result != ErrorCode::SUCCESS) {
+        show_error(db_result, ERROR_DURATION_MS);
+    }
+
+    const ErrorCode init_err = scanner_ptr_->initialize();
+    if (init_err != ErrorCode::SUCCESS) {
+        show_error(init_err, ERROR_DURATION_MS);
+    }
+
+    baseband::run_image(portapack::spi_flash::image_tag_wideband_spectrum);
+    portapack::receiver_model.set_sampling_rate(DB_CAPTURE_RATE_HZ);
+    portapack::receiver_model.set_baseband_bandwidth(DB_CAPTURE_RATE_HZ);
+    baseband::set_spectrum(DB_CAPTURE_RATE_HZ, DB_FFT_TRIGGER);
+    portapack::receiver_model.enable();
+
+    // FPV-OPTIMIZED RF frontend: ensure max sensitivity for long-range analog
+    // 5.8 GHz video link detection. Non-destructive: only raises values that
+    // are lower than FPV defaults (respects user-set higher values from other apps).
+    // Field set_value() calls fire on_change → receiver_model.set_*() → hardware update.
+    if (portapack::receiver_model.lna() < DEFAULT_LNA_GAIN) {
+        field_lna_.set_value(static_cast<int32_t>(DEFAULT_LNA_GAIN));
+    }
+    if (portapack::receiver_model.vga() < DEFAULT_VGA_GAIN) {
+        field_vga_.set_value(static_cast<int32_t>(DEFAULT_VGA_GAIN));
+    }
+    if (!portapack::receiver_model.rf_amp()) {
+        field_rf_amp_.set_value(1);
+    }
+
+    // Set default headphone volume to 70/99 if not already set higher
+    if (portapack::receiver_model.normalized_headphone_volume() < 70) {
+        portapack::receiver_model.set_normalized_headphone_volume(70);
+    }
+
+    // Initialize audio codec for beep playback (WM8731/AK4951)
+    audio::set_rate(audio::Rate::Hz_24000);
+    audio::output::start();
+
+    scanner_thread_->start();
+
+    scanning_ = false;
+
+    scanner_ptr_->set_alert_callback([](ThreatLevel level) {
+        AudioAlertManager::play_alert(level);
+    });
+
+    // Stack budget: use shared statics to avoid ~728B peak on stack
+    g_workspace_cfg = ScanConfig{};
+    g_workspace_cfg.mode = scanning_mode_;
+    // rssi_threshold_dbm intentionally NOT overridden: fresh install must
+    // match SettingsStruct / DEFAULT button (Sens 85 -> -105 dBm).
+    g_workspace_cfg.scan_interval_ms = SCAN_CYCLE_INTERVAL_MS;
+
+    // Load all settings from SD card via centralized manager
+    const ErrorCode load_err = SettingsFileManager::load(g_workspace_settings);
+    if (load_err == ErrorCode::SUCCESS) {
+        SettingsFileManager::apply_to_config(g_workspace_settings, g_workspace_cfg);
+        // Apply volume from settings (not during parsing to avoid side-effects)
+        portapack::receiver_model.set_normalized_headphone_volume(g_workspace_settings.volume);
+        // Apply display-only settings that are not part of ScanConfig
+        drone_display_.set_spectrum_visible(g_workspace_settings.spectrum_visible);
+        drone_display_.set_timeline_visible(g_workspace_settings.timeline_visible);
+    }
+
+    const ErrorCode config_err = scanner_ptr_->set_config(g_workspace_cfg);
+    if (config_err != ErrorCode::SUCCESS) {
+        show_error(config_err, ERROR_DURATION_MS);
+    }
+
+    // FIX (moved from top of constructor): initial value of the "cy" field.
+    // The old sync ran BEFORE construct_objects() (scanner_ptr_ == nullptr →
+    // dead code) and before SettingsFileManager::load(), so the field always
+    // displayed 0 instead of the persisted rssi_decrease_cycles. Here the
+    // config is final. Display-only update: trigger_change=false so the
+    // freshly registered on_change does not perform a redundant
+    // get_config/set_config round-trip.
+    field_rssi_dec_cyc_.set_value(
+        static_cast<int32_t>(g_workspace_cfg.rssi_decrease_cycles), false);
+
+    // Initial shelf offset from the loaded config (apply_to_config above
+    // copied sweep_shelf_offset from the SD settings). Display push is
+    // trigger-free (setter clamps + raises dirty only on change); the
+    // NumberField update must not fire on_change (scanner already has the
+    // value — same rationale as the "cy" field above).
+    field_shelf_offset_.set_value(
+        static_cast<int32_t>(g_workspace_cfg.sweep_shelf_offset), false);
+    drone_display_.set_shelf_offset(g_workspace_cfg.sweep_shelf_offset);
+}
+
+DroneScannerUI::~DroneScannerUI() noexcept {
+    // Unregister handlers before destroying anything else.
+    unregister_handlers();
+
+    // CRITICAL: Exit sweep mode first to stop baseband streaming.
+    // suppress_auto_restart=true: restarting DB scan during destruction is
+    // never desired (was_auto path would fire start_scanning + streaming_start
+    // right before destruct_objects/baseband::shutdown tear everything down).
+    if (composite_active_) {
+        exit_sweep_mode(true);
+    }
+
+    destruct_objects();
+
+    audio::output::stop();
+    portapack::receiver_model.disable();
+    baseband::shutdown();
+
+    // Ensure atomic flags are cleared on destruction
+    button_debounce_guard_.clear();
+    sweep_transition_guard_.clear();
+}
+
+void DroneScannerUI::focus() {
+    button_start_stop_.focus();
+}
+
+void DroneScannerUI::construct_objects() noexcept {
+    hardware_ptr_ = &s_hardware;
+    database_ptr_ = &s_database;
+    scanner_ptr_ = &s_scanner;
+    scanner_thread_ = &s_scanner_thread;
+}
+
+void DroneScannerUI::destruct_objects() noexcept {
+    if (scanner_thread_ != nullptr) {
+        scanner_thread_->stop();
+        scanner_thread_ = nullptr;
+    }
+    scanner_ptr_ = nullptr;
+    database_ptr_ = nullptr;
+    hardware_ptr_ = nullptr;
+}
+
+void DroneScannerUI::on_show() {
+    if (baseband_needs_restore_ && !composite_active_) {
+        baseband_needs_restore_ = false;
+        // CRITICAL: shutdown() first to reset baseband_image_running flag.
+        // Sub-views stop streaming but never call shutdown(),
+        // leaving baseband_image_running = true. Without shutdown(), run_image()
+        // panics with "BBRunning".
+        baseband::shutdown();
+        baseband::run_image(portapack::spi_flash::image_tag_wideband_spectrum);
+        portapack::receiver_model.set_sampling_rate(DB_CAPTURE_RATE_HZ);
+        portapack::receiver_model.set_baseband_bandwidth(DB_CAPTURE_RATE_HZ);
+        baseband::set_spectrum(DB_CAPTURE_RATE_HZ, DB_FFT_TRIGGER);
+        portapack::receiver_model.enable();
+
+        // Restore audio output that may have been muted by a sub-view
+        audio::output::unmute();
+    }
+
+    // Re-register handlers when becoming visible (after returning from sub-view)
+    register_handlers();
+
+    if (scanner_thread_ != nullptr && !scanner_thread_->is_active()) {
+        scanner_thread_->start();
+    }
+
+    // Restore scanning after returning from a sub-view.
+    // on_hide() stops scanning and sets scanning_ = false.
+    // scanning_needs_restore_ remembers if scanning was active before the push.
+    // For non-sweep mode: restart streaming and scanning if it was active.
+    // For sweep mode: handled by the composite_active_ block below.
+    if (!composite_active_ && !initialization_failed_ && scanner_ptr_ != nullptr && scanning_needs_restore_ && !scanning_) {
+        scanning_needs_restore_ = false;
+        baseband::spectrum_streaming_start();
+        (void)scanner_ptr_->start_scanning();
+        scanner_thread_->set_scanning(true);
+        scanning_ = true;
+        button_start_stop_.set_text("Stop");
+    }
+
+    // If in sweep mode, reload sweep range from config (Settings may have changed it)
+    if (composite_active_ && scanner_ptr_ != nullptr) {
+        scanner_ptr_->get_config(g_workspace_cfg);
+
+        // Reinit all windows from config (degenerate ranges are auto-disabled
+        // by init_sweep_window — see its guard note).
+        last_tuned_freq_ = 0;
+        skip_next_fft_ = true;
+        init_sweep_window(0, g_workspace_cfg.sweep_start_freq, g_workspace_cfg.sweep_end_freq, g_workspace_cfg.sweep_step_freq, true);  // Window 0 always enabled (unless degenerate)
+        init_sweep_window(1, g_workspace_cfg.sweep2_start_freq, g_workspace_cfg.sweep2_end_freq, g_workspace_cfg.sweep2_step_freq, g_workspace_cfg.sweep2_enabled);
+        init_sweep_window(2, g_workspace_cfg.sweep3_start_freq, g_workspace_cfg.sweep3_end_freq, g_workspace_cfg.sweep3_step_freq, g_workspace_cfg.sweep3_enabled);
+        init_sweep_window(3, g_workspace_cfg.sweep4_start_freq, g_workspace_cfg.sweep4_end_freq, g_workspace_cfg.sweep4_step_freq, g_workspace_cfg.sweep4_enabled);
+
+        // Find first enabled window
+        active_sweep_idx_ = 0;
+        for (uint8_t i = 0; i < MAX_SWEEP_WINDOWS; ++i) {
+            if (sweep_[i].enabled) {
+                active_sweep_idx_ = i;
+                break;
+            }
+        }
+        first_enabled_sweep_idx_ = active_sweep_idx_;
+
+        current_pair_ = pair_first(active_sweep_idx_);
+        update_sweep_pair_display();
+
+        radio::set_tuning_frequency(rf::Frequency(sweep_[active_sweep_idx_].f_center));
+        set_current_frequency_safe(sweep_[active_sweep_idx_].f_center);
+
+        if (!scanning_) {
+            baseband::spectrum_streaming_start();
+            scanning_ = true;
+            button_start_stop_.set_text("Stop");
+        }
+    }
+}
+
+void DroneScannerUI::on_hide() {
+    // Unregister handlers first — prevents stale message processing while
+    // scanner thread is being joined below. Safety net for any code path
+    // that pushes a sub-view without calling unregister_handlers().
+    unregister_handlers();
+
+    if (scanning_) {
+        scanner_thread_->set_scanning(false);
+        if (scanner_ptr_ != nullptr) {
+            (void)scanner_ptr_->stop_scanning();
+        }
+        baseband::spectrum_streaming_stop();
+        scanning_ = false;
+        button_start_stop_.set_text("Start");
+    }
+    if (scanner_thread_ != nullptr) {
+        scanner_thread_->stop();
+    }
+}
+
+void DroneScannerUI::paint(Painter& painter) {
+    (void)painter;
+    // Alert/error timer expiry is now handled in refresh_ui() to avoid
+    // requiring DroneScannerUI::paint() to be called every frame.
+    // This eliminates the need for this->set_dirty() in refresh_ui(),
+    // preventing full widget-tree repaints that cause screen flicker.
+}
+
+void DroneScannerUI::show_alert(const char* message, uint32_t duration_ms) noexcept {
+    if (message == nullptr) return;
+    (void)safe_str_copy(alert_message_, MAX_TEXT_LENGTH, message);
+    alert_active_ = true;
+    alert_start_time_ = chTimeNow();
+    alert_duration_ms_ = duration_ms;
+}
+
+void DroneScannerUI::show_error(ErrorCode error, uint32_t duration_ms) noexcept {
+    error_active_ = true;
+    last_error_ = error;
+    error_start_time_ = chTimeNow();
+    error_duration_ms_ = duration_ms;
+}
+
+bool DroneScannerUI::on_touch(const ui::TouchEvent event) {
+    return View::on_touch(event);
+}
+
+void DroneScannerUI::bigdisplay_update(BigDisplayColor color) noexcept {
+    const FreqHz freq = get_current_frequency_safe();
+
+    // Skip big_display_.set() when both frequency and color are unchanged.
+    // At 60 Hz this saves ~58 text-rendering calls/sec when frequency is stable.
+    if (freq == bigdisplay_last_freq_ && color == bigdisplay_last_color_) return;
+    bigdisplay_last_freq_ = freq;
+    bigdisplay_last_color_ = color;
+
+    switch (color) {
+        case BigDisplayColor::GREY:
+            big_display_.set_style(Theme::getInstance()->fg_medium);
+            break;
+        case BigDisplayColor::YELLOW:
+            big_display_.set_style(Theme::getInstance()->fg_yellow);
+            break;
+        case BigDisplayColor::GREEN:
+            big_display_.set_style(Theme::getInstance()->fg_green);
+            break;
+        case BigDisplayColor::RED:
+            big_display_.set_style(Theme::getInstance()->fg_red);
+            break;
+    }
+    
+    big_display_.set(freq);
+}
+
+void DroneScannerUI::refresh_ui() noexcept {
+    // Check alert/error timer expiry (moved from paint() to avoid full-tree repaint)
+    {
+        const SystemTime now = chTimeNow();
+        if (alert_active_ && (now - alert_start_time_) >= alert_duration_ms_) {
+            alert_active_ = false;
+            drone_display_.set_dirty();  // Force repaint to clear alert overlay
+        }
+        if (error_active_ && (now - error_start_time_) >= error_duration_ms_) {
+            error_active_ = false;
+            drone_display_.set_dirty();
+        }
+    }
+
+    if (scanner_ptr_ == nullptr || initialization_failed_) {
+        current_scanner_state_ = ScannerState::IDLE;
+        current_rssi_ = RSSI_NOISE_FLOOR_DBM;
+        set_current_frequency_safe(0);
+        bigdisplay_update(BigDisplayColor::GREY);
+        displayed_drone_type_[0] = '\0';
+        drone_type_display_timer_ = 0;
+        drone_display_.set_status_text(STATUS_ERROR);
+        return;
+    }
+
+    current_scanner_state_ = scanner_ptr_->get_state();
+
+    // Rate-limit stale drone removal to 1Hz (was 60Hz — unnecessary churn)
+    {
+        static SystemTime last_stale_check = 0;
+        constexpr uint32_t STALE_CHECK_INTERVAL_MS = 1000;
+        const SystemTime now = chTimeNow();
+        if ((now - last_stale_check) >= STALE_CHECK_INTERVAL_MS) {
+            scanner_ptr_->remove_stale_drones(now);
+            last_stale_check = now;
+        }
+    }
+
+    // FAST/SLOW split: the heavy snapshot (drone-list copy+sort, status text,
+    // SOS re-check) only needs ~10Hz — it does not change 60 times a second.
+    // Between slow ticks refresh_display_data_ keeps its last snapshot, so the
+    // drone list just does not repaint (no DIRTY_DRONES) — this removes the
+    // blocking get_tracked_drones() lock and snprintf churn from every frame.
+    // Big frequency, realtime waterfall and alarm sweeps stay on the fast path.
+    const SystemTime now_frame = chTimeNow();
+    static constexpr uint32_t UI_SLOW_REFRESH_MS = 100;
+    static SystemTime last_slow_refresh = 0;
+    const bool slow_tick = ((now_frame - last_slow_refresh) >= UI_SLOW_REFRESH_MS);
+    if (slow_tick) {
+        last_slow_refresh = now_frame;
+    }
+
+    if (slow_tick) {
+        // Build display data from tracked drones
+        // update_display_data() skips the copy+DIRTY_DRONES when data is unchanged
+        refresh_display_data_.clear();
+
+        {
+            // DIRECT COMPACT SNAPSHOT: get_display_entries() selects the
+            // top-N by priority and converts each to a 48 B
+            // DisplayDroneEntry under the scanner lock, filtering below
+            // DISPLAY_MIN_THREAT during conversion (threat-descending order
+            // guarantees no qualifying entry is starved out of top-N).
+            // This replaces the old 160 B TrackedDrone round-trip through a
+            // refresh_drones_[] scratch array (~1.9 KB of heap) — the render
+            // snapshot is the compact form from the start. Tracking itself
+            // is unaffected — a NONE-threat drone stays alive in the scanner
+            // (history, trend, sweep-cycle counters, decay clocks,
+            // Mahalanobis, eviction priority), it just costs zero render
+            // time: no sort compares for it, no 100 Hz memcmp bytes and no
+            // gray row on screen.
+            // Stack: ~0 bytes. O(select_n × tracked_count_) <= 12 × 25.
+            const size_t shown = scanner_ptr_->get_display_entries(
+                refresh_display_data_.drones, MAX_DISPLAYED_DRONES, DISPLAY_MIN_THREAT);
+            refresh_display_data_.drone_count = shown;
+
+            // Sort by COMPOSITE priority descending — threat level first (CRITICAL
+            // → HIGH → MEDIUM → LOW; NONE is gated out above so it never reaches
+            // this list), then RECENT signal strength (latest
+            // sample, stronger first), then freshness (newer last_seen first,
+            // wrap-safe). The key EXACTLY matches the scanner's eviction and
+            // top-N selector (recent_strength()/has_higher_priority()): equal-
+            // threat rows rank by current signal, and a drone whose threat just
+            // rose climbs to its logical position on the next 100 ms refresh
+            // ("поднятие угрозы в списке"). get_display_entries() already
+            // returns priority order, so this mostly stabilizes; the sort is
+            // retained as a defense against out-of-order buffers and MUST use
+            // the same key so it never undoes the scanner's ranking.
+            // Bounded by `shown`: slots beyond shown were never written this
+            // tick (stale BSS from earlier ticks) and must not be pulled into
+            // the visible range by the sort.
+            for (size_t i = 1; i < shown; ++i) {
+                const DisplayDroneEntry key = refresh_display_data_.drones[i];
+                size_t j = i;
+                while (j > 0) {
+                    const DisplayDroneEntry& prev = refresh_display_data_.drones[j - 1];
+                    const bool key_outranks_prev =
+                        (key.threat > prev.threat)
+                        || (key.threat == prev.threat && key.last_rssi > prev.last_rssi)
+                        || (key.threat == prev.threat && key.last_rssi == prev.last_rssi &&
+                            key.last_seen != prev.last_seen &&
+                            (key.last_seen - prev.last_seen) < 0x80000000u);
+                    if (!key_outranks_prev) {
+                        break;
+                    }
+                    refresh_display_data_.drones[j] = prev;
+                    --j;
+                }
+                refresh_display_data_.drones[j] = key;
+            }
+
+            // Cap to visible maximum — entries beyond this are never rendered.
+            // Sort ensures highest-threat entries are at indices [0..capped-1].
+            const uint16_t visible_cap = drone_display_.max_visible_drones();
+            if (visible_cap > 0 && shown > visible_cap) {
+                refresh_display_data_.drone_count = visible_cap;
+            }
+        }
+
+        // Update status text based on state and database status
+        // Always show database entry count so user can verify DB changed after Load
+
+        if (!db_loaded_) {
+            drone_display_.set_status_text("No DB");
+        } else if (db_entry_count_ == 0) {
+            drone_display_.set_status_text("DB empty");
+        } else {
+            switch (current_scanner_state_) {
+                case ScannerState::SCANNING:
+                    snprintf(refresh_status_buf_, sizeof(refresh_status_buf_), "Scan (%lu)", (unsigned long)db_entry_count_);
+                    drone_display_.set_status_text(refresh_status_buf_);
+                    break;
+                case ScannerState::LOCKING:
+                    snprintf(refresh_status_buf_, sizeof(refresh_status_buf_), "Lock (%lu)", (unsigned long)db_entry_count_);
+                    drone_display_.set_status_text(refresh_status_buf_);
+                    break;
+                case ScannerState::TRACKING:
+                    // Show TOTAL tracked count, not the display-capped count —
+                    // more drones can be tracked than fit on screen rows.
+                    if (scanner_ptr_->get_and_clear_eviction_pending()) {
+                        // A tracked drone was just displaced by a stronger/
+                        // fresher detection — tracked_count_ did NOT change, so
+                        // without this hint the operator would not see it.
+                        snprintf(refresh_status_buf_, sizeof(refresh_status_buf_), "Evict %lu (%lu)",
+                                 (unsigned long)scanner_ptr_->get_tracked_count(), (unsigned long)db_entry_count_);
+                    } else {
+                        snprintf(refresh_status_buf_, sizeof(refresh_status_buf_), "Track %lu (%lu)",
+                                 (unsigned long)scanner_ptr_->get_tracked_count(), (unsigned long)db_entry_count_);
+                    }
+                    drone_display_.set_status_text(refresh_status_buf_);
+                    break;
+                case ScannerState::PAUSED:
+                    snprintf(refresh_status_buf_, sizeof(refresh_status_buf_), "Pause (%lu)", (unsigned long)db_entry_count_);
+                    drone_display_.set_status_text(refresh_status_buf_);
+                    break;
+                default:
+                    snprintf(refresh_status_buf_, sizeof(refresh_status_buf_), "Ready (%lu)", (unsigned long)db_entry_count_);
+                    drone_display_.set_status_text(refresh_status_buf_);
+                    break;
+            }
+        }
+
+        drone_display_.update_display_data(refresh_display_data_);
+
+        // Stop looping SOS alert if no HIGH/CRITICAL threats remain
+        // (MEDIUM uses one-shot alerts — don't kill those)
+        if (AudioAlertManager::is_sos_looping()) {
+            bool has_high_threat = false;
+            for (size_t i = 0; i < refresh_display_data_.drone_count; ++i) {
+                if (refresh_display_data_.drones[i].threat >= ThreatLevel::HIGH) {
+                    has_high_threat = true;
+                    break;
+                }
+            }
+            if (!has_high_threat) {
+                AudioAlertManager::stop_alert();
+            }
+        }
+    }  // if (slow_tick): heavy 10 Hz snapshot ends here
+
+    // Waterfall data flow: sweep waterfall is the sole waterfall.
+    // It draws live during sweep mode and freezes as a static snapshot
+    // in DB scan mode. Before the first sweep the WF area shows "Waiting...".
+    // push_sweep_waterfall_window() in on_sweep_spectrum() handles all
+    // waterfall data flow.
+
+    // Update big frequency display
+    {
+        RssiValue drone_rssi = RSSI_NOISE_FLOOR_DBM;
+        if (refresh_display_data_.drone_count > 0) {
+            drone_rssi = refresh_display_data_.drones[0].rssi;
+        }
+        current_rssi_ = drone_rssi;
+
+        BigDisplayColor color = BigDisplayColor::GREY;
+        switch (current_scanner_state_) {
+            case ScannerState::LOCKING:
+                color = BigDisplayColor::YELLOW;
+                break;
+            case ScannerState::TRACKING: {
+                const int32_t critical_threshold = (scanner_ptr_ != nullptr)
+                    ? scanner_ptr_->get_threat_critical_dbm()
+                    : RSSI_CRITICAL_THREAT_THRESHOLD_DBM;
+                color = (current_rssi_ >= critical_threshold)
+                      ? BigDisplayColor::RED
+                      : BigDisplayColor::GREEN;
+                break;
+            }
+            default:
+                color = BigDisplayColor::GREY;
+                break;
+        }
+        bigdisplay_update(color);
+    }
+
+    if (current_scanner_state_ == ScannerState::LOCKING) {
+        char drone_type[5]{'\0', '\0', '\0', '\0'};
+        ErrorCode err = scanner_ptr_->get_current_drone_type(drone_type, 5);
+        if (err == ErrorCode::SUCCESS && drone_type[0] != '\0') {
+            (void)safe_str_copy(displayed_drone_type_, MAX_DRONE_TYPE_DISPLAY, drone_type);
+            drone_type_display_timer_ = chTimeNow();
+        }
+    } else {
+        displayed_drone_type_[0] = '\0';
+        drone_type_display_timer_ = 0;
+    }
+
+    // Drive SOS/multi-beep pattern at ~60Hz
+    AudioAlertManager::update();
+
+    // REMOVED: this->set_dirty() — was forcing ALL 17 children to repaint
+    // every frame, causing screen flicker. Each widget now only repaints
+    // when its own set_dirty() is called (drone_display_, big_display_).
+}
+
+void DroneScannerUI::on_retune(FreqHz freq, uint32_t range) noexcept {
+    (void)range;
+    set_current_frequency_safe(freq);
+}
+
+void DroneScannerUI::apply_agc(const uint8_t* spectrum_data) noexcept {
+    // Auto gain control: analyze spectrum and adjust RF frontend.
+    // P0-2: receiver_model reads are hoisted — the old code called
+    // lna()/vga()/rf_amp() up to TWICE (compute args + change compare), each
+    // of which may take the radio SPI mutex. One snapshot per tick, applied
+    // with the same values, removes the duplicate reads AND the TOCTOU
+    // where the compare saw different values than the compute.
+    if (scanner_ptr_ == nullptr || !scanner_ptr_->is_adaptive_cfar_enabled()) return;
+
+    const uint8_t cur_lna = portapack::receiver_model.lna();
+    const uint8_t cur_vga = portapack::receiver_model.vga();
+    const bool cur_rf_amp = portapack::receiver_model.rf_amp();
+    const auto gain = auto_gain_control_.compute_optimal(
+        spectrum_data,
+        cur_lna,
+        cur_vga,
+        cur_rf_amp,
+        chTimeNow()
+    );
+    if (gain.lna != cur_lna) {
+        portapack::receiver_model.set_lna(gain.lna);
+        // FIX: keep the on-screen field in sync with hardware — previously the
+        // widgets kept showing stale values after AGC retuned the frontend.
+        // set_value(v, false) is display-only (no on_change → no second SPI
+        // write, no callback loop); it clips to the field range and repaints
+        // via its own set_dirty(). AGC values are always in field range:
+        // LNA {0,8,..,40} ⊂ {0,40}, VGA {0..62, step 2} ⊂ {0,62}.
+        field_lna_.set_value(static_cast<int32_t>(gain.lna), false);
+    }
+    if (gain.vga != cur_vga) {
+        portapack::receiver_model.set_vga(gain.vga);
+        field_vga_.set_value(static_cast<int32_t>(gain.vga), false);
+    }
+    if (gain.rf_amp != cur_rf_amp) {
+        portapack::receiver_model.set_rf_amp(gain.rf_amp);
+        field_rf_amp_.set_value(gain.rf_amp ? 1 : 0, false);
+    }
+}
+
+void DroneScannerUI::on_channel_spectrum(const ChannelSpectrum& spectrum) noexcept {
+    if (scanner_ptr_ != nullptr && scanning_) {
+        // Use frequency from on_retune() — this matches the hardware tuning
+        // when this spectrum was captured. Do NOT read scanner's current_frequency_
+        // because the scanner thread may have already moved to the next frequency.
+        const FreqHz freq = get_current_frequency_safe();
+        if (freq == 0) {
+            return;
+        }
+
+        // RETUNE-STRADDLE GUARD: a frame integrates over ~16.5 ms
+        // (DB_FFT_TRIGGER @ DB_CAPTURE_RATE_HZ); with the 50 ms hop cadence
+        // ~1 frame in 3 straddles a retune and blends the OLD and NEW
+        // frequency. ChannelSpectrum carries no capture-frequency tag, so the
+        // first frame observed after the tuned frequency changes is DISCARDED
+        // (detection, AGC and display alike) — the remaining frames of the
+        // dwell are clean. Required since the widened ±10 MHz capture:
+        // with matched production/consumption frame rates a straddler would
+        // otherwise inject foreign-frequency energy into the tracker.
+        if (freq != last_db_frame_freq_) {
+            last_db_frame_freq_ = freq;
+            return;
+        }
+
+        (void)scanner_ptr_->process_spectrum_message(spectrum, freq);
+
+        // ALERT DEFER (audit D-ALERT-LOCK): the DB tracking path stages
+        // threat alerts instead of firing the audio callback under
+        // DATA_MUTEX (a full baseband queue can busy-wait and stall the
+        // lock holder). Drain right after the lock is released.
+        scanner_ptr_->deliver_pending_alert();
+
+        // Auto gain control: analyze spectrum and adjust RF frontend
+        apply_agc(spectrum.db.data());
+
+        // Feed spectrum to DroneDisplay for visualization only when scanning.
+        // set_spectrum_data() already calls set_dirty() — no need for redundant call.
+        drone_display_.set_spectrum_data(spectrum.db.data(), spectrum.db.size());
+    }
+}
+
+void DroneScannerUI::init_sweep_window(
+    const uint8_t idx,
+    const FreqHz start,
+    const FreqHz end,
+    const FreqHz step,
+    const bool want_enabled
+) noexcept {
+    if (idx >= MAX_SWEEP_WINDOWS) return;
+    sweep_[idx].init(start, end, step);
+    // DEGENERATE-WINDOW GUARD: init() leaves step_hz == 0 for unsweepable
+    // ranges (f_min clamped to the hardware ceiling). Enabling such a window
+    // hangs the pass — process_frame() is a no-op and the pass never
+    // completes (pre-fix: infinite retune loop at f_center == 0). Keep it
+    // disabled so the pair/round-robin logic skips it; if ALL windows are
+    // degenerate, enter_sweep_mode() aborts back to DB-scan mode.
+    sweep_[idx].enabled = want_enabled && (sweep_[idx].step_hz != 0);
+}
+
+void DroneScannerUI::enter_sweep_mode() noexcept {
+    // Prevent re-entrant entry (double-tap on Start button / auto-cycle re-entry)
+    if (composite_active_) return;
+    if (!sweep_transition_guard_.try_set()) return;
+    sweep_guard_timestamp_ = chTimeNow();
+
+    composite_active_ = true;
+    last_tuned_freq_ = 0;
+    skip_next_fft_ = true;  // first FFT after entry may be stale
+    drone_display_.set_composite_mode(true);
+    // Auto-enable noise floor filtering for composite display.
+    // This suppresses the visible noise baseline without affecting the data.
+    // Using SWEEP_DISPLAY_NOISE_MARGIN so only signals above noise + margin draw color.
+    // The composite noise floor itself is computed automatically in set_composite_data().
+    drone_display_.set_spectrum_filter(SWEEP_DISPLAY_NOISE_MARGIN);
+    // Start with a clean EMA state and hidden scan heads.
+    drone_display_.reset_composite_persistence();
+    // Sweep waterfall history persists across mode transitions so the user
+    // sees continuous WF data when toggling between DB Scan and Sweep modes.
+    // push_sweep_waterfall_window() appends new rows to existing history.
+    drone_display_.set_scan_head(-1, -1);
+
+    if (scanner_ptr_ != nullptr) {
+        scanner_ptr_->get_config(g_workspace_cfg);
+    } else {
+        g_workspace_cfg = ScanConfig{};
+    }
+
+    // Initialize all 4 sweep windows from config (degenerate ranges are
+    // auto-disabled by init_sweep_window — see its guard note).
+    init_sweep_window(0, g_workspace_cfg.sweep_start_freq, g_workspace_cfg.sweep_end_freq, g_workspace_cfg.sweep_step_freq, true);  // Window 0 always enabled (unless degenerate)
+    init_sweep_window(1, g_workspace_cfg.sweep2_start_freq, g_workspace_cfg.sweep2_end_freq, g_workspace_cfg.sweep2_step_freq, g_workspace_cfg.sweep2_enabled);
+    init_sweep_window(2, g_workspace_cfg.sweep3_start_freq, g_workspace_cfg.sweep3_end_freq, g_workspace_cfg.sweep3_step_freq, g_workspace_cfg.sweep3_enabled);
+    init_sweep_window(3, g_workspace_cfg.sweep4_start_freq, g_workspace_cfg.sweep4_end_freq, g_workspace_cfg.sweep4_step_freq, g_workspace_cfg.sweep4_enabled);
+
+    // Enable per-window waterfalls for each enabled sweep window.
+    // MUST run AFTER sweep_[i].enabled is loaded from config above (lines
+    // preceding this point). exit_sweep_mode() clears every enabled flag and
+    // the windows default to disabled, so reading them before the config load
+    // would always produce a 0 mask — the per-window sweep waterfalls would
+    // never render (paint() would fall back to the realtime waterfall).
+    {
+        uint8_t wf_mask = 0;
+        for (uint8_t i = 0; i < MAX_SWEEP_WINDOWS; ++i) {
+            if (sweep_[i].enabled) {
+                wf_mask = static_cast<uint8_t>(wf_mask | (1u << i));
+            }
+        }
+        drone_display_.set_active_sweep_windows(wf_mask);
+    }
+
+    // Find first enabled window for round-robin
+    active_sweep_idx_ = MAX_SWEEP_WINDOWS;  // invalid sentinel
+    for (uint8_t i = 0; i < MAX_SWEEP_WINDOWS; ++i) {
+        if (sweep_[i].enabled) {
+            active_sweep_idx_ = i;
+            break;
+        }
+    }
+    if (active_sweep_idx_ >= MAX_SWEEP_WINDOWS) {
+        // No enabled windows — abort sweep, return to normal mode
+        composite_active_ = false;
+        drone_display_.set_composite_mode(false);
+        sweep_transition_guard_.clear();
+        return;
+    }
+    // Record first enabled window as cycle boundary for RSSI decay detection.
+    // Used by on_sweep_spectrum() wrap detection: decay fires when round-robin
+    // returns to this window, ensuring ALL enabled windows are visited first.
+    first_enabled_sweep_idx_ = active_sweep_idx_;
+
+    // Initialize pair tracking (pairs: 0=[w0,w1], 2=[w2,w3])
+    current_pair_ = pair_first(active_sweep_idx_);
+
+    // Reset cached display state so first update_sweep_pair_display() call
+    // always sets dirty flags (avoids stale cache preventing initial repaint).
+    last_sweep_range_start_ = 0;
+    last_sweep_range_end_ = 0;
+    last_sweep2_range_start_ = 0;
+    last_sweep2_range_end_ = 0;
+    last_dual_sweep_mode_ = false;
+
+    // Save DB index BEFORE stopping scanner, then derive frequency from DB entry.
+    // This ensures last_db_frequency_ == entries[last_db_index_].frequency,
+    // so get_next_frequency() finds the exact resume point after sweep.
+    if (database_ptr_ != nullptr) {
+        last_db_index_ = database_ptr_->get_current_index();
+        // Use current frequency from scanner (thread-safe via atomic read)
+        // This is the frequency the scanner was tuned to before sweep entry
+        const FreqHz cur_freq = get_current_frequency_safe();
+        if (cur_freq != 0) {
+            last_db_frequency_ = cur_freq;
+        } else {
+            // Fallback: try to get from scanner's locked frequency
+            last_db_frequency_ = scanner_ptr_->get_locked_frequency();
+        }
+    }
+
+    // Stop scanner thread FIRST — UI drives tuning during sweep
+    if (scanner_thread_ != nullptr) {
+        scanner_thread_->set_scanning(false);
+        scanner_thread_->reset_dwell();
+    }
+    if (scanner_ptr_ != nullptr) {
+        (void)scanner_ptr_->stop_scanning();
+        // Clear lock state to prevent stale LOCKING/TRACKING after resume
+        scanner_ptr_->clear_lock_state();
+        // Flush temporal integrators BEFORE the first sweep frame: DB-scan
+        // frames (different trigger/bandwidth/gain regime) must not seed the
+        // sweep TBD envelope or the per-window median windows. Unconditional
+        // reset — zero hot-path cost, one 2 KB zeroing per mode entry.
+        scanner_ptr_->reset_sweep_integrators();
+    }
+    scanning_ = false;
+
+    // Configure baseband for sweep bandwidth
+    portapack::receiver_model.set_sampling_rate(SWEEP_SLICE_BW);
+    portapack::receiver_model.set_baseband_bandwidth(SWEEP_SLICE_BW);
+    baseband::set_spectrum(SWEEP_SLICE_BW, SWEEP_FFT_TRIGGER);
+    spectrum_fifo_ = nullptr;
+
+    // Set up display for current pair (2+2 pagination)
+    update_sweep_pair_display();
+
+    radio::set_tuning_frequency(rf::Frequency(sweep_[active_sweep_idx_].f_center));
+    // NO settle sleep here (was: chThdSleepMilliseconds(5), "Looking Glass
+    // pattern"). Staleness is handled frame-wise, not by wall time:
+    //   - skip_next_fft_ (set on entry) makes on_sweep_spectrum() discard the
+    //     first frame and re-tune via retune_sweep_window(), which arms
+    //     retune_pending_frames_ (len() + 1) for everything queued plus the
+    //     frame in flight at that instant;
+    //   - MAX2837/RFFC5072 lock in ~200 µs — far below one 6.5 ms FFT frame —
+    //     so the first full frame captured after the retune is clean.
+    // The old sleep blocked the UI event loop for 5 ms while the M0 was
+    // already streaming into the channel FIFO, and added nothing the exact
+    // frame budget does not already guarantee. Mirrors retune_sweep_window().
+    set_current_frequency_safe(sweep_[active_sweep_idx_].f_center);
+
+    baseband::spectrum_streaming_start();
+    scanning_ = true;
+    button_start_stop_.set_text("Stop");
+    drone_display_.set_dirty();  // ensure sweep display paints on entry
+
+    // Allow exit_sweep_mode() to work after enter completes
+    sweep_transition_guard_.clear();
+}
+
+void DroneScannerUI::exit_sweep_mode(bool suppress_auto_restart) noexcept {
+    // Prevent re-entrant exit — must match enter_sweep_mode() guard pattern
+    if (!composite_active_) return;
+    if (!sweep_transition_guard_.try_set()) {
+        // Guard stuck for >200ms — forcibly clear to prevent permanent lockup.
+        // At worst this causes a double-clear, which is harmless.
+        const uint32_t now = chTimeNow();
+        if ((now - sweep_guard_timestamp_) > 200) {
+            sweep_transition_guard_.clear();
+            (void)sweep_transition_guard_.try_set();
+        } else {
+            return;
+        }
+    }
+    sweep_guard_timestamp_ = chTimeNow();
+
+    const bool was_auto = sweep_auto_mode_;
+    composite_active_ = false;
+    sweep_auto_mode_ = false;
+    active_sweep_idx_ = 0;
+    current_pair_ = 0;
+    sweep_[0].enabled = false;
+    sweep_[1].enabled = false;
+    sweep_[2].enabled = false;
+    sweep_[3].enabled = false;
+    drone_display_.set_composite_mode(false);
+    drone_display_.set_dual_sweep_mode(false);
+    // Reset cached display state so next sweep entry starts fresh.
+    last_sweep_range_start_ = 0;
+    last_sweep_range_end_ = 0;
+    last_sweep2_range_start_ = 0;
+    last_sweep2_range_end_ = 0;
+    last_dual_sweep_mode_ = false;
+    // Restore normal display filter when returning from sweep mode.
+    // Without this, the sweep noise floor threshold would persist in normal mode,
+    // causing weak signals to be invisible in non-sweep view.
+    drone_display_.set_spectrum_filter(0);
+    // Clean EMA state and hide scan heads so the next sweep entry starts fresh
+    // and the non-sweep view does not show leftover markers.
+    drone_display_.reset_composite_persistence();
+    drone_display_.set_scan_head(-1, -1);
+    // NOTE: Do NOT call set_active_sweep_windows(0) here.
+    // The sweep waterfall mask must persist so paint() continues rendering
+    // the static sweep WF snapshot in DB scan mode. The sweep WF freezes
+    // (no new rows pushed) and resumes when re-entering sweep mode.
+
+    // Stop streaming BEFORE nulling fifo — prevents stale data in frame_sync
+    if (scanning_) {
+        baseband::spectrum_streaming_stop();
+        scanning_ = false;
+    }
+    spectrum_fifo_ = nullptr;
+    db_scan_count_ = 0;
+    button_start_stop_.set_text("Start");
+
+    // Restore baseband to normal bandwidth immediately
+    portapack::receiver_model.set_sampling_rate(DB_CAPTURE_RATE_HZ);
+    portapack::receiver_model.set_baseband_bandwidth(DB_CAPTURE_RATE_HZ);
+    baseband::set_spectrum(DB_CAPTURE_RATE_HZ, DB_FFT_TRIGGER);
+
+    // Only auto-restart scanning if NOT being called from view transition.
+    // When suppress_auto_restart=true (video or pattern manager push),
+    // the streaming restart would be immediately stopped by the caller,
+    // creating a send_message() race that can panic "Baseband Send Fail".
+    if (!suppress_auto_restart && was_auto && scanner_ptr_ != nullptr) {
+        // Clear sweep-mode flags on tracked drones so they resume
+        // rssi_history_-based trend calculation in normal scanning mode
+        scanner_ptr_->clear_sweep_modes();
+        // Flush temporal integrators BEFORE DB scan resumes: sweep frames
+        // (different slice steps, round-robin windows) must not seed the
+        // DB-scan TBD envelope or median window. Without this, the first DB
+        // frames after sweep exit integrate against stale sweep power and
+        // TBD can confirm a phantom (or the median can suppress a real peak
+        // for up to 7 frames). Unconditional reset — one 2 KB zeroing per
+        // mode exit, zero hot-path cost.
+        scanner_ptr_->reset_sweep_integrators();
+
+        // Continue scanning from last DB position (skip already-scanned)
+        // Restore both frequency AND database index for exact resume
+        if (last_db_frequency_ != 0) {
+            scanner_ptr_->set_scan_frequency(last_db_frequency_);
+        }
+        if (database_ptr_ != nullptr) {
+            database_ptr_->set_current_index(last_db_index_);
+        }
+
+        if (scanner_thread_ != nullptr) {
+            scanner_thread_->set_scanning(true);
+        }
+        (void)scanner_ptr_->start_scanning();
+        baseband::spectrum_streaming_start();
+        scanning_ = true;
+        button_start_stop_.set_text("Stop");
+    }
+
+    sweep_transition_guard_.clear();
+}
+
+void DroneScannerUI::on_sweep_spectrum(const ChannelSpectrum& spectrum, bool display_only) noexcept {
+    // Bounds check — prevent out-of-bounds access if state corrupted
+    if (active_sweep_idx_ >= MAX_SWEEP_WINDOWS) {
+        baseband::spectrum_streaming_stop();
+        return;
+    }
+
+    // Consume the entry-skip flag: the first frame after sweep entry (or
+    // window switch) may be stale from the previous mode/tune. The frame-sync
+    // handler already dropped drained frames under entry_skip; this final
+    // frame is guaranteed clean because PLL lock (~200 µs) < FFT frame period
+    // (~6.5 ms). Clearing here ensures subsequent frames are processed normally.
+    skip_next_fft_ = false;
+
+    // NOTE: streaming stays RUNNING continuously across sweep steps.
+    // retune_sweep_window() retunes the radio and arms the exact stale-frame
+    // budget (retune_pending_frames_ = len() + 1). Stopping+restarting
+    // streaming here would reset the channel FIFO twice per step and inject two
+    // M0 control messages into the UI event loop on every frame — the main
+    // cause of sweep stutter.
+
+    auto& win = sweep_[active_sweep_idx_];
+
+    // DEGENERATE-WINDOW GUARD (step_hz == 0 — see SweepWindow::init()): a
+    // window with no derived pitch can never paint a line (process_frame()
+    // no-ops) yet freq_covered is trivially true — the old code re-tuned
+    // forever without advancing. Mark the line painted so the normal
+    // completion path below fires and the round-robin moves on. Detection is
+    // skipped: with f_min == f_max the range gate in apply_sweep_tracking()
+    // would reject every peak anyway.
+    if (win.step_hz == 0) {
+        win.pixel_index = COMPOSITE_SIZE;
+    } else {
+        // FIRST-SLICE DOUBLE DWELL — revisit tick runs WITHOUT progress credit
+        // (identical discipline to the drained live frames, C2): pixel_index /
+        // bins_hz_acc / line_full / scan-head pacing stay at exactly one step
+        // per retune, while the composite max-hold below gets the second look
+        // at f_center_ini. The DETECTOR is intentionally NOT charged on the
+        // revisit (guard above) — both ticks contribute only composite max-hold,
+        // so FAR stays uniform across the window (one look per slice). See
+        // SweepWindow::first_slice_dwell_done_ for the full rationale.
+        const bool first_slice_revisit =
+            win.first_slice_dwell_done_ && (win.f_center == win.f_center_ini);
+        win.process_bins(spectrum, !first_slice_revisit);
+
+        if (scanner_ptr_ != nullptr && !display_only && !first_slice_revisit) {
+            // Use the exact frequency the radio was tuned to when this FFT was captured.
+            // f_center may have already been incremented from the previous frame's step.
+            const FreqHz fft_freq = (last_tuned_freq_ != 0) ? last_tuned_freq_ : win.f_center;
+
+            // Pass sweep range boundaries to prevent false positives outside the range.
+            // Shape analysis runs on RAW FFT bins inside the scanner (RF-monotonic,
+            // DC gap = hard measurement boundary) — never on display-mapped buffers.
+            // LOOK BUDGET (C2): charge one integration against this (window,
+            // center) per-pass budget. Refusal means COMPOSITE-ONLY — the frame
+            // was already integrated into win.composite above; only the TBD
+            // waterfall / median feed / tracker step is skipped, and only when
+            // this center has already received SWEEP_MAX_DETECTOR_LOOKS_PER_
+            // SLICE looks this pass. Keeps the bottom edge's false-alarm rate
+            // identical to every interior slice instead of 2x (dwell) to 4x
+            // (dwell + drain burst).
+            if (win.spend_detector_look(active_sweep_idx_, fft_freq)) {
+                scanner_ptr_->process_spectrum_sweep(
+                    active_sweep_idx_, spectrum, fft_freq, win.f_min, win.f_max);
+            }
+
+            // AGC for sweep mode — PASS-BOUNDARY ONLY (frozen mid-pass).
+            // Mid-pass gain steps shift the reference level of the composite
+            // max-hold and the TBD envelope by 4-14 dB mid-integration,
+            // desensitizing weak targets and spawning phantoms. AGC now runs
+            // only when this step COMPLETED the pass (line_full below).
+        }
+    }
+
+    // Live display update: show current pair data every frame.
+    // NOTE: Do NOT call set_dirty() here — it forces a full widget-tree
+    // repaint (spectrum + waterfalls + drone list + status) every frame.
+    // Instead, individual update methods (set_composite_data, set_scan_head,
+    // push_sweep_waterfall_window) set their own DIRTY_* flags and call
+    // set_dirty() only when their data actually changes. This reduces
+    // paint() cost from ~3ms to ~1.5ms per frame.
+    update_sweep_pair_display();
+
+    // A sweep pass is complete only when BOTH conditions hold:
+    //   1. line_full:    composite[0..239] has been painted by the accumulator;
+    //   2. freq_covered: the slice centered at f_center physically reached f_max
+    //      (f_center + half-slice >= f_max).
+    // Both are needed: line_full alone would skip the RF tail (blind band),
+    // freq_covered alone would leave the composite partially empty.
+    const bool line_full = (win.pixel_index >= COMPOSITE_SIZE);
+    const bool freq_covered = (win.f_center + (SWEEP_SLICE_BW / 2)) >= win.f_max;
+    if (!(line_full && freq_covered)) {
+        // FIRST-SLICE DOUBLE DWELL — arming: the first live frame at
+        // f_center_ini has now been fully integrated (composite + the first
+        // detector looks); stay tuned ONE extra tick on the SAME frequency
+        // instead of advancing. The next tick captures a fresh frame at
+        // f_center_ini (the radio never left), processes it with credit=false
+        // (see the top of this function) and then falls through to the normal
+        // advance below. Net: two consecutive live ticks of COMPOSITE max-hold
+        // at the window's bottom edge — which has no neighbour slice below it
+        // (single sideband where the interior has two overlapping ones). The
+        // DETECTOR is intentionally NOT doubled: both ticks charge the SAME
+        // per-pass budget through spend_detector_look(), so the revisit only
+        // contributes while that budget still has room. The bottom edge can
+        // therefore never run above the uniform cap (no higher false-alarm rate
+        // — that was the "false spike at the start of the window" defect when
+        // both the dwell AND an unbounded drain fed it), and never below an
+        // interior slice (its total is min(tick1 + tick2, cap) vs the
+        // interior's min(tick1, cap)). The revisit tick does NOT reset the TBD
+        // waterfall / median filter (same center → freq_diff == 0) anyway, so
+        // nothing is lost.
+        // Gated on f_center == f_center_ini so mid-pass slices advance
+        // normally; the degenerate-window branch (step_hz == 0) never reaches
+        // this code.
+        if (win.f_center == win.f_center_ini && !win.first_slice_dwell_done_) {
+            win.first_slice_dwell_done_ = true;
+            return;  // stay on f_center_ini; the next tick is the revisit
+        }
+        // Normal step: advance frequency within current window
+        win.f_center += win.step_hz;
+        retune_sweep_window(win, nullptr);
+        return;
+    }
+    // One or both limits reached — force completion of the sweep pass.
+    // Clear accumulators to prevent stale values from affecting the next pass.
+    win.pixel_index = COMPOSITE_SIZE;
+    win.bins_hz_acc = 0;
+    win.pixel_max = 0;
+
+    // PER-WINDOW WATERFALL PUSH: Push this window's composite immediately
+    // instead of waiting for pair_complete. This gives the user instant
+    // visual feedback for each sweep pass (default 300 MHz window = 35
+    // slices at the gapless 8.83 MHz pitch: ~0.58 s per window at the
+    // 1-tick guarded-straddler cadence, ~1.17 s under an overrun burst —
+    // vs ~0.67 s per pair at the historical 2-tick cadence).
+    // When WF is disabled (timeline_visible_==false), skip push: the render
+    // path short-circuits but push still compresses 240 bytes → 12 bytes,
+    // advances the ring buffer, and sets DIRTY_WATERFALL — pure CPU waste.
+    if (win.enabled && drone_display_.get_timeline_visible()) {
+        drone_display_.push_sweep_waterfall_window(
+            active_sweep_idx_, win.composite,
+            win.f_min, win.f_max);
+    }
+
+    // Current window sweep pass complete
+    // Check if its pair is fully complete (both enabled windows in the pair done)
+    const uint8_t w0 = current_pair_;
+    const uint8_t w1 = w0 + 1;
+    const bool w0_done = !sweep_[w0].enabled || sweep_[w0].pixel_index >= COMPOSITE_SIZE;
+    const bool w1_done = (w1 >= MAX_SWEEP_WINDOWS) || !sweep_[w1].enabled || sweep_[w1].pixel_index >= COMPOSITE_SIZE;
+    const bool pair_complete = w0_done && w1_done;
+
+    if (pair_complete) {
+        // Recompute noise floor once per sweep pass (not per frame).
+        // This replaces the per-frame quickselect that previously ran in
+        // set_composite_data() / set_sweep2_data(), saving ~1200 comparisons/frame.
+        drone_display_.update_noise_floor();
+
+        // AGC PASS-BOUNDARY UPDATE (sensitivity fix): gains are frozen
+        // mid-pass so the composite max-hold and the TBD envelope share one
+        // reference level for the whole integration. 500 ms rate limiter
+        // inside AutoGainControl stays the second guard.
+        // Skipped for display_only fallback reuse (stale duplicated frame).
+        if (!display_only) {
+            apply_agc(spectrum.db.data());
+        }
+
+        // Hand off cycle-peak RSSI for movement trend calculation.
+        // Must run BEFORE apply_rssi_decay() so prev_cycle_peak_rssi_ is set
+        // before any drone removal changes tracked_count_.
+        if (scanner_ptr_ != nullptr) {
+            scanner_ptr_->finalize_sweep_cycles();
+        }
+
+        // Display final pair data before reset.
+        // NOTE: Waterfall rows already pushed per-window above — no push here.
+        update_sweep_pair_display();
+
+        // Reset windows in this pair for next scan pass.
+        // NOTE: Do NOT call reset_composite_persistence() here — the EMA
+        // persistence buffer must survive across passes so the noise floor
+        // estimate (15th percentile) improves with each pass. The EMA decay
+        // formula (max(raw, old*224/256)) already handles the transition:
+        // signal peaks are retained, noise floor decays toward zero.
+        if (sweep_[w0].enabled) {
+            sweep_[w0].reset();
+        }
+        if (w1 < MAX_SWEEP_WINDOWS && sweep_[w1].enabled) sweep_[w1].reset();
+
+        // Advance to next pair (pairs: 0=[w0,w1], 2=[w2,w3]).
+        // Skip pairs with no enabled windows — otherwise current_pair_ points
+        // at an empty pair and update_sweep_pair_display() bails out, freezing
+        // the display even though the sweep logic keeps running.
+        uint8_t next_pair = (current_pair_ + 2 < MAX_SWEEP_WINDOWS) ? current_pair_ + 2 : 0;
+        for (uint8_t skip = 0; skip < MAX_SWEEP_WINDOWS / 2; ++skip) {
+            const uint8_t np_w0 = next_pair;
+            const uint8_t np_w1 = np_w0 + 1;
+            const bool has_enabled = sweep_[np_w0].enabled ||
+                (np_w1 < MAX_SWEEP_WINDOWS && sweep_[np_w1].enabled);
+            if (has_enabled) break;
+            next_pair = (next_pair + 2 < MAX_SWEEP_WINDOWS) ? next_pair + 2 : 0;
+        }
+
+        // Full cycle wrap: all pairs have been visited.
+        // Exit auto-mode before round-robin changes active_sweep_idx_,
+        // but apply SWEEP-AWARE decay first (see wrap detection block below for rationale).
+        if (next_pair == 0 && sweep_auto_mode_) {
+            // FIX: Apply RSSI decay before exit in auto-mode (HIGH-4 bug fix)
+            // Original bug: exit_sweep_mode() was called without decay first,
+            // causing stale drone entries to persist indefinitely in auto-mode.
+            if (scanner_ptr_ != nullptr) {
+                scanner_ptr_->apply_rssi_decay(true);  // is_sweep_mode = true
+            }
+            exit_sweep_mode();
+            return;
+        }
+
+        current_pair_ = next_pair;
+    }
+
+    // Round-robin to next enabled window (GLOBAL cycling through all 4 windows)
+    // This is critical: cycling must go through ALL windows, not just the current pair.
+    // Otherwise, with 1-2 enabled windows, the round-robin wraps within the pair
+    // and triggers premature pair_complete + auto-exit.
+    uint8_t next = active_sweep_idx_;
+    do {
+        next = (next + 1) % MAX_SWEEP_WINDOWS;
+    } while (!sweep_[next].enabled && next != active_sweep_idx_);
+
+    // Wrap detection: if we cycled back to the first enabled window in the
+    // entire round-robin, a full cycle is done. Use first_enabled_sweep_idx_
+    // (set once on sweep entry) instead of w0 (stale pair reference) so
+    // detection works correctly with non-contiguous enabled windows.
+    // SWEEP-AWARE DECAY: Use cycle-based decay (is_sweep_mode=true) to tolerate
+    // long gaps between visits in sweep mode.
+    if (pair_complete && next == first_enabled_sweep_idx_) {
+        if (scanner_ptr_ != nullptr) {
+            scanner_ptr_->apply_rssi_decay(true);  // is_sweep_mode = true
+        }
+
+        if (sweep_auto_mode_) {
+            exit_sweep_mode();
+            return;
+        }
+        // Manual mode: continue sweeping (pair already advanced above)
+    }
+
+    active_sweep_idx_ = next;
+    last_tuned_freq_ = sweep_[next].f_center;  // freq for first FFT of new window
+    retune_sweep_window(sweep_[next], nullptr);
+}
+
+void DroneScannerUI::update_sweep_pair_display() noexcept {
+    const uint8_t w0 = current_pair_;
+    const uint8_t w1 = w0 + 1;
+
+    if (w0 >= MAX_SWEEP_WINDOWS) return;
+    if (!sweep_[w0].enabled && (w1 >= MAX_SWEEP_WINDOWS || !sweep_[w1].enabled)) return;
+
+    if (w1 < MAX_SWEEP_WINDOWS && sweep_[w0].enabled && sweep_[w1].enabled) {
+        // Dual mode: upper = w0, lower = w1
+        if (sweep_[w0].f_min != last_sweep_range_start_ || sweep_[w0].f_max != last_sweep_range_end_) {
+            drone_display_.set_sweep_range(sweep_[w0].f_min, sweep_[w0].f_max);
+            last_sweep_range_start_ = sweep_[w0].f_min;
+            last_sweep_range_end_ = sweep_[w0].f_max;
+        }
+        drone_display_.set_composite_data(sweep_[w0].composite, COMPOSITE_SIZE);
+        if (!last_dual_sweep_mode_) {
+            drone_display_.set_dual_sweep_mode(true);
+            last_dual_sweep_mode_ = true;
+        }
+        if (sweep_[w1].f_min != last_sweep2_range_start_ || sweep_[w1].f_max != last_sweep2_range_end_) {
+            drone_display_.set_sweep2_range(sweep_[w1].f_min, sweep_[w1].f_max);
+            last_sweep2_range_start_ = sweep_[w1].f_min;
+            last_sweep2_range_end_ = sweep_[w1].f_max;
+        }
+        drone_display_.set_sweep2_data(sweep_[w1].composite, COMPOSITE_SIZE);
+        // Detection-window brackets: band 0 shows w0, band 1 shows w1.
+        drone_display_.set_detection_windows(
+            0, g_workspace_cfg.sweep_det_win_start_mhz[w0], g_workspace_cfg.sweep_det_win_end_mhz[w0]);
+        drone_display_.set_detection_windows(
+            1, g_workspace_cfg.sweep_det_win_start_mhz[w1], g_workspace_cfg.sweep_det_win_end_mhz[w1]);
+    } else if (sweep_[w0].enabled) {
+        // Single mode: only w0
+        if (sweep_[w0].f_min != last_sweep_range_start_ || sweep_[w0].f_max != last_sweep_range_end_) {
+            drone_display_.set_sweep_range(sweep_[w0].f_min, sweep_[w0].f_max);
+            last_sweep_range_start_ = sweep_[w0].f_min;
+            last_sweep_range_end_ = sweep_[w0].f_max;
+        }
+        drone_display_.set_composite_data(sweep_[w0].composite, COMPOSITE_SIZE);
+        // Single mode: only band 0 is rendered → brackets from w0 there.
+        drone_display_.set_detection_windows(
+            0, g_workspace_cfg.sweep_det_win_start_mhz[w0], g_workspace_cfg.sweep_det_win_end_mhz[w0]);
+        if (last_dual_sweep_mode_) {
+            drone_display_.set_dual_sweep_mode(false);
+            last_dual_sweep_mode_ = false;
+        }
+    } else if (w1 < MAX_SWEEP_WINDOWS && sweep_[w1].enabled) {
+        // Only w1 enabled (non-contiguous): show w1 as single
+        if (sweep_[w1].f_min != last_sweep_range_start_ || sweep_[w1].f_max != last_sweep_range_end_) {
+            drone_display_.set_sweep_range(sweep_[w1].f_min, sweep_[w1].f_max);
+            last_sweep_range_start_ = sweep_[w1].f_min;
+            last_sweep_range_end_ = sweep_[w1].f_max;
+        }
+        drone_display_.set_composite_data(sweep_[w1].composite, COMPOSITE_SIZE);
+        // Only w1 enabled (shown alone on band 0) → brackets from w1 there.
+        drone_display_.set_detection_windows(
+            0, g_workspace_cfg.sweep_det_win_start_mhz[w1], g_workspace_cfg.sweep_det_win_end_mhz[w1]);
+        if (last_dual_sweep_mode_) {
+            drone_display_.set_dual_sweep_mode(false);
+            last_dual_sweep_mode_ = false;
+        }
+    }
+
+    // Push real-time scan-head positions for both bands. The display draws a
+    // 1-px marker at the current pixel_index of each enabled window so the
+    // user sees where the sweep is right now, even before the spectrum data
+    // accumulates enough to fill the band.
+    const int16_t head_w0 = (sweep_[w0].enabled)
+        ? static_cast<int16_t>(sweep_[w0].pixel_index)
+        : static_cast<int16_t>(-1);
+    const int16_t head_w1 = (w1 < MAX_SWEEP_WINDOWS && sweep_[w1].enabled)
+        ? static_cast<int16_t>(sweep_[w1].pixel_index)
+        : static_cast<int16_t>(-1);
+    drone_display_.set_scan_head(head_w0, head_w1);
+}
+
+uint8_t DroneScannerUI::pair_first(uint8_t idx) const noexcept {
+    if (idx >= MAX_SWEEP_WINDOWS) return 0;
+    return (idx / 2) * 2;
+}
+
+// ============================================================================
+// SweepWindow implementations
+// ============================================================================
+
+void DroneScannerUI::SweepWindow::init(FreqHz start, FreqHz end, FreqHz step) noexcept {
+    f_min = start;
+    f_max = end;
+    // RANGE CLAMP: retune_sweep_window() calls radio::set_tuning_frequency()
+    // directly (no validation layer), so a malformed config (0/0 from a
+    // corrupted settings file, or a range beyond the RFFC5072 tuning limit)
+    // would otherwise drive the radio to an illegal frequency for a whole
+    // sweep pass. The window itself is the last line of defense.
+    if (f_min < MIN_FREQUENCY_HZ) {
+        f_min = MIN_FREQUENCY_HZ;
+    }
+    if (f_max > MAX_FREQUENCY_HZ) {
+        f_max = MAX_FREQUENCY_HZ;
+    }
+    if (f_min >= f_max) {
+        f_max = f_min + SWEEP_SLICE_BW;
+    }
+    // f_min near the ceiling may have pushed the slice past MAX again.
+    if (f_max > MAX_FREQUENCY_HZ) {
+        f_max = MAX_FREQUENCY_HZ;
+    }
+    if (f_min >= f_max) {
+        // DEGENERATE WINDOW (f_min clamped to the hardware ceiling): nothing
+        // to sweep. Zero ALL derived pitch state — a stale step_hz from a
+        // previous valid init() would defeat the enabled-gate in
+        // init_sweep_window() (enabled = want && step_hz != 0) and re-arm the
+        // old f_center == 0 retune-forever bug. The window is left DISABLED
+        // by that gate; f_center lands on a legal frequency in case a stray
+        // retune ever touches it.
+        f_max = f_min;
+        step_hz = 0;
+        effective_bin_size = 0;
+        pixel_step_hz = 0;
+        f_center_ini = f_min;
+        reset();
+        return;
+    }
+    const FreqHz range = f_max - f_min;
+
+    // GAPLESS COVERAGE — the ONLY correct sweep pitch for a threat detector.
+    // Every 20 MHz slice excludes the 16-bin DC notch (FFT bins 120-135) and
+    // the edge bins (0-5, 250-255) from detection. Stepping the center by the
+    // old ~17.8 MHz pitch (SWEEP_BINS_PER_STEP) left a PERMANENT ~1.8 MHz dead
+    // zone around EVERY slice center plus a ~0.6 MHz dead zone at the window's
+    // lower edge: a drone on any of those fixed frequencies could never be
+    // detected, on any sweep pass (numeric simulation of the exact
+    // fft_bin_to_freq() mask: ~10% of every window was blind).
+    //
+    // The center pitch is AUTO-DERIVED so each slice's notch is fully covered
+    // by the neighbouring slice's active bins: step <= SWEEP_GAPLESS_STEP_MAX_HZ
+    // (8,828,125 Hz) ⇒ every frequency is probed by >= 2 slices and no blind
+    // band exists anywhere. A user pitch SMALLER than the maximum only adds
+    // overlap (honored below via eff_step); a LARGER pitch would reopen the
+    // notches and stays clamped.
+    static constexpr FreqHz MAX_STEP_HZ = SWEEP_GAPLESS_STEP_MAX_HZ;
+    // USER STEP HONORED (dense-only): a user pitch SMALLER than the gapless
+    // maximum only adds overlap (more dwell per Hz, no blind bands), so honor
+    // it — the SWP "Stp" knob now visibly changes sweep speed/resolution.
+    // A pitch LARGER than the maximum would reopen the 1.8 MHz DC-notch dead
+    // zones at every slice center (the ~10% blind-band bug the gapless pitch
+    // was built to kill), so it stays clamped to MAX_STEP_HZ. step == 0
+    // (unset/default file value) means "auto gapless".
+    // SRAM/Stack: 0B extra. Behavior for step >= MAX: bit-identical to before.
+    FreqHz eff_step = step;
+    if (eff_step == 0 || eff_step > MAX_STEP_HZ) {
+        eff_step = MAX_STEP_HZ;
+    }
+    uint16_t frames = (range + eff_step - 1) / eff_step;
+    // SWEEP_MIN_SLICES floor: a single slice ALWAYS leaves its 23-bin DC notch
+    // (center − 7 .. center + 16 bins ≈ 1.8 MHz) undetected — no neighbour
+    // exists to cover it. With >= 2 slices the pitch drops below the gapless
+    // maximum and every notch lands on a neighbour's sidebands. Cost: one
+    // extra retune per pass on narrow windows (dwell actually improves).
+    if (frames < SWEEP_MIN_SLICES) {
+        frames = SWEEP_MIN_SLICES;
+    }
+    step_hz = range / frames;
+
+    // P0-3: cache the per-bin Hz credit ONCE per window. step_hz is fixed
+    // for the whole pass (gapless auto-derivation above), so the old
+    // `step_hz / 236` UDIV in process_bins() ran identically on EVERY
+    // frame. 236 = FFT_SWEEP_USABLE_BINS, the bins process_frame() actually
+    // visits ({2..119} ∪ {136..253}); each slice then advances pixel_index
+    // by exactly step_hz / pixel_step_hz.
+    effective_bin_size = step_hz / FFT_SWEEP_USABLE_BINS;
+
+    // Linear frequency-to-pixel mapping: each of 240 pixels represents exactly
+    // range/240 Hz. process_frame() discards excess pixels via the
+    // pixel_index >= COMPOSITE_SIZE guard — overflow is harmless.
+    // NOTE: pixel_step_hz must NOT use (frames × HZ_PER_FRAME) / 240 — that
+    // inflates the value by the overlap ratio (~2×), compressing the display
+    // and causing out-of-band power from the first slice to leak into the
+    // first pixels (the artifact observed at the beginning of each window).
+    pixel_step_hz = range / SWEEP_PIXELS_PER_SLICE;
+    if (pixel_step_hz == 0) {
+        pixel_step_hz = 1;
+    }
+
+    // eff_step consumed above (dense-only user pitch + gapless clamp).
+    // NOTE: step_hz REMAINS the gapless-derived value — the user pitch only
+    // selects the slice count, never the blind-notch geometry.
+
+    // First-slice placement — EDGE-BLIND FIX:
+    // Slice detection coverage is ASYMMETRIC around the center (see the
+    // SWEEP_BIAS_* geometry block in constants.hpp): the lowest DETECTED
+    // frequency of a slice is (center − FFT_DC_SPIKE_START·SWEEP_BIN_SIZE) =
+    // center − 9.375 MHz (bin 6 of the upper sideband; the lower sideband
+    // re-enters only at center + 1.25 MHz). The old "half-slice lead"
+    // (f_min + 10 MHz) therefore started detection at f_min + 625 kHz — a
+    // PERMANENT blind band at the window's lower edge on every pass (and the
+    // old narrow-window midpoint placement left the single slice's 1.8 MHz
+    // center notch undetected entirely; fixed by SWEEP_MIN_SLICES above).
+    // Placing the first center at f_min + SWEEP_FIRST_SLICE_LEAD_HZ
+    // (= FFT_DC_SPIKE_START bins = 9.375 MHz) puts the first detection bin
+    // EXACTLY on f_min. Display bins 2..5 map below f_min; process_frame()'s
+    // below-range prefix consumes them without writes (no ghost pixels).
+    // With step <= SWEEP_GAPLESS_STEP_MAX_HZ the upper sidebands tile
+    // [f_min, f_max] butt-jointed: bottom edge exact, top edge covered because
+    // the last slice reaches up to c_last + 10.078 MHz (freq_covered keeps a
+    // 1-bin margin below that).
+    f_center_ini = f_min + SWEEP_FIRST_SLICE_LEAD_HZ;
+    reset();
+}
+
+void DroneScannerUI::SweepWindow::reset() noexcept {
+    memset(composite, 0, COMPOSITE_SIZE);
+    f_center = f_center_ini;
+    pixel_index = 0;
+    pixel_max = 0;
+    bins_hz_acc = 0;
+    retune_pending_frames_ = 0;
+    // Fresh detector budget for the new pass. The (center, win) key would
+    // re-arm on its own the moment the center changes, but reset() runs at
+    // EVERY pass start — including the pass after a window was toggled or the
+    // whole sweep re-entered — and the sentinel must never survive a mode
+    // change (a stale center could otherwise grant a second budget to the
+    // very first slice of the new pass).
+    detector_look_center_ = 0;
+    detector_look_win_ = 0;
+    detector_looks_ = 0;
+    first_slice_dwell_done_ = false;
+}
+
+void DroneScannerUI::SweepWindow::process_bins(
+    const ChannelSpectrum& spectrum,
+    const bool credit_progress
+) noexcept {
+    // NOTE: stale (pre-retune) frames NEVER reach this function — the
+    // frame-sync handler drops exactly `retune_pending_frames_` of them before
+    // the drain loop, and the entry_skip path hands the final frame only to
+    // on_sweep_spectrum()'s skip branch (which retunes instead of painting).
+    // The historical settle counter that used to return false from here is
+    // gone: it could never expire once a retune re-armed it from inside
+    // on_sweep_spectrum (the "never-expires" loop), and its own decrement was
+    // a second, weaker copy of the handler's classification.
+    //
+    // PROGRESS ACCUMULATOR: each of 236 signal-carrying bins contributes
+    // effective_bin_size (= step_hz / FFT_SWEEP_USABLE_BINS, cached in
+    // init()), so each slice advances pixel_index by exactly
+    // step_hz / pixel_step_hz pixels — scan-head pacing and the line_full
+    // completion check are unchanged.
+    //
+    // DATA PLACEMENT (true-position): each bin is written at the pixel its
+    // REAL RF frequency maps to on the linear window scale,
+    // px = (freq - f_min) * 240 / range — the SAME mapping as the band title
+    // (f_min..f_max) and every tracked drone's frequency. The old sequential
+    // placement squeezed each slice's ~20 MHz of content into its step_hz
+    // pixel slot (~2.4x compression at the gapless 8.83 MHz step), so drawn
+    // peaks sat at columns that did not correspond to the tracked frequency,
+    // and every signal was duplicated once per overlapping slice (ghost
+    // peaks). Max-hold on the target column makes overlapping slices
+    // reinforce; the DC notch of slice k is covered by slices k-1/k+1.
+    // P0-3: use the value cached in init(). Falls back to a one-time
+    // division only for hand-built windows that never went through init()
+    // (a zero here would make process_frame() a silent no-op).
+    FreqHz effective_bin_size = this->effective_bin_size;
+    if (effective_bin_size == 0 && step_hz != 0) {
+        effective_bin_size = step_hz / FFT_SWEEP_USABLE_BINS;
+    }
+    if (credit_progress) {
+        SweepProcessor::process_frame(
+            spectrum,
+            composite,
+            pixel_index,
+            pixel_max,
+            bins_hz_acc,
+            pixel_step_hz,
+            f_center,
+            effective_bin_size,
+            f_min,
+            f_max
+        );
+    } else {
+        // C2 DISPLAY-ONLY integration (drained live frames): pixels are
+        // written at their TRUE RF position (the absolute f_min/f_max mapping
+        // inside process_frame), so extra frames reinforce the composite
+        // max-hold without moving the scan head. The progress accumulators
+        // get dummies — their advance is discarded, keeping pixel_index /
+        // bins_hz_acc pacing at exactly one step per retune, so the
+        // line_full / freq_covered completion check is unchanged.
+        // Stack: ~16 bytes (three dummy locals, all in registers).
+        uint16_t pixel_index_dummy = 0;
+        uint8_t pixel_max_dummy = 0;
+        FreqHz bins_hz_acc_dummy = 0;
+        SweepProcessor::process_frame(
+            spectrum,
+            composite,
+            pixel_index_dummy,
+            pixel_max_dummy,
+            bins_hz_acc_dummy,
+            pixel_step_hz,
+            f_center,
+            effective_bin_size,
+            f_min,
+            f_max
+        );
+    }
+}
+
+void DroneScannerUI::retune_sweep_window(SweepWindow& win, const char* prefix) noexcept {
+    // NOTE: radio::set_tuning_frequency is thread-safe via internal SPI driver mutex
+    radio::set_tuning_frequency(rf::Frequency(win.f_center));
+    set_current_frequency_safe(win.f_center);
+    last_tuned_freq_ = win.f_center;
+    // C1 EXACT STALE-FRAME BUDGET (replaces the settle counter + the
+    // SWEEP_CLEAN_FRAME_MS age verdict). Taken AFTER the tuning writes so the
+    // observation point can only be at-or-after the retune instant:
+    //   - BEFORE the retune would be UNSAFE — a frame completing in the
+    //     microseconds between the snapshot and the PLL write would then be
+    //     counted as live while its capture ran entirely at the OLD frequency,
+    //     i.e. exactly the mixed/previous-band frame whose leak produced the
+    //     false spike at the start of a window.
+    //   - AFTER is conservative in the harmless direction: a frame that
+    //     lands inside the snapshot window itself is counted (over-drop of at
+    //     most one fully-post-retune frame, which the detector look budget
+    //     would have capped anyway).
+    // `+ 1` accounts for the ONE frame in flight inside the M0 at this
+    // instant — the retune straddler, whose capture interval contains the
+    // retune and whose bins therefore mix old- and new-frequency power. It is
+    // not in the FIFO yet, and FIFO pop order equals completion order, so the
+    // next tick's drops are exactly: everything queued now, then that one.
+    //
+    // FRAME-BASED SETTLING replaces the old 5 ms wall-clock sleep + streaming
+    // restart. Streaming is continuous, so every frame queued here (and the one
+    // in flight) was captured at the PREVIOUS frequency; the handler drops
+    // precisely this budget before processing anything, guaranteeing each
+    // analyzed frame was captured after the MAX2837/RFFC5072 finished locking
+    // (~200us, far below one FFT frame period). This is strictly stronger than
+    // sleeping: the guarantee is pinned to captured frames, not to wall time,
+    // and the UI event loop no longer blocks on every sweep step.
+    //
+    // WHY AN EXACT COUNT INSTEAD OF A TIMING PREDICATE: the old code assumed
+    // "the OLDEST queued frame is the straddler, everything behind it is
+    // clean". That only holds if the handler reaches the retune before another
+    // frame completes — and this handler is at its LONGEST exactly at a window
+    // boundary (3 drained frames through the S1 detector loop + pair completion
+    // + AGC + per-window waterfall push all precede the retune). Any frame
+    // completing in that interval landed IN FRONT of the straddler, so the old
+    // logic dropped a genuinely-stale backlog frame and then PROCESSED the
+    // mixed-frequency straddler as live: previous band's spectrum painted into
+    // the first pixels of the new window (round-robin jump = hundreds of MHz)
+    // and fed to the detector under the new window's f_min/f_max — the reported
+    // "false spike + false detection at the beginning of the first window when
+    // >= 2 windows sweep" regression. `len() + 1` is a count, not a guess, and
+    // is independent of handler latency, FIFO drain depth and tick jitter.
+    //
+    // NO HZ CREDIT: the dropped frames never reach process_bins(), so
+    // bins_hz_acc / pixel_index are untouched — composite mapping and the
+    // line_full completion check are unaffected (see the history block in
+    // DroneScannerUI::SweepWindow::process_bins()).
+    //
+    // ARCHAEOLOGY — the flip-flop this replaces (do NOT reintroduce):
+    //  - 4ae47015: STALE=3, but settle frames also banked phantom Hz credit
+    //    into bins_hz_acc → accumulator ran ahead → sweep aborted after ~5
+    //    slices. The CREDIT was the bug, not STALE=3.
+    //  - fd4da6b: fixed the phantom credit (correct) but also dropped STALE
+    //    to 1 based on the wrong assumption that the FIFO drains between
+    //    retunes → 2 of 4 stale frames leaked into the composite → false
+    //    spike/dip at the start of each window line ("SWEEP рисуется
+    //    неправильно").
+    //  - 8dc0ed7a: STALE=3 correct but re-added the phantom credit line →
+    //    "3-BROKE SWEEP"; confounding, the credit broke it.
+    //  - bf018832/aa01fc92: reverted both again.
+    //  - 00fe2b98 + 94fd471a: settle counter + age predicate + guarded
+    //    straddler drop — one tick/slice, but still an "oldest == straddler"
+    //    ASSUMPTION, which is what finally broke (see above).
+    // Stack: 0 B. Flash: ~24 B. SRAM: 1 B (the armed counter).
+    // Defensive clamp BEFORE the narrowing cast: FIFO::in() refuses at
+    // is_full(), so len() <= SWEEP_CHANNEL_FIFO_DEPTH and pending <= depth + 1
+    // in ALL defined behavior — the clamp is unreachable on healthy input. It
+    // exists for broken upstream (torn/garbage len()): arm at most one full
+    // queue plus the in-flight straddler, never a wrapped uint8_t. The old
+    // literal 32 would have turned a broken len() into 32 dropped LIVE frames
+    // (~200 ms of dead air per retune); depth + 1 bounds that at 5.
+    uint8_t budget = SWEEP_RETUNE_MIN_PENDING_FRAMES;
+    if (spectrum_fifo_ != nullptr) {
+        constexpr size_t k_max_pending = static_cast<size_t>(SWEEP_CHANNEL_FIFO_DEPTH) + 1;
+        const size_t pending = spectrum_fifo_->len() + 1;  // queued + straddler
+        budget = static_cast<uint8_t>((pending > k_max_pending) ? k_max_pending : pending);
+    }
+    win.retune_pending_frames_ = budget;
+    (void)prefix;
+}
+
+DroneScanner& get_scanner_instance() noexcept {
+    return s_scanner;
+}
+
+DroneScanner* get_scanner_ptr() noexcept {
+    return &s_scanner;
+}
+
+} // namespace drone_analyzer

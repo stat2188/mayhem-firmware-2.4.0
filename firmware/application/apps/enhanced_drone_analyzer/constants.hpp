@@ -1,0 +1,2642 @@
+#ifndef CONSTANTS_HPP
+#define CONSTANTS_HPP
+
+#include <cstdint>
+#include <cstddef>
+#include "drone_types.hpp"
+
+namespace drone_analyzer {
+
+// ============================================================================
+// Frequency Constants
+// ============================================================================
+
+/**
+ * @brief Minimum frequency in Hz (1 MHz - HackRF One minimum)
+ */
+constexpr FreqHz MIN_FREQUENCY_HZ = 1'000'000ULL;
+
+/**
+ * @brief Maximum frequency in Hz (7.2 GHz - HackRF One theoretical maximum)
+ */
+constexpr FreqHz MAX_FREQUENCY_HZ = 7'200'000'000ULL;
+
+/**
+ * @brief Maximum supported frequency in Hz (7.2 GHz)
+ * @note HackRF One RFFC5072 mixer practical limit: ~6 GHz
+ *       but 7.2 GHz is used for validation headroom
+ * @note Use this for validation of sweep ranges and database entries
+ */
+constexpr FreqHz HARDWARE_MAX_FREQ_HZ = 7'200'000'000ULL;
+
+/**
+ * @brief Hardware practical minimum frequency in Hz (1 MHz)
+ */
+constexpr FreqHz HARDWARE_MIN_FREQ_HZ = 1'000'000ULL;
+
+/**
+ * @brief Frequency step size in Hz (1 MHz)
+ */
+constexpr FreqHz FREQUENCY_STEP_HZ = 1'000'000ULL;
+
+/**
+ * @brief MHz conversion factor (1e6)
+ */
+constexpr FreqHz MHZ = 1'000'000ULL;
+
+/**
+ * @brief kHz conversion factor (1e3)
+ */
+constexpr FreqHz KHZ = 1'000ULL;
+
+/**
+ * @brief Nominal frequency coverage per DB scan slice (Hz)
+ * @note 20 MHz — matches SWEEP_SLICE_BW: one DB capture covers the same span
+ *       as one sweep slice. FPV_ANALOG Band A channels are spaced exactly
+ *       20 MHz, so adjacent DB entries leave NO unobserved gap.
+ * @note Used by the Mahalanobis frequency-stability normalization and the
+ *       pattern matcher default pattern range.
+ */
+constexpr FreqHz FREQUENCY_BANDWIDTH_HZ = 20'000'000ULL;
+
+// ============================================================================
+// Buffer Size Constants
+// ============================================================================
+
+/**
+ * @brief Maximum number of tracked drones
+ */
+constexpr size_t MAX_TRACKED_DRONES = 25;
+
+/**
+ * @brief Maximum number of displayed drones
+ */
+constexpr size_t MAX_DISPLAYED_DRONES = 12;
+
+/**
+ * @brief Minimum threat level copied into the render snapshot (drone list)
+ * @note RENDER GATE ONLY — it never affects tracking. A tracked drone below
+ *       this level keeps its RSSI history, trend hysteresis, sweep-cycle
+ *       counters, decay clocks, Mahalanobis stats and eviction priority; it
+ *       is merely skipped when building the UI snapshot, so it costs nothing
+ *       to render (no DisplayDroneEntry construction, no insertion-sort
+ *       compares, no 100 Hz memcmp, no per-row draw).
+ * @note ThreatLevel::NONE is the "tracked but not classified" state: a weak
+ *       creation sample or a decayed threat lands there. Without this gate
+ *       those entries paint as gray rows (COLOR_UNKNOWN_THREAT) in the
+ *       detection list.
+ * @note ORDERING IS LOAD-BEARING: DroneScanner::get_tracked_drones() returns
+ *       priority order with threat_level descending, so every gated-out entry
+ *       ranked strictly below every kept one — the filter can never displace
+ *       a LOW+ drone from the visible top-N rows.
+ */
+constexpr ThreatLevel DISPLAY_MIN_THREAT = ThreatLevel::LOW;
+
+/**
+ * @brief Frequency match radius for drone tracking (Hz)
+ * @note A detection landing within this distance of an existing tracked drone
+ *       UPDATES that entry (nearest match) instead of spawning a duplicate.
+ *       Without it, FFT-bin quantization (78,125 Hz/bin), bin hops between
+ *       sweep cycles, overlapping sweep windows, and real RF drift fragment
+ *       one physical emitter into 2-4 tracker entries: trends break and the
+ *       16-slot tracker fills with duplicates, crowding out genuine drones.
+ * @note Default 1 MHz: every known duplication mechanism is <= ~400 kHz
+ *       (3-bin hop), while real drone link channel spacing is >= 5 MHz
+ *       (5.8 GHz FPV band), so distinct emitters are never merged.
+ * @note Exact matches (difference == 0) always take priority over in-radius
+ *       matches — two tracked database channels never collapse into one entry
+ *       while both are being detected at their own centers.
+ * @note Duplicates that pre-date the radius (created by older firmware, mode
+ *       switches, or multi-window sweep races) are HEALED by consolidation:
+ *       when a detection lands in-radius, ALL in-radius entries merge into
+ *       the oldest one (RSSI history, sweep cycle peaks, trend state) — see
+ *       DroneScanner::match_and_consolidate_drone_internal() and
+ *       TrackedDrone::absorb_from().
+ */
+constexpr FreqHz DRONE_FREQ_MATCH_RADIUS_HZ = 1'000'000ULL;
+
+/**
+ * @brief Default drone frequency match merge radius (MHz)
+ * @note Configurable at runtime via ScanConfig.freq_match_radius_mhz (0-100).
+ *       0 = only exact frequency matches consolidate (no merging)
+ *       10 = 10 MHz radius (FPV default — one analog FPV channel spans ~18 MHz
+ *       and its LO drift/FHSS wander easily exceeds the previous 1 MHz radius,
+ *       spawning duplicate tracker entries that fragment RSSI history & trend)
+ * @see DroneScanner::match_and_consolidate_drone_internal()
+ */
+constexpr uint8_t DEFAULT_FREQ_MATCH_RADIUS_MHZ = 10;
+
+/**
+ * @brief Spectrum buffer size (bytes)
+ * @note Must match ChannelSpectrum::db.size() (256 bins)
+ */
+constexpr size_t SPECTRUM_BUFFER_SIZE = 256;
+
+/**
+ * @brief RSSI history size for each drone
+ * @note Must be >= MOVEMENT_TREND_MIN_HISTORY for trend calculation
+ */
+constexpr size_t RSSI_HISTORY_SIZE = 6;
+
+/**
+ * @brief Timestamp history size for each drone
+ * @note Must equal RSSI_HISTORY_SIZE to prevent index misalignment
+ *       in circular buffer access patterns
+ */
+constexpr size_t TIMESTAMP_HISTORY_SIZE = RSSI_HISTORY_SIZE;
+
+/**
+ * @brief Maximum number of frequency entries to scan
+ */
+constexpr size_t MAX_ENTRIES_TO_SCAN = 100;
+
+/**
+ * @brief Frequency hash table size
+ */
+constexpr size_t FREQUENCY_HASH_TABLE_SIZE = 256;
+
+// ============================================================================
+// Hardware Constants
+// ============================================================================
+
+/**
+ * @brief Default sample rate in Hz (2 MHz) — LEGACY DB capture rate
+ * @note Superseded for DB scan by DB_CAPTURE_RATE_HZ (±10 MHz window).
+ *       Kept as the documented legacy value for reference.
+ */
+constexpr uint32_t DEFAULT_SAMPLE_RATE_HZ = 2000000;
+
+/**
+ * @brief DB (normal) scan capture sampling rate: ±10 MHz around the tuned frequency
+ * @note 20 MHz — identical to SWEEP_SLICE_BW, so the FFT bin size is 78.125 kHz
+ *       in BOTH scan modes. Shape-filter settings expressed in bins (margin,
+ *       min/max width, sharpness, flatness, valley) now mean the same bandwidth
+ *       in DB and sweep phases — field tuning carries over 1:1.
+ * @note The full ~18 MHz analog FPV channel is visible on the DB spectrum, and
+ *       VTX drift up to ±10 MHz from a DB entry stays inside the capture window
+ *       (FPV_ANALOG Band A entries are spaced exactly 20 MHz — no blind gaps).
+ * @note CALIBRATION: per-bin noise power scales with bin bandwidth — absolute
+ *       levels rise ~10 dB vs the legacy 2 MHz capture (10·log10(20/2)).
+ *       rssi_threshold_dbm and the threat ladder need a one-time re-tune;
+ *       shape filters are per-frame relative (noise percentile) and do NOT.
+ * @see DB_FFT_TRIGGER, SWEEP_SLICE_BW
+ * @note Declared as a literal (SWEEP_SLICE_BW is defined further down this
+ *       header); parity is enforced by static_assert after SWEEP_SLICE_BW.
+ */
+constexpr FreqHz DB_CAPTURE_RATE_HZ = 20'000'000ULL;
+
+/**
+ * @brief FFT trigger (baseband buffers per FFT frame) for DB scan mode
+ * @note Frame period = (trigger + 1) × 2048 samples / sampling_rate.
+ *       161 × 102.4 µs ≈ 16.5 ms → ~60.6 fps at 20 MHz — MUST match the ~60 Hz
+ *       DisplayFrameSync consumption rate. If production exceeds consumption,
+ *       the 4-slot channel FIFO saturates and DROPS frames (FIFO::in), so every
+ *       consumed frame lags 2-4 hops and detections get attributed to the wrong
+ *       frequency. Do NOT lower this below ~150 at 20 MHz.
+ * @note 16.5 ms integration ≈ +4 dB SNR per frame over the sweep trigger (63).
+ * @note If DB_CAPTURE_RATE_HZ is changed to 10 MHz (±5 MHz), set this to 80
+ *       (81 × 204.8 µs ≈ 16.6 ms) to keep the frame rate matched.
+ * @see DB_CAPTURE_RATE_HZ
+ */
+constexpr size_t DB_FFT_TRIGGER = 160;
+
+/**
+ * @brief Default gain value
+ * @note >= 20 enables RF amp (RFFC5072) for ~10-14 dB additional gain
+ */
+constexpr uint16_t DEFAULT_GAIN = 30;
+
+/**
+ * @brief Default LNA gain value (MAX2837: 0-40 dB, step 8 dB)
+ * @note 40 dB — FPV max-range: catch weak analog 5.8 GHz video links
+ * @note 40 dB is the maximum valid value (LNA step = 8 dB)
+ */
+constexpr uint8_t DEFAULT_LNA_GAIN = 32;
+
+/**
+ * @brief Default VGA gain value (MAX2837: 0-62 dB, step 2 dB)
+ * @note 40 dB — FPV-optimized: 80 dB total RF gain (LNA 40 + VGA 40)
+ * @note 62 dB (max) would risk ADC saturation on strong analog FM,
+ *       producing intermod spurs that mimic drone signatures.
+ *       40 dB gives max useful range without baseband overload.
+ */
+constexpr uint8_t DEFAULT_VGA_GAIN = 32;
+
+/** @brief Maximum valid LNA gain (dB) — MAX2837 hardware limit */
+constexpr uint16_t MAX_GAIN_DB = 40;
+
+// ============================================================================
+// Time Constants
+// ============================================================================
+
+/**
+ * @brief Drone stale timeout in milliseconds (5 seconds)
+ */
+constexpr uint32_t DRONE_STALE_TIMEOUT_MS = 5000;
+
+/**
+ * @brief Drone removal timeout in milliseconds (30 seconds)
+ */
+constexpr uint32_t DRONE_REMOVAL_TIMEOUT_MS = 30000;
+
+/**
+ * @brief Scan cycle interval in milliseconds (50 ms)
+ */
+constexpr uint32_t SCAN_CYCLE_INTERVAL_MS = 50;
+
+/**
+ * @brief PLL lock timeout in milliseconds
+ */
+constexpr uint32_t PLL_LOCK_TIMEOUT_MS = 100;
+
+/**
+ * @brief PLL lock poll interval in milliseconds
+ */
+constexpr uint32_t PLL_LOCK_POLL_INTERVAL_MS = 3;
+
+/**
+ * @brief Hardware retry delay in milliseconds
+ */
+constexpr uint32_t HARDWARE_RETRY_DELAY_MS = 10;
+
+/**
+ * @brief SD card operation timeout in milliseconds
+ */
+constexpr uint32_t SD_CARD_TIMEOUT_MS = 1000;
+
+// ============================================================================
+// RSSI Constants
+// ============================================================================
+
+/**
+ * @brief Minimum RSSI value (dBm)
+ */
+constexpr int32_t RSSI_MIN_DBM = -120;
+
+/**
+ * @brief Maximum RSSI value (dBm)
+ */
+constexpr int32_t RSSI_MAX_DBM = -20;
+
+/**
+ * @brief RSSI threshold for signal detection (dBm)
+ * @note FPV-OPTIMIZED: -95 dBm for maximum long-range detection
+ * @note Analog 5.8 GHz FPV: -85 to -100 dBm at 5-15 km (typical analog VTX)
+ * @note -95 dBm catches weak analog FM video links; noise/spurs filtered by:
+ *       - spectrum shape filter (V-shape, valley depth, symmetry)
+ *       - CFAR OS (multi-target robust)
+ *       - Mahalanobis gate + RSSI variance (anti-false-positive post-filters)
+ * @note -90 dBm was the previous default; -95 adds ~3-5 km of detection range
+ * @note HackRF baseband: spectrum.db = clamp(dBV*5 + 255, 0, 255)
+ * @note dBm = (value - 255) / 5 - gain_offset; approximated as value - 120
+ * @note Center bins 120-135 contain DC spike (blanked like Looking Glass/Search)
+ */
+constexpr int32_t RSSI_DETECTION_THRESHOLD_DBM = -95;
+
+/**
+ * @brief Default UI sensitivity (percent, 0-100) — the "Sens" control
+ * @note USER DEFAULT: 85.
+ * @note Mapping (single source of truth, mirrored by settings_manager.cpp
+ *       parse/derive code): alert_rssi_threshold_dbm = -20 - sensitivity.
+ */
+constexpr uint8_t DEFAULT_SCAN_SENSITIVITY = 85;
+
+/**
+ * @brief Detection RSSI threshold (dBm) matching DEFAULT_SCAN_SENSITIVITY
+ * @note = -20 - 85 = -105 dBm. SettingsStruct (settings_manager.cpp) derives
+ *       the identical value for alert_rssi_threshold_dbm, and ScanConfig uses
+ *       this as the rssi_threshold_dbm default — so a fresh install (no
+ *       settings file) behaves exactly like the persisted defaults.
+ */
+constexpr int32_t DEFAULT_ALERT_RSSI_THRESHOLD_DBM =
+    -20 - static_cast<int32_t>(DEFAULT_SCAN_SENSITIVITY);
+
+/**
+ * @brief RSSI threshold for high threat (dBm)
+ * @note With default gains (LNA=32 + VGA=32 + RF_AMP=14 = 78 dB),
+ *       max RSSI = (255-255)/5 - 78 = -78 dBm. Threshold must be reachable.
+ *       -85 dBm = 20 dB above LOW (-105), 4 dB above MEDIUM (-89). Reachable when
+ *       spectrum.db value >= 220 (~86% of max).
+ * @note Previous value (-84) sat 2 dB below CRITICAL (-80), squeezing the HIGH
+ *       band to 4 dB; lowered to -85 to give both HIGH and CRITICAL a usable
+ *       3-4 dB band within the reachable dynamic range.
+ */
+constexpr int32_t RSSI_HIGH_THREAT_THRESHOLD_DBM = -85;
+
+/**
+ * @brief RSSI threshold for critical threat (dBm)
+ * @note With default gains (78 dB), max RSSI = -78 dBm. Threshold -82 dBm
+ *       requires spectrum.db value >= 235 (~92% of max) — reserved for very
+ *       strong signals (close-range drone, line-of-sight).
+ * @note Previous value (-80) required ~96% of max and left a 2 dB CRITICAL
+ *       band at the physical ceiling; -82 keeps CRITICAL practically reachable
+ *       while still reserving it for strong, close-range signals.
+ */
+constexpr int32_t RSSI_CRITICAL_THREAT_THRESHOLD_DBM = -82;
+
+/**
+ * @brief Minimum gap (dB) push medium threat above the detection threshold
+ * @note Keeps a usable LOW band reachable: any signal that passes the
+ *       detection gate (threshold + 2 dB hysteresis) must still classify as
+ *       LOW when below medium. If detection is raised above/beside medium,
+ *       LOW bands collapse to empty. Enforced in Settings UI and on load.
+ */
+constexpr int32_t RSSI_MIN_MEDIUM_ABOVE_DETECTION_DB = 3;
+
+/**
+ * @brief Noise floor RSSI (dBm)
+ */
+constexpr int32_t RSSI_NOISE_FLOOR_DBM = -100;
+
+/**
+ * @brief Default RSSI threshold for low threat (dBm)
+ * @note Equals the fresh detection threshold (-105 dBm =
+ *       DEFAULT_ALERT_RSSI_THRESHOLD_DBM, Sens 85) — weak but active signals
+ *       just above the detection gate classify as LOW (not MEDIUM). The -95
+ *       dBm RSSI_DETECTION_THRESHOLD_DBM is the rssi_sens formula anchor,
+ *       not the gate.
+ * @note The -95 variant tracked the older detection default; once the fresh
+ *       gate became -105 (Sens 85), keeping LOW at -95 left a NONE band
+ *       [-105, -95) where detected signals classified as no threat at all.
+ */
+constexpr int32_t DEFAULT_THREAT_LOW_DBM = -95;
+
+/**
+ * @brief Default RSSI threshold for medium threat (dBm)
+ * @note 16 dB above LOW (-105) gives a real LOW band for long-range/weak drones.
+ *       Stronger signals escalate to MEDIUM, HIGH (-85), CRITICAL (-82).
+ * @note Previous value (-88) left only a 4 dB HIGH band between MEDIUM and
+ *       CRITICAL (-80); -89 spreads the levels evenly across the dynamic range.
+ */
+constexpr int32_t DEFAULT_THREAT_MEDIUM_DBM = -89;
+
+/**
+ * @brief RF amplifier gain (dB) when enabled
+ * @note HackRF RF amp (HMC627A/VGA) provides ~14 dB when enabled, 0 dB bypass when off
+ */
+constexpr int32_t RF_AMP_GAIN_DB = 14;
+
+// ============================================================================
+// Display Constants
+// ============================================================================
+
+/**
+ * @brief Display width in pixels
+ */
+constexpr uint16_t DISPLAY_WIDTH = 240;
+
+/**
+ * @brief Display height in pixels
+ */
+constexpr uint16_t DISPLAY_HEIGHT = 320;
+
+/**
+ * @brief Font height in pixels
+ */
+constexpr uint8_t FONT_HEIGHT = 8;
+
+/**
+ * @brief Font width in pixels
+ */
+constexpr uint8_t FONT_WIDTH = 5;
+
+/**
+ * @brief Maximum text length for display
+ */
+constexpr size_t MAX_TEXT_LENGTH = 32;
+
+/**
+ * @brief Drone type name length
+ */
+constexpr size_t DRONE_TYPE_NAME_LENGTH = 16;
+
+// ============================================================================
+// Threat Level Constants
+// ============================================================================
+
+/**
+ * @brief Number of threat levels
+ */
+constexpr size_t THREAT_LEVEL_COUNT = 5;
+
+/**
+ * @brief High threat approaching count threshold
+ */
+constexpr size_t HIGH_THREAT_APPROACHING_COUNT = 3;
+
+/**
+ * @brief Critical threat approaching count threshold
+ */
+constexpr size_t CRITICAL_THREAT_APPROACHING_COUNT = 5;
+
+// ============================================================================
+// Scanning Constants
+// ============================================================================
+
+/**
+ * @brief Default scanning mode
+ */
+constexpr ScanningMode DEFAULT_SCANNING_MODE = ScanningMode::SEQUENTIAL;
+
+/**
+ * @brief Number of scanning modes
+ */
+constexpr uint8_t SCANNING_MODE_COUNT = 1;
+
+/**
+ * @brief Maximum scan cycles before timeout
+ */
+constexpr uint32_t MAX_SCAN_CYCLES = 1000;
+
+// ============================================================================
+// Database Constants
+// ============================================================================
+
+/**
+ * @brief Maximum database entries
+ * @note 100 entries × 16 bytes = 1,600 bytes
+ */
+constexpr size_t MAX_DATABASE_ENTRIES = 100;
+
+/**
+ * @brief Database file path
+ */
+constexpr const char DATABASE_FILE_PATH[] = "/FREQMAN/DRONES.TXT";
+
+/**
+ * @brief Database load timeout in milliseconds
+ */
+constexpr uint32_t DATABASE_LOAD_TIMEOUT_MS = 2000;
+
+/**
+ * @line Database line buffer size
+ */
+constexpr size_t DATABASE_LINE_BUFFER_SIZE = 128;
+
+// ============================================================================
+// Settings Constants
+// ============================================================================
+
+/**
+ * @brief Settings file path
+ */
+constexpr const char SETTINGS_FILE_PATH[] = "/EDA/SETTINGS.TXT";
+
+/**
+ * @brief Settings file version
+ */
+constexpr uint32_t SETTINGS_FILE_VERSION = 1;
+
+// settings_version line of SETTINGS/eda_settings.txt, scaled x10 so the
+// digit-only parser can read "1.4" as 14 (audit D-FULL-PASS, 2026-10).
+// The writer stamps SETTINGS_FILE_VERSION_X10 on every save; the loader
+// compares against SETTINGS_FILE_VERSION_X10_PRE_FULL_PASS to decide
+// whether the legacy shape_sim_threshold_pct = 50 migration applies.
+constexpr uint8_t SETTINGS_FILE_VERSION_X10_PRE_FULL_PASS = 13;  // last pre-D-FULL-PASS writer ("1.3")
+constexpr uint8_t SETTINGS_FILE_VERSION_X10 = 14;                // this firmware ("1.4")
+
+// ============================================================================
+// Audio Constants
+// ============================================================================
+
+/**
+ * @brief Audio alert sample rate in Hz
+ */
+constexpr uint32_t AUDIO_ALERT_SAMPLE_RATE_HZ = 24000;
+
+/**
+ * @brief Audio alert frequency in Hz (default)
+ */
+constexpr uint32_t AUDIO_ALERT_FREQUENCY_HZ = 1000;
+
+/**
+ * @brief Audio alert high threat frequency in Hz
+ */
+constexpr uint32_t AUDIO_ALERT_HIGH_FREQUENCY_HZ = 1200;
+
+/**
+ * @brief Audio alert critical threat frequency in Hz
+ */
+constexpr uint32_t AUDIO_ALERT_CRITICAL_FREQUENCY_HZ = 1500;
+
+/**
+ * @brief Audio alert low frequency in Hz (receding)
+ */
+constexpr uint32_t AUDIO_ALERT_LOW_FREQUENCY_HZ = 800;
+
+/**
+ * @brief Audio alert duration in milliseconds (default)
+ */
+constexpr uint32_t AUDIO_ALERT_DURATION_MS = 150;
+
+/**
+ * @brief Audio alert short duration in milliseconds (critical)
+ */
+constexpr uint32_t AUDIO_ALERT_SHORT_DURATION_MS = 80;
+
+/**
+ * @brief Audio alert medium duration in milliseconds (threat increased)
+ */
+constexpr uint32_t AUDIO_ALERT_MEDIUM_DURATION_MS = 100;
+
+/**
+ * @brief Audio alert long duration in milliseconds (approaching)
+ */
+constexpr uint32_t AUDIO_ALERT_LONG_DURATION_MS = 200;
+
+/**
+ * @brief Audio alert gap in milliseconds (short)
+ */
+constexpr uint32_t AUDIO_ALERT_SHORT_GAP_MS = 40;
+
+/**
+ * @brief Audio alert gap in milliseconds (long)
+ */
+constexpr uint32_t AUDIO_ALERT_LONG_GAP_MS = 50;
+
+// ============================================================================
+// Memory Constants
+// ============================================================================
+
+/**
+ * @brief Memory breakdown (simplified):
+ * - Database entries: 96 × 12 = 1,152 bytes
+ * - Tracked drones: 16 × 125 = 2,000 bytes (includes Mahalanobis stats)
+ * - Display drones: 16 × 39 = 624 bytes
+ * - Spectrum buffer: 256 bytes
+ * - Signal timeline: 62 bytes
+ * - RSSI detector: ~108 bytes (includes RSSIStatistics struct)
+ * - Scanner thread stack: 2,048 bytes (BSS)
+ * - Mini waterfalls: 5 × 450 = 2,250 bytes (reduced from 3,150)
+ * - Other structures: ~200 bytes
+ * - Total static RAM: ~8,550 bytes
+ */
+constexpr size_t STATIC_RAM_BUDGET_BYTES = 8550;
+
+/**
+ * @brief Total stack budget (bytes)
+ * @note Updated to accommodate deeper call stacks for alert handling
+ */
+constexpr size_t STACK_BUDGET_BYTES = 4096;
+
+/**
+ * @brief Total memory budget (bytes)
+ * @note Sum of static RAM and stack budgets
+ */
+constexpr size_t TOTAL_MEMORY_BUDGET_BYTES = 12646;
+
+/**
+ * @brief Maximum stack usage per function (bytes)
+ */
+constexpr size_t MAX_STACK_PER_FUNCTION = 512;
+
+// ============================================================================
+// Struct Size Validation Constants
+// ============================================================================
+
+// ============================================================================
+// Error Handling Constants
+// ============================================================================
+
+/**
+ * @brief Maximum hardware retry attempts
+ */
+constexpr uint32_t MAX_HARDWARE_RETRIES = 3;
+
+/**
+ * @brief Maximum database retry attempts
+ */
+constexpr uint32_t MAX_DATABASE_RETRIES = 3;
+
+/**
+ * @brief Maximum mutex retry attempts
+ */
+constexpr uint32_t MAX_MUTEX_RETRIES = 3;
+
+// ============================================================================
+// Thread Constants
+// ============================================================================
+
+/**
+ * @brief Scanner thread priority
+ */
+constexpr uint8_t SCANNER_THREAD_PRIORITY = 10;
+
+/**
+ * @brief UI thread priority
+ */
+constexpr uint8_t UI_THREAD_PRIORITY = 5;
+
+/**
+ * @brief Scanner thread stack size (bytes)
+ */
+constexpr size_t SCANNER_THREAD_STACK_SIZE = 2048;
+
+/**
+ * @brief UI thread stack size (bytes)
+ */
+constexpr size_t UI_THREAD_STACK_SIZE = 4096;
+
+// ============================================================================
+// Color Constants (RGBA)
+// ============================================================================
+
+/**
+ * @brief Color for low threat (green)
+ */
+constexpr uint32_t COLOR_LOW_THREAT = 0xFF00FF00;
+
+/**
+ * @brief Color for medium threat (yellow)
+ */
+constexpr uint32_t COLOR_MEDIUM_THREAT = 0xFFFFFF00;
+
+/**
+ * @brief Color for high threat (orange)
+ */
+constexpr uint32_t COLOR_HIGH_THREAT = 0xFFFF8000;
+
+/**
+ * @brief Color for critical threat (red)
+ */
+constexpr uint32_t COLOR_CRITICAL_THREAT = 0xFFFF0000;
+
+/**
+ * @brief Color for unknown threat (gray)
+ */
+constexpr uint32_t COLOR_UNKNOWN_THREAT = 0xFF808080;
+
+/**
+ * @brief Color for background (black)
+ */
+constexpr uint32_t COLOR_BACKGROUND = 0xFF000000;
+
+/**
+ * @brief Color for text (white)
+ */
+constexpr uint32_t COLOR_TEXT = 0xFFFFFFFF;
+
+/**
+ * @brief Red detection-window bracket overlay (sweep spectrum title strip)
+ * @note Pure red — visually distinct from the white range title and the
+ *       colored spectrum bars below the strip.
+ */
+constexpr uint32_t COLOR_DET_WINDOW = 0xFFFF0000;
+
+// ============================================================================
+// FFT Bin Layout Constants (HackRF baseband: 256-bin FFT)
+// ============================================================================
+// The HackRF baseband produces 256 spectrum bins. Center bins 120-135
+// contain the DC spike from the FFT zero-frequency component.
+// Filter rolloff artifacts appear at bins 0-9 and 246-255.
+
+/**
+ * @brief Total FFT bins per spectrum message
+ */
+constexpr size_t FFT_BIN_COUNT = 256;
+
+/**
+ * @brief DC spike start bin index
+ */
+constexpr size_t FFT_DC_SPIKE_START = 120;
+
+/**
+ * @brief DC spike end bin index (exclusive)
+ */
+constexpr size_t FFT_DC_SPIKE_END = 136;
+
+/**
+ * @brief Edge skip for filter rolloff (standard: skip bins 0-9 and 246-255)
+ * @note Used by extract_rssi() and analyze_spectrum_shape_multi()
+ */
+constexpr size_t FFT_EDGE_SKIP = 10;
+
+/**
+ * @brief Edge skip for filter rolloff (narrow: skip bins 0-5 and 250-255)
+ * @note Used by sweep mode (Looking Glass pattern) — tighter window for speed
+ */
+constexpr size_t FFT_EDGE_SKIP_NARROW = 6;
+
+/**
+ * @brief Measurable emission-extent cap per DC-gap sideband, DB window (bins)
+ * @note The Step-4 walk and emission_extent() are DC-gap bounded: one
+ *       sideband measures [FFT_EDGE_SKIP .. FFT_DC_SPIKE_START) or
+ *       [FFT_DC_SPIKE_END .. FFT_BIN_COUNT - FFT_EDGE_SKIP), i.e. at most
+ *       DB_EXTENT_CAP_BINS (110) bins in DB mode. An extent can NEVER
+ *       exceed this value there, so `spectrum_max_width < DB_EXTENT_CAP_BINS`
+ *       is the Step-13 EFFECTIVE-ARMING predicate proving "MaxW can reject a
+ *       measurable wideband extent in DB" (audit M3 rev. 2, F2 fix 2026-10:
+ *       the DB-only arming site previously consumed the sweep constant 114,
+ *       which made the default MaxW = 110 read as ARMED in DB while the
+ *       chain could reject NOTHING — a silently skipped neighbor post-filter
+ *       under the documented D-B disarmed-chain config).
+ */
+constexpr uint8_t DB_EXTENT_CAP_BINS =
+    static_cast<uint8_t>(FFT_DC_SPIKE_START - FFT_EDGE_SKIP);
+
+/**
+ * @brief Measurable emission-extent cap per DC-gap sideband, sweep window (bins)
+ * @note Same construction with the narrow edge-skip: sidebands
+ *       [6 .. 119) / [136 .. 250) measure at most SWEEP_EXTENT_CAP_BINS
+ *       (114) bins. No live DB-path consumer (the Step-13 arming site is
+ *       DB-only — sweep enters via process_spectrum_sweep); the constant
+ *       exists so tests and docs state both caps from ONE pair of FFT
+ *       constants instead of copying literals.
+ */
+constexpr uint8_t SWEEP_EXTENT_CAP_BINS =
+    static_cast<uint8_t>(FFT_DC_SPIKE_START - FFT_EDGE_SKIP_NARROW);
+
+static_assert(
+    DB_EXTENT_CAP_BINS ==
+        static_cast<uint8_t>(FFT_BIN_COUNT - FFT_EDGE_SKIP - FFT_DC_SPIKE_END),
+    "lower and upper DB sidebands must measure the same bin count");
+static_assert(
+    SWEEP_EXTENT_CAP_BINS == static_cast<uint8_t>(FFT_BIN_COUNT -
+                                                  FFT_EDGE_SKIP_NARROW -
+                                                  FFT_DC_SPIKE_END),
+    "lower and upper sweep sidebands must measure the same bin count");
+
+// ============================================================================
+// AUDIT MEDIUM-2 (F4 — documentation only; do NOT "fix" by changing values):
+// bin-size parity between DB and sweep is enforced by static_assert
+// (DB_CAPTURE_RATE_HZ == SWEEP_SLICE_BW), but the ROLLOFF EXCLUSION is NOT
+// parity: DB skips 10 bins (0.78 MHz) per edge, sweep skips 6 (0.47 MHz).
+// If the capture chain's rolloff reaches beyond 6 bins, sweep's p25 noise
+// shelf is biased upward by contaminated edge bins and edge-adjacent margins
+// differ from DB for the same physical spectrum. Field tuning expressed in
+// bins carries over 1:1 ONLY for the central region; treat bins within
+// [edge_skip, edge_skip+4) of any window edge as approximate in sweep mode.
+// Changing FFT_EDGE_SKIP_NARROW here would also move the sweep display
+// mapping (SweepProcessor true-position painter) — change both together.
+// ============================================================================
+
+/**
+ * @brief Focused bin window: lower sideband start
+ * @note Bins 100-119 cover ±200 kHz around tuned frequency
+ */
+constexpr size_t FFT_FOCUSED_LOWER_START = 100;
+
+/**
+ * @brief Focused bin window: upper sideband end (exclusive)
+ * @note Bins 136-156 cover the upper sideband mirror
+ */
+constexpr size_t FFT_FOCUSED_UPPER_END = 156;
+
+/**
+ * @brief Legacy dBm conversion offset (for uncorrected RSSI)
+ * @note HackRF baseband: spectrum.db = clamp(dBV*5 + 255, 0, 255)
+ * @note LEGACY: Approximate dBm = spectrum.db - 120 (NO gain correction, slope error)
+ * @note CORRECT: dBm = (spectrum.db - 255) / 5 - (lna + vga + rf_amp_gain)
+ * @note See extract_rssi() for the gain-compensated implementation.
+ */
+constexpr int32_t FFT_DBM_OFFSET = 120;
+
+/**
+ * @brief Usable bins for spectrum shape analysis
+ * @note Total bins minus DC spike (16) minus edge skip (2×10) = 220
+ */
+constexpr size_t FFT_USABLE_BINS = FFT_BIN_COUNT - (FFT_DC_SPIKE_END - FFT_DC_SPIKE_START) - (2 * FFT_EDGE_SKIP);
+
+/**
+ * @brief Usable bins for sweep mode (narrow edge skip)
+ * @note Total bins minus DC spike (16) minus edge skip narrow (2×6) = 228
+ */
+constexpr size_t FFT_USABLE_BINS_NARROW = FFT_BIN_COUNT - (FFT_DC_SPIKE_END - FFT_DC_SPIKE_START) - (2 * FFT_EDGE_SKIP_NARROW);
+
+/**
+ * @brief Signal-carrying bins visited by SweepProcessor::process_frame.
+ * @note The true-position painter skips edges {0,1} ∪ {254,255} and the
+ *       DC notch {120..135}: runs are {2..119} (118) ∪ {136..253} (118).
+ *       This is the denominator the sweep progress accumulator
+ *       (SweepWindow::effective_bin_size = step_hz / this) must use so each
+ *       slice advances pixel_index by exactly step_hz / pixel_step_hz.
+ */
+constexpr size_t FFT_SWEEP_USABLE_BINS = 236;
+
+/**
+ * @brief Sweep slice bandwidth in Hz (20 MHz per slice)
+ * @note MUST be defined BEFORE SWEEP_BIN_SIZE - C++ requires forward declaration
+ */
+constexpr FreqHz SWEEP_SLICE_BW = 20000000;
+
+/**
+ * @brief Unified bin size in Hz (78125 Hz per bin)
+ * @note Used by both Logic and UI layers to avoid duplication
+ */
+constexpr FreqHz SWEEP_BIN_SIZE = SWEEP_SLICE_BW / FFT_BIN_COUNT;
+
+// Bin-size parity guarantee: the DB (normal) scan capture MUST stay identical
+// to the sweep slice bandwidth so that shape-filter settings expressed in bins
+// mean the same bandwidth in both scan modes. If you change one, change both.
+static_assert(DB_CAPTURE_RATE_HZ == SWEEP_SLICE_BW,
+              "DB_CAPTURE_RATE_HZ must equal SWEEP_SLICE_BW (bin-size parity between DB scan and sweep)");
+
+// ============================================================================
+// Sweep Bin Mapping Constants (Looking Glass pattern)
+// ============================================================================
+// In sweep mode, 240 bins from the 256-bin FFT are mapped to screen pixels.
+// The mapping rearranges bins to skip the DC spike:
+//   Lower sideband: FFT bins 134-253 → screen pixels 0-119
+//   Upper sideband: FFT bins 0-118   → screen pixels 120-238
+//   Bins 119, 120-135, 254-255 are skipped (DC spike + neighbors)
+
+/**
+ * @brief Screen pixels per sweep slice (= DISPLAY_WIDTH)
+ */
+constexpr uint8_t SWEEP_PIXELS_PER_SLICE = 240;
+
+/**
+ * @brief Composite buffer size (pixels)
+ */
+constexpr uint16_t COMPOSITE_SIZE = 240;
+
+/**
+ * @brief Max center-to-center sweep step (Hz) that guarantees ZERO blind
+ *        frequencies across a sweep window ("gapless coverage").
+ * @note Every 20 MHz slice excludes the 16-bin DC notch (bins 120-135) and the
+ *       edge bins (0-5, 250-255) from detection. Stepping the center by more
+ *       than this leaves a PERMANENT ~1.8 MHz dead zone around every slice
+ *       center (a drone on such a frequency can never be detected). Stepping
+ *       by this value or less lets each slice's notch be fully covered by the
+ *       neighbouring slice's active bins (every frequency probed by >=2 fits).
+ * @note Formula: (256 - 6 - 1 - 136) * 78125 = 113 bins * 78,125 = 8,828,125 Hz
+ */
+constexpr FreqHz SWEEP_GAPLESS_STEP_MAX_HZ =
+    static_cast<FreqHz>(FFT_BIN_COUNT - FFT_EDGE_SKIP_NARROW - 1 - FFT_DC_SPIKE_END)
+    * SWEEP_BIN_SIZE;
+// ============================================================================
+// Sweep slice detection geometry (Looking-Glass sideband biases)
+// ============================================================================
+// Both the display painter (SweepProcessor::process_frame) and the detector
+// (DroneScanner::fft_bin_to_freq) map FFT bins to RF with per-sideband biases:
+//   upper sideband (bins 6..119 usable):
+//     freq = center + (bin − SWEEP_BIAS_UPPER)·SWEEP_BIN_SIZE
+//     → detection covers [center − 120 bins, center − 7 bins]
+//   lower sideband (bins 136..249 usable):
+//     freq = center + (bin − SWEEP_BIAS_LOWER)·SWEEP_BIN_SIZE
+//     → detection covers [center + 16 bins, center + 129 bins]
+// The per-slice detection blind notch is therefore (center − 7 .. center + 16)
+// = 23 bins ≈ 1.797 MHz. SWEEP_GAPLESS_STEP_MAX_HZ above is the EXACT
+// butt-joint pitch: at 113 bins the next slice's upper sideband starts exactly
+// at (center − 7 bins) and the previous slice's lower sideband ends exactly at
+// (center + 16 bins) — the notch is sealed by U(k+1) ∪ L(k−1), with L(k) and
+// U(k+2) reinforcing.
+
+/**
+ * @brief FFT-bin bias of the sweep slice's upper sideband (bins 2..119).
+ * @note freq(bin) = center + (bin − SWEEP_BIAS_UPPER)·SWEEP_BIN_SIZE.
+ */
+constexpr uint32_t SWEEP_BIAS_UPPER = FFT_DC_SPIKE_START + FFT_EDGE_SKIP_NARROW;  // 126
+
+/**
+ * @brief FFT-bin bias of the sweep slice's lower sideband (bins 136..253).
+ * @note freq(bin) = center + (bin − SWEEP_BIAS_LOWER)·SWEEP_BIN_SIZE.
+ */
+constexpr uint32_t SWEEP_BIAS_LOWER = FFT_DC_SPIKE_START;  // 120
+
+/**
+ * @brief RF offset (in bins, below the slice center) of a slice's LOWEST
+ *        detected frequency.
+ * @note The upper sideband's first detection bin (FFT_EDGE_SKIP_NARROW) sits
+ *       at center − (SWEEP_BIAS_UPPER − FFT_EDGE_SKIP_NARROW)·SWEEP_BIN_SIZE
+ *       = center − FFT_DC_SPIKE_START·SWEEP_BIN_SIZE = center − 9,375,000 Hz.
+ *       The lower sideband re-enters only at center + 16 bins, so the upper
+ *       sideband defines the slice's bottom edge. Used to place the FIRST
+ *       slice center so its first detection bin lands EXACTLY on f_min.
+ */
+constexpr uint32_t SWEEP_DETECT_EDGE_OFFSET_BINS =
+    SWEEP_BIAS_UPPER - FFT_EDGE_SKIP_NARROW;  // 120 (= FFT_DC_SPIKE_START)
+
+/**
+ * @brief Lead of the first sweep slice center above f_min (Hz).
+ * @note f_center_ini = f_min + SWEEP_FIRST_SLICE_LEAD_HZ puts the first
+ *       detection bin EXACTLY on f_min — zero blind band at the window's lower
+ *       edge. The previous "half-slice lead" (f_min + 10 MHz) started
+ *       detection at f_min + 625 kHz — a permanent blind band on every pass.
+ */
+constexpr FreqHz SWEEP_FIRST_SLICE_LEAD_HZ =
+    static_cast<FreqHz>(SWEEP_DETECT_EDGE_OFFSET_BINS) * SWEEP_BIN_SIZE;  // 9,375,000 Hz
+
+/**
+ * @brief Minimum number of slices per sweep window.
+ * @note A single slice ALWAYS leaves its 23-bin DC notch undetected (no
+ *       neighbour exists to cover it). With >= 2 slices the derived pitch is
+ *       <= SWEEP_GAPLESS_STEP_MAX_HZ / 2 and every notch lands on a neighbour.
+ */
+constexpr uint16_t SWEEP_MIN_SLICES = 2;
+
+/**
+ * @brief FFT bin where lower sideband mapping starts
+ */
+constexpr uint8_t SWEEP_FFT_MAP_START = 134;
+
+/**
+ * @brief Crossover pixel index (lower → upper sideband boundary)
+ */
+constexpr uint8_t SWEEP_FFT_MAP_CROSSOVER = 120;
+
+/**
+ * @brief FFT bins per step for sweep advancement
+ * @note 228 bins × 78125 Hz/bin = 17.8125 MHz step (matches usable narrow bins)
+ */
+constexpr uint16_t SWEEP_BINS_PER_STEP = FFT_USABLE_BINS_NARROW;
+
+/**
+ * @brief M0 baseband phase decimation trigger for wideband spectrum.
+ * @note Controls how many samples are accumulated per FFT frame.
+ * @note 63 buffers @ 20MHz = ~6.5ms integration = maximum sensitivity
+ * @note +3dB SNR improvement over trigger=31, sweep takes ~1.6s for 240 freq
+ */
+constexpr size_t SWEEP_FFT_TRIGGER = 63;
+
+/**
+ * @brief Maximum number of sweep windows
+ */
+constexpr uint8_t MAX_SWEEP_WINDOWS = 4;
+
+// ============================================================================
+// Sweep Persistence & Smoothing Constants
+// ============================================================================
+
+/**
+ * @brief Composite EMA decay factor for sweep persistence.
+ * @note new_val = max(raw_val, (persist_val * DECAY) >> 8)
+ * @note 224/256 = 0.875: signal decays to ~59% after 4 passes (~3s at 1.6s/pass)
+ * @note Increased from 192 to retain weak signals longer between sweep cycles.
+ * @note Range: 128 (fast fade) to 255 (slow fade)
+ */
+constexpr uint16_t SWEEP_PERSISTENCE_DECAY_Q8 = 224;
+
+/**
+ * @brief Minimum number of frames to drop after a retune when the FIFO level
+ *        could not be snapshotted (streaming not yet started — the UI holds a
+ *        null ChannelSpectrumFIFO pointer).
+ * @note Exactly one frame is in flight inside the M0 at any instant; that
+ *       frame — the retune STRADDLER, whose capture interval contains the
+ *       retune instant — is stale by construction (its bins mix the old and
+ *       the new frequency, and the MAX2837/RFFC5072 needs ~200 us to relock,
+ *       far below one FFT frame period). With no FIFO observation the caller
+ *       can account for that straddler and nothing else.
+ * @note The NORMAL path never uses this floor: DroneScannerUI::
+ *       retune_sweep_window() snapshots the exact count as
+ *       `spectrum_fifo_->len() + 1`. Stack: 0 B.
+ */
+constexpr uint8_t SWEEP_RETUNE_MIN_PENDING_FRAMES = 1;
+
+/**
+ * @brief Physical depth of the channel spectrum FIFO in slots.
+ * @note SOURCE: ChannelSpectrumFIFO = FIFO<ChannelSpectrum> sized
+ *       `1 << ChannelSpectrumConfigMessage::fifo_k` (fifo_k = 2 → 4 slots;
+ *       FIFO::in() refuses at is_full(), so len() <= 4 by construction).
+ * @note Single source of truth for the drain-loop cap and the retune-budget
+ *       clamp in DroneScannerUI. The equation is pinned by a static_assert in
+ *       drone_scanner_ui.hpp: changing fifo_k breaks the BUILD, not the
+ *       stale-frame accounting.
+ * Flash: 1 B. SRAM: 0.
+ */
+constexpr uint8_t SWEEP_CHANNEL_FIFO_DEPTH = 4;
+
+/**
+ * @brief Max DRAINED frames consumed by one frame-sync tick in sweep mode
+ *        (the newest frame is popped separately into spectrum_buffer_ for
+ *        on_sweep_spectrum()).
+ * @note DEPTH − 1: three older frames land in spectrum_discard_, the fourth
+ *       pop hands the freshest capture to on_sweep_spectrum(). NOT applied
+ *       while a stale budget is armed — an armed retune_pending_frames_ is
+ *       always spent to zero first (the break is gated on
+ *       `stale_budget == 0`), so no pre-retune frame can slip past the cap.
+ * @note Sensitivity-neutral: identical to the historical literal `3` — one
+ *       tick still feeds up to 3 drained + 1 final = 4 detector charges,
+ *       exactly SWEEP_MAX_DETECTOR_LOOKS_PER_SLICE.
+ * Flash: 1 B. SRAM: 0.
+ */
+constexpr uint8_t SWEEP_MAX_DRAIN_PER_TICK = SWEEP_CHANNEL_FIFO_DEPTH - 1;
+
+/**
+ * @brief Hard cap on detector integrations (process_spectrum_sweep calls) per
+ *        (sweep window, slice center) per sweep pass.
+ * @note DERIVATION (uniform false-alarm rate across the window): one handler
+ *       tick delivers at most FOUR detector charges for the same (window,
+ *       center) — up to 3 drained live frames in the frame-sync drain loop
+ *       plus the final frame via on_sweep_spectrum() — and an INTERIOR slice
+ *       is probed by exactly one tick per pass. The cap is therefore calibrated
+ *       to one tick's maximum: a normal slice is NEVER throttled, and the
+ *       constant only binds on look accumulation ACROSS ticks (today: the
+ *       first-slice double dwell). Every temporal integrator the detector feeds
+ *       is STRICTLY MONOTONE in the number of samples it sees per pass:
+ *         - WaterfallHistory::get_max_across_frames() — an order statistic;
+ *         - WaterfallHistory::count_above_threshold() vs TBD_MIN_FRAMES;
+ *         - MedianFilter<int32_t,7>::is_warm() — warm at N/2+1 = 4.
+ *       A slice center that receives more looks than the interior therefore has
+ *       a systematically HIGHER false-alarm rate than the rest of the window.
+ *       The first-slice dwell used to double the tick count at f_center_ini —
+ *       that, plus an unbounded drain, produced the false spike and false
+ *       detection at the window's lower edge.
+ * @note Consumed by SweepWindow::spend_detector_look(). Composite max-hold is
+ *       NOT capped: display-only integration stays free, so the dwell keeps
+ *       its full display benefit while losing only its detector bias.
+ * @note Sensitivity-neutral in BOTH directions: slice 0 receives
+ *       min(tick1 + tick2, cap) versus an interior slice's min(tick1, cap)
+ *       under identical FIFO conditions, so no slice can be throttled below
+ *       what an interior slice already receives — and the first look at any new
+ *       (window, center) is always admitted because the counter resets on every
+ *       key change.
+ * SRAM: 0. Flash: 4 B.
+ */
+constexpr uint8_t SWEEP_MAX_DETECTOR_LOOKS_PER_SLICE = 4;
+
+/**
+ * @brief Noise margin for composite display floor subtraction.
+ * @note render_composite suppresses bins below noise_floor + this.
+ */
+constexpr uint8_t SWEEP_DISPLAY_NOISE_MARGIN = 8;
+
+/**
+ * @brief Percentile of EMA persistence buffer used as auto-computed noise floor.
+ * @note Range 0..99. Lower value = more aggressive subtraction (cuts more bins).
+ * @note 15 = robust against sparse spectra: only the bottom 15% is treated as noise,
+ *       so the first fresh pixels of a new pass are visible in real-time.
+ * @note 50 (median, the previous default) is too aggressive for real-time sweep:
+ *       with a dense spectrum the median sits at the signal level and zero-outs
+ *       freshly-written pixels until the pass completes.
+ */
+constexpr uint8_t SWEEP_NOISE_FLOOR_PERCENTILE = 15;
+
+/**
+ * @brief User shelf offset (units, -9..+9, default 0) applied to the sweep
+ *        noise shelf in BOTH the display and the detector.
+ * @note Display side: DroneDisplay subtracts (15th-percentile composite floor
+ *       + offset) from every bar before the margin/color gates — the dial
+ *       reveals or suppresses weak peaks on the spectrum.
+ * @note Detector side: process_spectrum_sweep biases its per-frame p25 noise
+ *       shelf AND the width-anchor shelf by the SAME offset, so the Step-3
+ *       margin gate, shape chain, fast prefilter and TBD elevation all move
+ *       with the displayed shelf — what the user reveals is what the relative
+ *       gates admit. The absolute RSSI gate (Sens knob, rssi_threshold_dbm)
+ *       and the dBm-domain tracking/RSSI path are intentionally NOT biased.
+ * @note RAW exceptions (offset must NOT reach them): the σ/IQR estimate in
+ *       update_auto_gate (its contract is IQR = p75 - p25, and the DB path
+ *       already feeds it the RAW p25 — biasing it would cancel most of a
+ *       negative dial position inside the Step-3 gate and desync DB vs sweep)
+ *       and AdaptiveThreshold's floor_dBm (must share the RAW-peak dBm domain
+ *       of the rssi it classifies against).
+ * @note UI drain parity: the drain prefilter gates on clamp(min_bin + offset)
+ *       via DroneScanner::sweep_shelf_offset_try() so the documented "UI gate
+ *       ⊆ detector gate" proof survives every offset (incl. negative); the
+ *       accessor fails OPEN to SWEEP_SHELF_OFFSET_MIN on mutex contention.
+ * @note Semantics: effective_shelf = auto_N + offset. The automatic percentile
+ *       keeps running every pass (tracks AGC gain steps and range changes);
+ *       the user's RELATIVE adjustment never gets recalculated away.
+ */
+constexpr int8_t SWEEP_SHELF_OFFSET_MIN = -9;
+constexpr int8_t SWEEP_SHELF_OFFSET_MAX = 9;
+constexpr int8_t SWEEP_SHELF_OFFSET_DEFAULT = 0;
+
+// ============================================================================
+// Mini Waterfall Constants
+// ============================================================================
+
+/**
+ * @brief Horizontal resolution of the mini waterfall display in frequency bands.
+ * @note 60 bands (each = 4 composite bins) × WATERFALL_MAX_ROWS rows of history.
+ *       Row-oriented: each sweep pass produces one row (60 frequency bands).
+ *       Rows scroll top-to-bottom (oldest at top, newest at bottom).
+ *       SRAM: WATERFALL_MAX_ROWS × 30 bytes/row = 450 bytes per MiniWaterfall
+ *       instance; 5 instances (4 sweep windows + 1 realtime) = 2,250 bytes BSS.
+ *       Each band maps to 4 screen pixels (240 / 60 = 4), giving 4px-wide
+ *       vertical stripes — 2.5× finer than the previous 24-band (10px) layout.
+ *       Renderer shows min(chart_h, count) rows — fills available height.
+ */
+constexpr uint16_t WATERFALL_HEIGHT = 60;
+
+/**
+ * @brief Vertical depth (history rows) of each MiniWaterfall.
+ * @note Sized to fill the timeline section:
+ *       TIMELINE_H(26) − WF_HEADER_H(10) − 1 bottom gap = 15 rows.
+ *       Values above 15 only waste SRAM (renderer clips at chart_h);
+ *       values below 15 leave permanently blank rows under the waterfall.
+ *       Reduced from 21 to 15 to save 900 bytes BSS (5 × 180 bytes)
+ *       and prevent stack pressure on tab transitions.
+ */
+constexpr uint8_t WATERFALL_MAX_ROWS = 15;
+
+// ============================================================================
+// Spectrum Shape Filter Constants
+// ============================================================================
+
+/**
+ * @brief Default peak margin above noise floor (5-200; spectrum.db units, 5 units = 1 dB)
+ * @note 10 ≈ 2 dB above noise — permissive default for weak-signal sites;
+ *       CFAR (OS mode) and the post-filters (neighbor margin, RSSI
+ *       variance, Mahalanobis) still perform the false-positive rejection
+ * @note 5 ≈ 1 dB (too permissive on noisy sites; below the compile-time
+ *       noise-model floor — see TBD_MIN_ELEVATION_UNITS /
+ *       SHAPE_ADAPT_GATE_FLOOR static_asserts),
+ *       20 ≈ 4 dB (previous analog-FPV default), 25 ≈ 5 dB (strict-ish),
+ *       55 ≈ 11 dB (very strict)
+ * @note Lower bound: must stay >= 2×TBD_MIN_ELEVATION_UNITS and
+ *       >= SHAPE_ADAPT_GATE_FLOOR + 2 (static_asserts below) so the TBD
+ *       confirm floor and the sensitive-mode auto-gate floor never sit
+ *       inside the noise.
+ */
+constexpr uint8_t DEFAULT_SPECTRUM_MARGIN = 10;
+
+/**
+ * @brief Default minimum signal width in bins (1-100)
+ * @note Signals narrower than this are rejected as needle spikes
+ * @note 40 bins ≈ 3.13 MHz (2026-10-22 user-elected default): rejects
+ *       narrow noise spikes and narrowband control links (ELRS/FrSky
+ *       2-8 bins die; wider narrowband clutter up to 3.13 MHz dies too)
+ *       at the in-frame path, while letting medium-width signals (3-5 MHz
+ *       skirts, marginal digital FPV) through. Analog FPV video (8-14 MHz
+ *       wide) and wide digital FPV pass comfortably. The flatness
+ *       wide-fragment waiver (FLATNESS_WIDE_WAIVER_BINS) follows THIS
+ *       default by construction.
+ * @note TBD below-gate EXEMPT side effect: the MinW narrowband guard in
+ *       tbd_peak_is_narrowband() exempts below-gate targets while
+ *       spectrum_min_width sits at THIS default floor
+ *       (minw_applies = peak_margin >= gate || min_width > default). At the
+ *       default floor the exempt lets below-gate targets with width < 40
+ *       bins pass the MinW guard by design — the in-frame path still
+ *       enforces the full 40-bin edge. Raising MinW above 40 extends
+ *       enforcement to the below-gate path too (NOTE for upgraders: a
+ *       saved file that still carries the OLD default 60 now counts as
+ *       "raised" and gets full below-gate enforcement).
+ * @note History: 2 bins ≈ 156 kHz (permissive, "pass narrow AND wide"),
+ *       9 bins ≈ 700 kHz (older analog-FPV default), 20 ≈ 1.56 MHz,
+ *       60 ≈ 4.69 MHz (strict 2026-10 set), 40 ≈ 3.13 MHz (current).
+ */
+constexpr uint8_t DEFAULT_SPECTRUM_MIN_WIDTH = 40;
+
+/**
+ * @brief Default maximum signal width in bins (1-255)
+ * @note Signals wider than this are rejected as flat-topped U/I noise
+ * @note 255 (PREVIOUS default — "pass narrow AND wide"): no width cap.
+ *       In the current raw-FFT chain (has_dc_gap=true everywhere) the Step-4
+ *       walk and emission_extent() are DC-gap bounded — the measurable
+ *       extent can NEVER exceed 110 bins in DB (10..119 / 136..245) or 114
+ *       in sweep (6..119 / 136..249) — so any value >= 114 is
+ *       behaviorally identical; 255 made "no cap" explicit instead of
+ *       implying the old 15.6 MHz ceiling. Wideband (WiFi 20-40 MHz)
+ *       rejection in sweep is owned by the Step 6c BOTH-EDGES rule (an
+ *       emission holding half power wall-to-wall across BOTH sidebands —
+ *       the rule bridges the DC gap, see scanner.cpp Step 6c — is wider
+ *       than any FPV channel); DB-scan flat-top rejection is owned by the
+ *       tracking post-filters (neighbor margin, Mahalanobis, RSSI variance)
+ *       and by Flat (now armed by default — see DEFAULT_SPECTRUM_FLATNESS).
+ * @note 200 bins ≈ 15.6 MHz (previous default) — inert under the DC-gap cap
+ *       (extent <= 114) but read by users as a real ceiling in the UI
+ * @note CAUTION: do not lower below ~100 bins (7.8 MHz) unless the primary
+ *       threat is narrowband only — values in the 100-114 range start
+ *       clipping the widest legitimate analog FPV video skirts (8-14 MHz
+ *       at −6 dB, measured per DC-gap sideband half)
+ * @note 110 bins ≈ 8.6 MHz (current default, A-2 2026-10): EQUAL to the DB
+ *       DC-gap measurable-extent cap (sideband 10..119 = 110 bins =
+ *       DB_EXTENT_CAP_BINS), so the setting is fully INERT in DB — an
+ *       extent can never measure more than 110 there, and the Step-13
+ *       EFFECTIVE-ARMING MaxW term (`max_width < DB_EXTENT_CAP_BINS`)
+ *       consequently reads DISARMED in DB (MaxW cannot reject anything
+ *       measurable, so it must not claim wideband ownership — F2 fix
+ *       2026-10; the chain owns the verdict via Sharp/Flat instead) —
+ *       while becoming a REAL cap in sweep, whose wider sidebands
+ *       (6..119 / 136..249 = 114 bins = SWEEP_EXTENT_CAP_BINS) can measure
+ *       111-114: a wall-to-wall sweep emission of that size is now rejected
+ *       by MaxW itself — an additional wideband gate AHEAD of the Step 6c
+ *       BOTH-EDGES rule (6c still owns the full window-span test).
+ *       DOCUMENTED COST (the CAUTION below, entering its 100-114 range):
+ *       the widest single-sideband FPV skirt measured 8.6-8.9 MHz
+ *       (111-114 bins, sweep right sideband) is now clipped; every FPV
+ *       straddling the DC gap measures <= 110 per sideband half and is
+ *       unaffected. (Was 120 — above the 114-bin sweep cap, i.e. inert in
+ *       BOTH modes; before that 255 = explicit no-cap.)
+ */
+constexpr uint8_t DEFAULT_SPECTRUM_MAX_WIDTH = 110;
+
+/**
+ * @brief Default minimum peak sharpness ratio (50-250)
+ * @note sharpness = (peak_margin * 100) / avg_margin
+ * @note Inverted-V peaks have sharpness > 200; flat U/I shapes have sharpness ~ 100
+ * @note 50 = no sharpness filtering (accept all shapes)
+ * @note 51..100 is a MATHEMATICAL NO-OP dead-band (audit D5): avg_margin is
+ *       measured over [left..right] which INCLUDES the peak bin, so
+ *       avg_margin <= peak_margin and sharpness >= 100 on EVERY frame —
+ *       only thresholds >= 101 can ever reject. 50, 75 and 100 behave
+ *       identically; the effective filtering range is 101..250.
+ * @note D-ARM (2026-10): under the Sens "Shape score" a dead-band value no
+ *       longer casts an always-pass VOTE — the step ABSTAINS (informative-
+ *       arming, see the SENS = PARALLEL SHAPE EVALUATION block below), so
+ *       a dead-band Sharp (the previous default 100) can no longer dilute
+ *       a real Flat/Valley dissent to a passing tie. The current default
+ *       165 is armed (can reject) and casts a real vote.
+ * @note 100 (PREVIOUS default — no-op dead-band top): analog FM video is a
+ *       quasi-flat block with a dominant carrier peak, measured sharpness
+ *       ≈ 100-130 at medium range. At exactly 100 the gate is a
+ *       mathematical no-op (avg_margin <= peak_margin, so sharpness >= 100
+ *       always).
+ * @note 165 (CURRENT default — STRICT): clips the measured FPV 100-130
+ *       band at medium range (same class of trade-off as the historical
+ *       150 default: "rejected medium-range analog FPV"). Accepts only
+ *       peaks whose sharpness clearly exceeds the flat-block distribution
+ *       — inverted-V / strong-carrier shapes (sharpness > 200 pass
+ *       comfortably; 130-165 marginal). WiFi/BT flat-top (~100) is
+ *       additionally rejected by this gate, not just by Flat. User-elected
+ *       strictness: weak/mid-range analog FPV will be lost.
+ * @note History: 75 (accepted flat noise) → 150 (rejected medium-range
+ *       analog FPV) → 120 (clipped the FPV 100-130 band once TBD stopped
+ *       resurrecting) → 100 (no-op) → 165 (strict, FPV band clipped by
+ *       design).
+ */
+constexpr uint8_t DEFAULT_SPECTRUM_PEAK_SHARPNESS = 165;
+
+/**
+ * @brief Default peak-to-width ratio threshold (0-255)
+ * @note ratio = (peak_margin * 10) / signal_width
+ * @note Inverted-V (drone video link): ratio > 50 (tall, narrow)
+ * @note Flat U/I noise: ratio < 20 (wide, short)
+ * @note Needle spikes: ratio > 100 (very tall, very narrow)
+ * @note 0 = no ratio filtering (disabled) — RECOMMENDED for FPV
+ * @note FPV: disabled due to wide signal width having low ratio.
+ *       Previous default was 5 (inconsistently enabled despite comment).
+ */
+constexpr uint8_t DEFAULT_SPECTRUM_PEAK_RATIO = 0;
+
+/**
+ * @brief Default valley depth threshold (0-200)
+ * @note REJECT rule: max flanking valley margin >= threshold → reject, so
+ *       RAISING the value LOOSENS the filter; 0 = disabled (the whole block,
+ *       including the O(width) dual-peak ridge scan, is skipped outright).
+ * @note FPV DEFAULT = 0 (OFF) — the shipped 90 was mathematically INERT.
+ *       Proof: Step 4 stops the width walk at the first bin below
+ *       elevated = noise + peak_margin/3, so the FIRST flank bin Step 9
+ *       measures is always < peak_margin/3, i.e. <= (255-1)/3 = 84 units in
+ *       EVERY mode (the elevated_sum clamp is unreachable: peak <= 255 forces
+ *       noise + margin/3 <= 255). A threshold of 90 could therefore never
+ *       reject anything — while still paying the dual-peak ridge scan for
+ *       every peak of every frame. 0 = byte-identical accept/reject
+ *       behavior, honest alignment with the PERMISSIVE SET (Flat/Sym/Ratio
+ *       are 0 too).
+ * @note FLANK PROBE = 6-bin window (audit D-VALLEY-PROBE): Step 9 now reads
+ *       up to VALLEY_PROBE_MAX_BINS (6) usable bins BEYOND the fragment edge
+ *       per side and takes the MAXIMUM margin. For a smooth monotone skirt
+ *       the edge bin is the maximum of the walk, so the measurement — and
+ *       the 3*(D+1) arming rule below — are IDENTICAL to the old 1-bin
+ *       probe; what changes is a 1-bin dip at the edge no longer masks an
+ *       elevated continuation further out (a plateau/second lobe within
+ *       6 bins counts at its own level). Keep D >= 6 so single-unit noise
+ *       dither beyond a deep valley cannot fire the filter.
+ * @note To ARM the filter: threshold D fires only on flank >= D, which
+ *       requires peak_margin >= 3*(D+1) — D=70..80 bites only near-saturation
+ *       events (margin >= 213): receiver OVERLOAD (README section 24,
+ *       scenario 5) but also saturated close-range FPV — the historical
+ *       "80 cut targets at ~10 m" report is exactly the margin >= 243
+ *       boundary. D <= 55 cuts legitimate mid-range FPV (fires at
+ *       margin >= 168). Against ordinary WiFi it never helps: WiFi margin
+ *       stays below 213 in all normal placements.
+ * @note History: 55 (rejected strong FPV at close range) → 80 (bit only
+ *       margin >= 243) → 90 (provably never fires — documented, but paid
+ *       the ridge scan) → 0 (explicit OFF, same behavior, zero cost).
+ */
+constexpr uint8_t DEFAULT_SPECTRUM_VALLEY_DEPTH = 0;
+
+/**
+ * @brief Default peak flatness threshold (0-100, percentage)
+ * @note flatness = (high_power_bins * 100) / signal_width
+ * @note Measures how many bins are at 90%+ of the peak-above-noise
+ *       (noise_floor + 0.9 * peak_margin — noise-relative, audit fix F2;
+ *       formerly 90% of the ABSOLUTE raw_peak, which drifted with gain:
+ *       the effective share shrank from 65% to 50% of margin as the noise
+ *       floor rose from 100 to 160 units for the same shape)
+ * @note COUNT (audit fix D-D): EVERY bin of the measured band [left..right]
+ *       at/above the bar counts — the numerator mirrors the denominator's
+ *       range exactly. An earlier walk-out loop broke at the first sub-90%
+ *       bin, so a dip inside the band hid the bins beyond it (dual-lobe
+ *       flat top under-scored → escaped Flat; code was more permissive
+ *       than this doc's "share of bins within the band" contract).
+ * @note WiFi/BT flat-top: flatness ~ 50-80% (many bins near peak)
+ * @note Fat analog FPV block with a BLUNT top: flatness ~ 40-70% — this is
+ *       NOT separable from WiFi by this metric at close/mid range.
+ * @note Higher threshold = MORE PERMISSIVE (admits flatter signals); LOWER
+ *       threshold = stricter (rejects more flat-top signals). The value is
+ *       the MAXIMUM allowed flatness: flatness_pct > threshold → REJECT.
+ *       0 = filter disabled.
+ * @note 25 (CURRENT default — ARMED, strict): flatness_pct > 25 → REJECT.
+ *       Accepts only sharp-peaked signals (< 25% of bins at 90%+ of peak);
+ *       fat blunt-topped analog FPV (40-70%) and WiFi/BT flat-top (50-80%)
+ *       are BOTH rejected on strong peaks (the filter engages above
+ *       FLATNESS_MIN_PEAK_MARGIN ≈ 8 dB and skips weak peaks / narrow
+ *       signals). User-elected strictness: blunt-top FPV carriers will be
+ *       lost on strong close-range passes — same trade-off class as the
+ *       pre-2026-09 default (45) but stricter. 0 = filter disabled;
+ *       direction: МЕНЬШЕ = жёстче, БОЛЬШЕ = мягче (см. README раздел 24).
+ * @note 0 (PREVIOUS default — "pass narrow AND wide"): flatness was
+ *       DISABLED. Rationale at the time: a fat FPV carrier with a slightly
+ *       blunt top measured 45-70% and was rejected on nearly every pass,
+ *       and the shape reject additionally vetoed its TBD rescue
+ *       (note_shape_veto). With 0 the verdict no longer depends on
+ *       top-bluntness; the trade-off was WiFi/BT discrimination OFF.
+ * @note SEMANTICS: flatness is a SHAPE filter, not a width filter. It does
+ *       NOT measure width and does NOT suppress it — MinW/MaxW own width
+ *       (Steps 5/6). Flatness runs AFTER the band is measured and classifies
+ *       its PROFILE: the share of bins within the measured band that carry
+ *       >= 90% of the peak-above-noise (noise-relative threshold, F2 — see
+ *       the formula note above). A flat top (WiFi/BT) scores 50-80% (REJECT),
+ *       a sharp peak (drone/FM) scores <30% (PASS). Two signals of the SAME
+ *       width can invert the verdict — the shape decides, which is exactly
+ *       why flatness works where MaxW cannot.
+ * @note SAFETY guards when ENABLED (unchanged): skipped entirely below
+ *       FLATNESS_MIN_PEAK_MARGIN (~8 dB) unless the fragment is wide
+ *       (>= FLATNESS_WIDE_WAIVER_BINS, A-3 2026-10 — wideband evidence
+ *       damps the low-SNR swing the floor protects against), skipped in
+ *       sensitive mode for weak peaks, and skipped for narrow signals
+ *       (<= FLATNESS_MIN_SIGNAL_WIDTH).
+ *       WiFi-плотные площадки: ПОНИЖАЙТЕ от 25 к 20 (меньше = жёстче;
+ *       см. README раздел 24).
+ */
+constexpr uint8_t DEFAULT_SPECTRUM_FLATNESS = 25;
+
+/**
+ * @brief Upper bound of the flatness PERCENTAGE domain (0-100).
+ * @note apply_shape_filters Step 10 eases the limit with
+ *       `(100 - Flat) * (10000 - w2) / 10000` in UNSIGNED arithmetic —
+ *       a ScanConfig carrying Flat > 100 would underflow that subtraction
+ *       and produce a garbage limit. Every shipped producer clamps to
+ *       0..100 (settings_manager.cpp parse + NumberField {0,100}); this
+ *       constant is the single named statement of that domain so the
+ *       defensive saturation in scanner.cpp has a name instead of a magic
+ *       100, and so the two stay welded together.
+ */
+constexpr uint8_t SPECTRUM_FLATNESS_PCT_MAX = 100;
+
+/**
+ * @brief Effective (rejection-capable) ceiling of the flatness limit (0-99).
+ * @note A flatness limit of 99 can reject ONLY the synthetic pct == 100
+ *       (every fragment bin within 10% of the 90% bar — a perfectly flat
+ *       top under a margin that barely clears the gate). Real WiFi/BT
+ *       plateaus measure 40-90% and a blunt-top FPV peak 45-70%: against
+ *       those a 99-bar is an ABSTENTION, not a verdict — exactly the
+ *       semantics SHARPNESS_NOOP_CEILING gives Sharp in its 51..100
+ *       dead-band. Under w-easing the default F = 25 lands on the limit 99
+ *       throughout the w <= 10 band (25 + 75·(10000−w²)/10000 = 99 ⇔
+ *       w² <= 133): informative arming and the Step-13 EFFECTIVE-ARMING
+ *       mirror must therefore treat 99 as disarmed, otherwise the
+ *       gate..gate+2 band keeps a phantom always-pass Flat seat and the
+ *       A-1 raw fallback never engages there (audit F1 2026-10: at w = 5/10
+ *       a wideband plateau slipped through 100%-scored while w = 0 and
+ *       w >= 15 both rejected it — stringency was NON-MONOTONIC in SNR).
+ * @note Sens OFF VERDICT-IDENTITY micro-change: at w² = 10000 the eased
+ *       limit equals the raw F, so F = 99 (previously armed, could reject
+ *       only pct == 100) newly abstains — same abstention class as F = 100,
+ *       which was already disarmed.
+ * @note SCOPE: this ceiling gates ARMING (the `< 99` test — exact eased
+ *       value, uncapped). The Step-10 PASS/FAIL limit is additionally
+ *       clamped below by FLAT_WIDE_BAR_PCT (85) — see
+ *       flatness_judgment_limit() in shape_gate_logic.hpp.
+ */
+constexpr uint8_t FLATNESS_EFFECTIVE_CEILING = 99;
+
+static_assert(FLATNESS_EFFECTIVE_CEILING < SPECTRUM_FLATNESS_PCT_MAX,
+    "the effective flatness ceiling must stay below the unreachable 100 abstain ceiling");
+
+/**
+ * @brief Minimum peak margin for flatness check to be meaningful (in spectrum.db units)
+ * @note Below this SNR, the flatness measurement is unreliable because:
+ *       - V-shape signals compress near the noise floor, increasing flatness_pct
+ *       - The 90% threshold is too close to the signal values, causing 20-50% swing
+ *         from normal peak fluctuations
+ * @note At peak_margin < 40 (~8 dB), WiFi flat-top still has flatness > 60%
+ *       while drone V-shape has flatness 40-70% — overlap is too high to distinguish.
+ * @note Above peak_margin 40 (~8 dB), WiFi flatness > 80% vs drone < 30% — clear separation.
+ * @note Skipping flatness for weak signals lets the other filters (sharpness, valley depth,
+ *       width) handle rejection, which are more stable at low SNR.
+ */
+constexpr uint8_t FLATNESS_MIN_PEAK_MARGIN = 40;
+
+/**
+ * @brief Minimum signal width (bins) for the flatness filter to be applied
+ * @note Flatness is meaningless for very narrow signals: a 2-4 bin burst
+ *       (ELRS/FrSky in 20 MHz sweep mode) is inherently "flat" — 1-2
+ *       high-power bins out of 2-4 total = 50-100% — and was previously
+ *       rejected whenever peak_margin >= FLATNESS_MIN_PEAK_MARGIN, making
+ *       spectrum_min_width=2 unreachable at moderate+ SNR (narrowband
+ *       control signals were invisible exactly when strong enough to detect).
+ * @note WiFi/BT flat-tops span dozens of bins and are unaffected by this guard.
+ * @note Flatness applies only when the measured signal spans MORE bins than
+ *       this constant.
+ */
+constexpr uint8_t FLATNESS_MIN_SIGNAL_WIDTH = 4;
+
+/**
+ * @brief Wide-fragment waiver of the flatness margin floor (bins, A-3 2026-10)
+ * @note The FLATNESS_MIN_PEAK_MARGIN floor exists because the 90%-bar
+ *       flatness statistic is unreliable at LOW SNR on NARROW fragments
+ *       (20-50% swing). A fragment that already spans >= THIS many bins
+ *       (≈3.13 MHz — the shipped MinW default, 2026-10-22) is wideband
+ *       EVIDENCE by itself: a WiFi/BT plateau parked just above the margin
+ *       gate (margin 8..39 at Sens defaults) used to escape Flat entirely
+ *       and was owned only by MaxW/sharpness; with the waiver the
+ *       flatness statistic runs on it — the wide plateau damps exactly the
+ *       low-SNR swing the floor was written to protect.
+ * @note DOCUMENTED COST: a weak, wide, BLUNT-TOP analog FPV peak
+ *       (margin < floor, width >= 40, flatness 40-70%) is now rejected at
+ *       the default Flat = 25 where it previously passed — the same
+ *       user-elected trade-off class as arming Flat on strong peaks;
+ *       raise Flat toward 40-45 or disable it (0) to recover those.
+ * @note Applies in BOTH modes (Sens ON/OFF) — a policy change to the
+ *       Step-10 run guard, not a Sens easing. The Step-13
+ *       EFFECTIVE-ARMING mirror stays CONSERVATIVE (no width term —
+ *       ShapeDetection carries no width): for a weak-wide candidate under
+ *       a disarmed-MaxW+Sharp config the neighbor post-filter still runs
+ *       once (safe direction — it can never SKIP filtering the chain
+ *       didn't do).
+ * @note == DEFAULT_SPECTRUM_MIN_WIDTH by design (wideband ≙ MinW-default
+ *       wide); deliberately NOT derived from the user's MinW — a
+ *       user-lowered MinW (e.g. 2) must not waive the floor for 2-bin
+ *       bursts.
+ */
+constexpr uint8_t FLATNESS_WIDE_WAIVER_BINS = DEFAULT_SPECTRUM_MIN_WIDTH;
+
+static_assert(FLATNESS_WIDE_WAIVER_BINS > FLATNESS_MIN_SIGNAL_WIDTH,
+    "the wide-fragment waiver must sit above the narrowband floor");
+
+/**
+ * @brief Ceiling of the SENS-eased Step-10 flatness PASS/FAIL limit (percent,
+ *        judgment cap 2026-10 — NOT a user knob, NOT an arming value)
+ * @note FORMULA (shape_gate_logic.hpp flatness_judgment_limit, the Step-10
+ *       judgment site only): `min(eased_flatness_limit(F, w2), max(F, FLAT_WIDE_BAR_PCT))`
+ *       — w-easing may RAISE the limit above the user value toward 100
+ *       ("marginal peaks judged gently") but never above THIS bar; a user
+ *       value at/above the bar is never tightened below what was asked:
+ *       for every in-domain F >= 85 (85..100) max(F, bar) = F and
+ *       eased >= F, so limit ≡ F at every w (easing disabled — the user's
+ *       own bar rules); out-of-domain F > 100 keeps the domain-guarded
+ *       eased value (100), which the cap leaves unchanged too.
+ * @note WHY (audit mid-band FP hole): adapt_w only reaches multiples of 5
+ *       (w = (margin − gate)·100/SHAPE_ADAPT_SLACK_UNITS, SLACK = 20), so
+ *       the reachable band where easing has just opened is w = 15..40 —
+ *       there the eased default F = 25 sat at limits 98..88 (98, 97, 95,
+ *       93, 90, 88) and a WiFi/BT plateau measured 86-98% could pass Flat
+ *       exactly where the gates had just opened, while the A-1 raw-fallback
+ *       band (w <= 10, limit 25) and w >= 45 (limit 84, easing below the
+ *       bar) both rejected it — stringency non-monotonic in SNR again,
+ *       this time as a mid-band hole instead of the F1 phantom seat. At
+ *       defaults the judgment now reads 25 (fallback, w <= 10) -> 85
+ *       (w = 15..40) -> eased 84..25 (w >= 45): one continuous descent
+ *       above the fallback band. DOCUMENTED RESIDUAL: the 25 -> 85 step at
+ *       the w = 10/15 boundary is the fail-closed fallback band itself
+ *       (scanner.cpp A-1) — see its documented FN classes; and plateaus
+ *       measured 40-85% still pass the mid band (owned by MaxW/Sharp/Sym
+ *       there, same as before the cap).
+ * @note CLASS SEPARATION (why 85): the flatness docs put WiFi/BT plateaus
+ *       at 40-90% (real flat tops 50-90%) and EVERY documented legitimate
+ *       class below — drone V-shape < 30 above margin 40, blunt-top FPV
+ *       45-70 — so 85 sits strictly above every documented legitimate value
+ *       (zero documented FN cost) while cutting the documented WiFi plateau's
+ *       top band (86-90%) everywhere the step runs — the mid band directly
+ *       (bar 85 < 86), the fallback band (25) and w >= 45 (eased <= 84)
+ *       already below it. Below margin 40 the
+ *       classes overlap (WiFi > 60 vs drone 40-70 — see
+ *       FLATNESS_MIN_PEAK_MARGIN) and NO fixed bar separates them there;
+ *       the bar deliberately does not try — that band stays owned by the
+ *       margin floor/waiver and the raw fallback.
+ * @note INERT CASES (byte-identity proofs): w2_eff = 10000 (Sens OFF and
+ *       the A-1 fallback both judge with it) ⇒ eased = clamp(F) <= max(F,
+ *       bar) ⇒ limit = eased for EVERY F 0..255 — byte-identical to the
+ *       pre-cap ladder (exactly raw F for every in-domain F <= 100; the
+ *       domain-guarded 100 for out-of-domain F > 100); and the step not
+ *       running (F = 0; closed seat: eased >= 99 ⇔ w2 <= 133 ⇒ reachable
+ *       w in {0, 5, 10}; narrow width; margin floor) never reads the
+ *       helper. ARMING is NOT capped: the Step-10 arming keeps
+ *       the exact `eased_flatness_limit(F, w2) < FLATNESS_EFFECTIVE_CEILING`
+ *       test — capping THAT would re-arm the w = 5/10 seat the F1 fix
+ *       closed and reopen the phantom-seat hole for plateaus <= 85%. The
+ *       Step-13 EFFECTIVE-ARMING mirror likewise stays on the uncapped
+ *       value (arming parity): the cap only lowers a verdict limit inside
+ *       an ALREADY-ARMED seat, so it can only add rejection where the
+ *       mirror already reads armed — no drift in the unsafe direction.
+ * Stack: 0. SRAM: 0. Flash: ~40 bytes (inlined helper).
+ */
+constexpr uint8_t FLAT_WIDE_BAR_PCT = 85;
+
+static_assert(FLAT_WIDE_BAR_PCT < FLATNESS_EFFECTIVE_CEILING,
+    "the judgment bar must stay below the abstention ceiling (a capped limit must remain a verdict)");
+static_assert(FLAT_WIDE_BAR_PCT > DEFAULT_SPECTRUM_FLATNESS,
+    "the judgment bar must sit above the default F so w-easing can still relax weak peaks");
+static_assert(FLAT_WIDE_BAR_PCT <= SPECTRUM_FLATNESS_PCT_MAX,
+    "the judgment bar must stay inside the flatness percentage domain");
+
+/**
+ * @brief Default signal symmetry threshold (0-100, percent)
+ * @note symmetry = min(left_width, right_width) * 100 / max(left_width, right_width)
+ *       (chain accepts sym_pct >= limit — scanner.cpp Step 11)
+ * @note Drone video V-shape: symmetry > 50% (both sides similar)
+ * @note Noise/asymmetric: symmetry < 30% (one side dominant)
+ * @note Lower = stricter (requires more symmetry); 0 = filter disabled
+ * @note 25 (CURRENT default — ARMED, strict, user-elected 2026-10): rejects
+ *       emissions whose weaker flank carries < ¼ of the stronger flank.
+ *       Clears the documented drone band (> 50) with margin and cuts the
+ *       asymmetric-noise band (< 30). TRADE-OFF (same class as the
+ *       historical 35 default, but STRICTER — lower = stricter): slightly
+ *       asymmetric analog FM (modulator drift, multipath) measured below 25
+ *       and was exactly why 35 was disabled to 0 — at 25 those cases clip
+ *       even harder. Skipped entirely for very_strong peaks (close-range
+ *       all-bins-elevated) and abstains when the walk clipped a flank bin;
+ *       Sensitive mode eases the limit toward 0 near the gate (weak peaks
+ *       pass).
+ * @note History: 35 (rejected slightly-asymmetric analog FM) → 0 (disabled,
+ *       analog-FPV tolerance) → 25 (armed by user election).
+ */
+constexpr uint8_t DEFAULT_SPECTRUM_SYMMETRY = 25;
+
+/**
+ * @brief Peak margin threshold for very strong signal bypass (~16 dB above noise)
+ * @note When peak_margin > this value, loosen valley depth, symmetry, and kurtosis checks.
+ *       At close range (drone within ~50m), ALL bins in signal band are elevated,
+ *       making these shape filters unreliable. Flatness filter remains active.
+ *       Also switches elevated_threshold from noise+margin/3 to noise+margin/2,
+ *       narrowing the width measurement to prevent false rejections of close-range
+ *       wideband signals (analog FPV at 5.8 GHz).
+ */
+constexpr uint8_t VERY_STRONG_SIGNAL_MARGIN = 80;
+
+/**
+ * @brief Peak margin threshold for extreme signal bypass (~19 dB above noise)
+ * @note When peak_margin > this value, also skip max_width check.
+ *       At 19+ dB, the elevated_threshold captures the entire signal bandwidth,
+ *       making width measurement unreliable. Only min_width check remains.
+ *       Lowered from 128 (~25 dB) to 96 (~19 dB) because width inflation begins
+ *       at ~16 dB (VERY_STRONG_SIGNAL_MARGIN). Without this fix, legitimate
+ *       close-range FPV signals (15+ MHz bandwidth) were falsely rejected by
+ *       max_width when their inflated width exceeded 200 bins.
+ */
+constexpr uint8_t EXTREME_SIGNAL_MARGIN = 96;
+
+/**
+ * @brief Contamination delta (25th - 10th usable-bin percentile) that demotes
+ *        the WIDTH-ANCHOR floor from p25 to p10 (audit fix W1).
+ * @note Every width gate (Step 4 fragment walk, Step 6b emission extent)
+ *       anchors its elevation bar at `floor + margin/divisor`, and the floor
+ *       was the 25th percentile. When a wideband emission (WiFi/BT) occupies
+ *       >= ~75% of the usable bins, p25 rises INTO the emission, the margin
+ *       shrinks to the top-of-plateau ripple, and the bar lands ~1-2 dB BELOW
+ *       THE CREST instead of above the true shelf: MaxW then measures the
+ *       crest's curvature (1-3 bins) instead of the emission's bandwidth, and
+ *       a 20-40 MHz flat top passes MaxW=2. The 10th percentile stays inside
+ *       the quiet minority in that regime, so it recovers the true shelf.
+ * @note GATED FALLBACK (provably no-op on clean spectra): clean noise has
+ *       p25 - p10 ~= 1-3 units (~3 sigma of the per-bin fluctuation at
+ *       sigma ~= 2 units), so any delta below this threshold keeps the
+ *       legacy p25 anchor BYTE-IDENTICAL. Only a band demonstrably occupied
+ *       by >= ~2 dB of shelf-to-p25 lift switches the anchor down.
+ * @note Sensitivity direction: LOWER anchor = wider measured width = MORE
+ *       wideband rejection, with two documented costs: (a) in a contaminated
+ *       frame a narrowband target spectrally adjacent to the wideband band
+ *       can bridge into its plateau and inherit its rejection — accepted
+ *       trade, the alternative is trusting a shelf that is the signal;
+ *       (b) none for clean frames (gated off).
+ * @note Scope: used ONLY for the width/extent anchors (Step 4 walk,
+ *       emission_extent). The Step-3 margin gate, valley/symmetry/flatness
+ *       margins and the Step 6c wall tests keep the p25 floor — lowering
+ *       those would open sensitivity holes or resurrect the FPV-at-window-
+ *       edge rejection the BOTH-EDGES relaxation exists to prevent.
+ * @note Kill switch: ScanConfig::robust_width_floor_enabled (settings
+ *       checkbox "RbF", default ON) skips the p10 pass entirely and returns
+ *       the legacy p25 anchor — field A/B of cost (a) without reflashing.
+ * @note Units: spectrum.db units, 5 units = 1 dB (see spectrum.db scale in
+ *       constants.hpp header notes).
+ */
+constexpr uint8_t WIDTH_FLOOR_CONTAM_DELTA_UNITS = 10;
+
+// ============================================================================
+// Track-Before-Detect (TBD) Confirmation Constants
+// ============================================================================
+// TBD is the multi-frame weak-signal integrator: it confirms a bin that never
+// cleared the Step-3 margin gate but stays elevated across TBD_MIN_FRAMES
+// frames of the same waterfall window (~9 dB integration gain). Its confirm
+// threshold is the RSSI threshold (Sens) FLOORED at the noise-relative value
+// below, because the RSSI term alone is not a noise-relative criterion:
+//   threshold_units = (rssi_threshold_dbm + total_gain) * 5 + 255
+// clamps to 0 for any total gain <= 54 dB at the default Sens (-105 dBm), and
+// "3 of N frames above 0" is then satisfied by pure noise (a bin only has to
+// be non-zero). Until now that hole was masked inadvertently by the frame-drop
+// prefilter (sweep_sensitivity.hpp::sweep_fast_prefilter), which discarded the
+// frame before TBD could look at it and thereby also amputated the genuine
+// below-half-gate weak-signal class.
+
+/**
+ * @brief Noise-relative floor for the TBD confirm threshold (spectrum.db units, 5 units = 1 dB).
+ * @note 5 units = 1.0 dB ≈ 2.5σ of the per-bin noise fluctuation around the
+ *       25th-percentile shelf (σ ≈ 2 units by the codebase's own noise
+ *       model), so a single noise bin reaches it rarely and a 3-of-N
+ *       coincidence stays small, while genuine below-gate emissions
+ *       (1-4 dB above the shelf) stay reachable.
+ * @note MUST stay BELOW DEFAULT_SPECTRUM_MARGIN / 2: the TBD confirm
+ *       threshold doubles as the sweep frame-reachability limit
+ *       (sweep_sensitivity.hpp::sweep_tbd_frame_reachable), so a floor above
+ *       half the Step-3 gate would cut frames BEFORE the integrator can vote
+ *       — reintroducing the regression this constant removes. A
+ *       static_assert() below enforces the relation at compile time.
+ *       (Was 6 units ≈ 3σ when the default margin was 20; lowered to 5 when
+ *       the margin default dropped to 10 — 2×5 ≤ 10 keeps the assert green.)
+ * @note Supersedes the aspirational TBD_THRESHOLD_MARGIN (= 10, "half of
+ *       spectrum margin") that sat in scanner.hpp as DEAD code until
+ *       2026-07-27: same idea, now actually wired into the confirm gate.
+ * @note Sensitivity direction: LOWER = more sensitive (more noise votes),
+ *       HIGHER = stricter. 0 would restore the pre-fix behaviour only in
+ *       combination with the RSSI clamp — do not set it to 0.
+ */
+constexpr uint8_t TBD_MIN_ELEVATION_UNITS = 5;
+
+// Parity guard: the floor must remain usable as a frame-reachability limit.
+// 2 × TBD_MIN_ELEVATION_UNITS <= DEFAULT_SPECTRUM_MARGIN keeps the floor at
+// or below half of the DEFAULT Step-3 gate, so the reachability test can never
+// be stricter than the prefilter's half-gate for the default configuration.
+static_assert(
+    (2u * static_cast<uint16_t>(TBD_MIN_ELEVATION_UNITS)) <=
+        static_cast<uint16_t>(DEFAULT_SPECTRUM_MARGIN),
+    "TBD_MIN_ELEVATION_UNITS must stay <= DEFAULT_SPECTRUM_MARGIN / 2: the "
+    "TBD floor is also the sweep frame-reachability limit, and a higher floor "
+    "would cut frames before the weak-signal integrator can vote");
+
+/**
+ * @brief Divisor of the Step-3 gate used as the FLOOR of the TBD width-anchor
+ *        elevation (audit fix W2: was gate/2).
+ * @note tbd_peak_is_narrowband() walks the envelope at
+ *       noise + max(envelope_peak_margin / 2, gate / DIV). For in-frame
+ *       targets (margin >= gate) the half-power term dominates and the anchor
+ *       is unchanged (Step 6b parity). Below the gate the old max(margin,
+ *       gate)/2 = gate/2 anchor sat ABOVE a weak peak's own envelope, so the
+ *       walk measured width = 1 BY CONSTRUCTION and neither width gate could
+ *       clip a weak flat-top: a WiFi/BT crest whose ripple stayed within
+ *       gate/2 of p25 was confirmed by TBD and tracked as a drone while
+ *       MaxW=2 looked like it was honored. Gate/3 (~3 units at the default
+ *       Mar=10) keeps the anchor ABOVE the
+ *       noise fluctuation band (>= ~3 sigma at sigma ~= 2 units, so an
+ *       isolated noise bin almost never extends the walk) while letting the
+ *       walk reach the weak emission's actual plateau.
+ * @note Continuity at the gate: at margin == gate both formulas give
+ *       gate/2 > gate/3 — the anchor is continuous (no cliff at Step 3).
+ * @note Sensitivity risk (accepted, quantified): the 8-frame OR envelope can
+ *       lift isolated noise bins ~1 unit above a gate/3 anchor; a below-gate
+ *       1-2 bin target may measure 1 bin wider in rare frames. MinW is
+ *       exempt for below-gate targets by design, so only MaxW <= 2 users can
+ *       see a marginal flicker — far rarer than the flat-top escape this
+ *       closes.
+ */
+constexpr uint8_t TBD_WIDTH_ANCHOR_GATE_DIV = 3;
+
+static_assert(TBD_WIDTH_ANCHOR_GATE_DIV > 0,
+    "TBD_WIDTH_ANCHOR_GATE_DIV must be non-zero (anchor division)");
+
+// ============================================================================
+// SENS = ADAPTIVE SHAPE ("self-tuning" mode, sensitive_mode ON) — constants
+// ============================================================================
+// Design contract (implementations: DroneScanner::update_auto_gate,
+// shape_gate_margin and apply_shape_filters in scanner.cpp):
+//   1) The Step-3 entry gate becomes NOISE-ADAPTIVE:
+//        gate = clamp(3σ_IQR, SHAPE_ADAPT_GATE_FLOOR, Mar_raw)
+//      where σ_IQR ≈ (p75 − p25) / 1.349 is estimated per frame from the
+//      same usable bins as the Step-1 noise floor, and Mar_raw is the RAW
+//      user spectrum_margin (A-5 2026-10: capping at the Sens-relaxed
+//      base Mar−2 collapsed the clamp to [8, 8] at the default Mar 10 —
+//      FLOOR == Mar−2 — and killed the measurement). In a CLEAN spectrum
+//      3σ sits under the floor → the gate OPENS to the floor (weak targets
+//      enter). In a NOISY spectrum it rises but is capped by the raw user
+//      Mar — Sens mode is never STRICTER than the user asked, so ±5..10
+//      clicks on "Mar" cannot cliff-kill a marginal peak the measured
+//      noise already justifies (the old failure mode: a hard gate cliff
+//      every marginal peak above it died on).
+//   2) Every downstream shape step (5-12) stays ACTIVE in Sens mode — NO
+//      more skipping — but its threshold eases with the stringency weight
+//      w ∈ [0..100] computed AFTER Step 3:
+//          w = min(100, (peak_margin − gate) × 100 / SHAPE_ADAPT_SLACK_UNITS)
+//      full user stringency only at gate + SLACK (+4 dB) and above;
+//      marginal peaks are judged by eased thresholds (quadratic w² easing:
+//      nearly abstain right at the gate, converging fast to user values).
+//      sensitive_mode OFF forces w = 100 → every eased formula collapses
+//      to the exact user value (the legacy chain is byte-identical).
+// Defense in depth under the opened gate (w ≈ 0 targets must still clear):
+// the absolute RSSI gate (Sens + hysteresis), neighbor-margin (2 dB),
+// confirm_count, NMS and the TBD resurrection veto are all unchanged.
+constexpr uint8_t SHAPE_ADAPT_GATE_FLOOR = 8;       // auto-gate floor (units): 1.6 dB ≈ 4σ at σ≈2
+constexpr uint8_t SHAPE_ADAPT_SLACK_UNITS = 20;     // w ramp width above the gate (4 dB)
+// SHAPE_ADAPT_MIN_WIDTH_RELAX was REMOVED (dependency audit, 2026-10): MinW is
+// a user band edge, not a noise-adaptive threshold. Easing it toward
+// (MinW - 10) near the gate meant a user-set MinW = 25 was served ~15 bins —
+// "the setting appears not to work". MinW is enforced at the exact config
+// value now (apply_shape_filters Step 5 and the TBD narrowband guard both read
+// spectrum_min_width directly). No other consumer existed (grep-verified).
+constexpr uint8_t SHAPE_ADAPT_SIGMA3_NUM = 22;      // 3σ ≈ IQR × 22/10 (σ ≈ IQR/1.349)
+constexpr uint8_t SHAPE_ADAPT_SIGMA3_DEN = 10;
+
+// The floor must sit STRICTLY below the default raw user Mar — otherwise
+// the clamp collapses to a single point (floor == cap) and the "gate
+// follows the noise" contract can never trigger at defaults (that is
+// exactly what A-5 fixed: the old cap Mar − 2 == FLOOR == 8 made the
+// auto-gate a constant at the shipped Mar 10).
+static_assert(SHAPE_ADAPT_GATE_FLOOR < DEFAULT_SPECTRUM_MARGIN,
+    "SHAPE_ADAPT_GATE_FLOOR must sit strictly below the default user margin");
+static_assert(SHAPE_ADAPT_SLACK_UNITS > 0,
+    "SHAPE_ADAPT_SLACK_UNITS must be non-zero (weight division)");
+static_assert(SHAPE_ADAPT_SIGMA3_DEN > 0,
+    "SHAPE_ADAPT_SIGMA3_DEN must be non-zero (sigma division)");
+
+// ============================================================================
+// SENS = PARALLEL SHAPE EVALUATION (sensitive_mode ON) — constants
+// ============================================================================
+// With Sens ON apply_shape_filters() does NOT short-circuit the similarity
+// steps: Steps 7/9/10 are measured in ONE fused pass over the Step-4 fragment,
+// every similarity verdict is computed unconditionally, and the final verdict
+// is
+//
+    //     pass <=>  (every armed HARD-envelope step passed)          // AND
+    //             && (armed SIMILARITY steps that agreed
+    //                 >= shape_sim_threshold_pct of the armed set)   // SCORE
+//
+// The two groups are DELIBERATELY not symmetric in representation:
+//
+// HARD      = the physical envelope — amplitude gate (Step 3), MinW (5),
+//             MaxW (6), emission extent (6b), edge-clip (6c, sweep only),
+//             ratio (8). Violating it means "not this class of signal at
+//             all", so it stays a conjunction and keeps its early return.
+//             Because AND is commutative over pure predicates, a hard step
+//             needs NO bitmask: it either returns false or does not speak.
+//             Giving it a bit would be state with no reader (zero-overhead
+//             principle) — hence there are deliberately NO SHAPE_BIT_* for it.
+//
+//             WHY RATIO (8) IS HARD WHILE SHARPNESS (7) IS SIMILARITY —
+//             both are "tall-vs-wide" V-shape criteria (ratio = margin*10/
+//             width, sharpness = margin*100/avg_margin), so the split looks
+//             arbitrary. It is not: ratio is a monotone function of the SAME
+//             (margin, width) pair that Steps 5 (MinW) and 6 (MaxW) already
+//             gate HARD. Scoring it would count the width dimension TWICE in
+//             the similarity numerator — a candidate could outvote a MinW/
+//             MaxW-consistent verdict with a second, correlated vote on the
+//             same measurement. Sharpness uses avg_margin (a shape statistic
+//             over the whole fragment), which the width gates do not
+//             constrain, so it is an INDEPENDENT witness and belongs in the
+//             scored group. Keep this split: correlated criteria go HARD
+//             (they re-derive an already-gated quantity), independent ones
+//             go SIMILARITY.
+//
+// SIMILARITY= the V-shape template criteria — sharpness (7), valley (9),
+//             flatness (10), symmetry (11), kurtosis (12). Scored, so a
+//             marginal target survives one disagreeing shape filter instead
+//             of being killed by whichever happened to run first. Only this
+//             group needs a bitmask: it is the only group with a reader
+//             (ShapeVerdict::similarity_pct -> Step-13 arming).
+//
+// INFORMATIVE-ARMING (audit D-ARM, 2026-10) — arming is by REJECTION
+//             CAPABILITY, not by the raw field value: a similarity step is
+//             armed only when its verdict is STRUCTURALLY capable of
+//             rejecting this frame. A step whose limit sits in its
+//             documented no-op regime ABSTAINS — it contributes no bit to
+//             sim_pass, no bit to sim_armed, no score seat — exactly as if
+//             its legacy `if` had not executed. Two such regimes exist and
+//             both used to occupy permanent ALWAYS-PASS seats:
+//             (1) SHARPNESS in the D5 dead-band 51..100: avg includes the
+//                 peak, so sharpness >= 100 on every frame and a limit <=
+//                 100 can never reject. Armed iff
+//                 eased_sharpness_limit(user, w2) > 100 (SHARPNESS_NOOP_
+//                 CEILING in shape_gate_logic.hpp — the same predicate Step 13's
+//                 EFFECTIVE-ARMING consumes, audit M3 rev. 2).
+//             (2) FLATNESS at the effective ceiling 99 (F1 fix 2026-10):
+//                 a limit of 99 rejects only the synthetic pct == 100
+//                 (see FLATNESS_EFFECTIVE_CEILING) — a real flat top
+//                 (40-90%) sails over it, so the limit is an abstention,
+//                 not a verdict. Previously the arming compared against
+//                 SPECTRUM_FLATNESS_PCT_MAX (100), which armed the eased
+//                 default F = 25 throughout the w <= 10 band (limit 99)
+//                 and kept a phantom always-pass seat there. Armed iff
+//                 eased_flatness_limit(user, w2) < FLATNESS_EFFECTIVE_CEILING
+//                 plus the three Step-10 run guards (F > 0, margin floor,
+//                 w > 0 — Step 13 mirrors them). This is the ARMING test,
+//                 uncapped: the Step-10 PASS/FAIL limit is separately
+//                 clamped at FLAT_WIDE_BAR_PCT (85) — see
+//                 flatness_judgment_limit() in shape_gate_logic.hpp.
+//             (3) VALLEY with an UNREACHABLE limit (D-ARM ext. 2026-10):
+//                 the probe margins are data[i] − noise_floor over uint8
+//                 bins, so max_valley is structurally bounded by
+//                 255 − noise_floor; when
+//                 noise_floor + eased_valley_limit(D, margin, w2) > 255 no
+//                 flank terrain can reach the limit and the verdict is
+//                 vacuously true EVERY frame — a permanent always-pass
+//                 seat (high-noise + deep-D regime, broader under
+//                 w-easing). Armed iff that sum <= 255 on top of the
+//                 legacy outer guards (D > 0, !very_strong, w > 0). The
+//                 formula lives in eased_valley_limit() (shape_gate_logic.hpp,
+//                 shared author of the arming test and the Step-9 chain,
+//                 audit M3 rev. 2 pattern).
+//             (4) SYMMETRY at a TRUNCATED-TO-ZERO bar (D-ARM ext. 2026-10):
+//                 sym_limit = user·w²/10000 truncates to 0 whenever
+//                 user·w² < 10000 (e.g. Y = 50 & w <= 14), and
+//                 ok = (sym_pct >= 0) is then vacuously true for every
+//                 geometry. Armed iff eased_sym_limit(user, w2) > 0 on top
+//                 of the legacy guards (Y > 0, width > 1, !very_strong,
+//                 w > 0, !clipped). Shared author: eased_sym_limit()
+//                 (shape_gate_logic.hpp).
+//             (5) KURTOSIS deliberately has NO capability term — proof of
+//                 ABSENCE, do not "fix" this: kurtosis_x10 (excess kurtosis
+//                 × 10, spectral_kurtosis.hpp) ranges DOWN to ≈ −30 —
+//                 platykurtic flat-tops are NEGATIVE, Gaussian ≈ 0 — while
+//                 the settings clamp (0..200) and the w-easing keep
+//                 kurt_limit >= 0 in EVERY armed configuration, including
+//                 the truncated-to-0 band user·w² < 10000 where
+//                 ok = (kurtosis_x10 >= 0) is a REAL "reject the flat/
+//                 platykurtic" verdict. Every reachable limit is therefore
+//                 structurally violable; adding a `kurt_limit > 0` disarm
+//                 would LOOSEN Step 12 and break Sens-OFF verdict identity
+//                 at kurtosis_min_x10 = 0.
+//             WHY IT MATTERED: the tie rule at the then-default threshold 50
+//             (majority-or-tie) turns a phantom always-pass vote into a
+//             dilution weapon — {Sharp(100, inert pass), Flat(45, real
+//             fail)} = 1 of 2 = 50% => PASS, so enabling Flat under "Shape
+//             score" could NEVER reject a WiFi flat-top while Sharp sat at
+//             its 100 default. After D-ARM the same config arms only Flat:
+//             a WiFi fail is 0 of 1 = 0% => REJECT. Sens OFF is
+//             VERDICT-IDENTICAL (the dead-band step's early return never
+//             fired: ok was unconditionally true) — D-ARM only removes the
+//             phantom vote and skips the fused-loop work.
+//             The "never STRICTER than the legacy ladder" invariant below
+//             is stated over the ARMED set; D-ARM only shrinks the set to
+//             informative members, so the invariant is preserved (score
+//             still accepts a superset of what the AND-ladder accepts for
+//             the same armed set).
+//
+// Sens OFF keeps the legacy fail-fast ladder. Every predicate is pure in
+// {data, config, Step-4 band}, so "evaluate all and AND" is verdict-identical
+// to the ladder — only the evaluation order and the CPU cost differ (the
+// fused pass is CHEAPER than the three separate walks it replaces).
+//
+// Flash: 12 bytes. SRAM: 0. No FP, no allocation, no locks.
+constexpr uint16_t SHAPE_BIT_SHARPNESS = 1u << 0;  // Step 7
+constexpr uint16_t SHAPE_BIT_VALLEY = 1u << 1;     // Step 9
+constexpr uint16_t SHAPE_BIT_FLATNESS = 1u << 2;   // Step 10
+constexpr uint16_t SHAPE_BIT_SYMMETRY = 1u << 3;   // Step 11
+constexpr uint16_t SHAPE_BIT_KURTOSIS = 1u << 4;   // Step 12
+
+constexpr uint16_t SHAPE_SIM_MASK = SHAPE_BIT_SHARPNESS | SHAPE_BIT_VALLEY |
+    SHAPE_BIT_FLATNESS | SHAPE_BIT_SYMMETRY | SHAPE_BIT_KURTOSIS;
+
+// SHARE (percent) of the ARMED similarity steps that must agree for a
+// Sens-mode candidate to pass. The share is 100 * popcount(pass) /
+// popcount(armed) — NEVER the mask VALUE (audit D-SCORE: the mask is a bit
+// pattern, so Sharp|Flat = 0x05 and dividing by 5 reported 40% for a perfect
+// 2-of-2 candidate, rejecting every multi-armed target — Sens ON became
+// STRICTER than Sens OFF, the inverse of the feature's purpose).
+// DEFAULT = 100 = STRICT AND (audit D-FULL-PASS, 2026-10): a detection can
+// NEVER be registered after passing only SOME of the configured similarity
+// gates — every armed gate must agree, exactly like the Sens-OFF ladder.
+// The tunable range below 100 exists only as an EXPLICIT user opt-in to
+// dissent-tolerance (far-field / multipath); the product default and the
+// DEFAULT button restore full pass-through.
+// MIN 50% => floor(100*p/n) >= 50, i.e. "majority or tie" — the most
+// permissive end of the tunable range, documented so a user who lowers the
+// field knows exactly what they are buying:
+//   n=1: 1 of 1 (100*1/1 = 100)
+//   n=2: 1 of 2 (tie,  50)
+//   n=3: 2 of 3 (66)          — 1 of 3 = 33 is a minority
+//   n=4: 2 of 4 (tie,  50) AND 3 of 4 (75) — note the TIE also passes
+//   n=5: 3 of 5 (60)          — 2 of 5 = 40 is a minority
+// so even at MIN the similarity group can never be STRICTER than the legacy
+// ladder it replaces. (The pre-audit wording listed only "3 of 4" for n=4
+// and so hid that a 2-of-4 tie qualifies; the RULE — floor(100p/n) >= t
+// <=> 100p >= n*t — was always implemented correctly, only the prose
+// enumeration was incomplete.)
+// User-tunable as ScanConfig::shape_sim_threshold_pct (settings UI, next to
+// the "Shape score" checkbox).
+constexpr uint8_t SHAPE_SIM_THRESHOLD_MIN_PCT = 50;
+constexpr uint8_t SHAPE_SIM_THRESHOLD_MAX_PCT = 100;
+// 100 = STRICT AND (2026-10-22 user-elected default, restoring the
+// D-FULL-PASS product default): EVERY armed similarity step must agree —
+// the Sens score is verdict-identical to the Sens-OFF ladder, so "Shape
+// score" can never be LOOSER than the legacy chain by default. The middle
+// ground 75 (4 of 5 armed steps; user-elected 2026-10, briefly the
+// default) remains reachable from the settings UI as an EXPLICIT opt-in to
+// dissent-tolerance (one dissenting armed shape step no longer kills a
+// detection outright, but a single agreeing step is far from enough).
+constexpr uint8_t DEFAULT_SHAPE_SIM_THRESHOLD_PCT = 100;
+// ENCODER STEP for the settings-UI NumberField — NOT a default value.
+// ui::NumberField's 4th constructor positional is `step`, and the widget has
+// NO default-value parameter at all (value_ starts at 0 and is clamped into
+// range, then overwritten by DroneSettingsView::apply_settings_to_ui via
+// set_value). Passing DEFAULT_SHAPE_SIM_THRESHOLD_PCT (then 50) here —
+// which is what the pre-audit code did, copying the latent
+// field_mahalanobis_threshold_ anti-pattern — made step == 50 over the
+// range {50,100}, so the encoder could only ever reach 50 and 100 and the
+// entire "adaptive middle" of the feature (55..95) was unreachable from the
+// UI while the README promised "шаг 5". Named constant so the UI and this
+// doc can never drift again.
+constexpr uint8_t SHAPE_SIM_THRESHOLD_STEP_PCT = 5;
+
+static_assert(SHAPE_SIM_MASK == 0x1Fu,
+    "SHAPE_SIM_MASK must cover exactly bits 0..4 (the five similarity steps)");
+static_assert(DEFAULT_SHAPE_SIM_THRESHOLD_PCT >= SHAPE_SIM_THRESHOLD_MIN_PCT &&
+        DEFAULT_SHAPE_SIM_THRESHOLD_PCT <= SHAPE_SIM_THRESHOLD_MAX_PCT,
+    "DEFAULT_SHAPE_SIM_THRESHOLD_PCT must stay inside MIN..MAX");
+static_assert(SHAPE_SIM_THRESHOLD_MIN_PCT > 0 &&
+        SHAPE_SIM_THRESHOLD_MAX_PCT <= 100,
+    "SHAPE_SIM threshold bounds must stay inside 1..100");
+// The UI step must be positive and must tile the MIN..MAX range exactly, so
+// (a) the encoder never stalls and (b) MAX is reachable from MIN in a whole
+// number of detents. 50..100 step 5 => 11 detents, endpoint hit exactly.
+static_assert(SHAPE_SIM_THRESHOLD_STEP_PCT > 0 &&
+        (SHAPE_SIM_THRESHOLD_MAX_PCT - SHAPE_SIM_THRESHOLD_MIN_PCT) %
+                SHAPE_SIM_THRESHOLD_STEP_PCT == 0,
+    "SHAPE_SIM threshold step must divide the MIN..MAX range evenly "
+    "(otherwise the MAX endpoint is unreachable from MIN)");
+// NOTE: SHAPE_SIM_MASK is NOT assert-only — it is a LIVE defensive consumer
+// inside ShapeVerdict::similarity_pct() (scanner.hpp), which masks BOTH
+// sim_pass and sim_armed with it before counting. A stray non-similarity bit
+// can therefore never inflate or deflate the score, even if a future
+// refactor writes one by accident. Cost: two ANDs per call.
+
+// ============================================================================
+// PREFILTER CAP (audit D-PRE-GATE) — restores the provable
+// "UI drain prefilter is a strict SUBSET of the detector gate" invariant
+// ============================================================================
+// sweep_fast_prefilter() drops a sweep frame BEFORE
+// process_spectrum_sweep() runs when
+//     (peak - min_usable_bin) < shape_gate_margin_try() / 2
+// while the detector of the SAME frame gates on
+//     (peak - p25) >= clamp(3s_IQR, SHAPE_ADAPT_GATE_FLOOR, raw Mar)
+// In Sens mode shape_gate_margin_try() returns the one-frame-STALE
+// auto_gate_. Nothing ties the stale value to the fresh one: the usable-bin
+// IQR jumps when a wideband interferer enters/leaves the band (p75 moves,
+// p25 does not) or after an AGC step, so raw Mar > 2*FLOOR (Mar > 16; the
+// stale cap was Mar−2 before A-5) plus a
+// falling IQR gives stale/2 > fresh gate — the UI then discards a frame the
+// detector WOULD have accepted. Because the frame dies before
+// waterfall_history_.push(), one TBD vote is lost with it, which is exactly
+// the sensitivity the S1 drain work was built to protect.
+//
+// Proof of the repair (audit D-PRE-GATE, rev. 2 — cap = 2 ×
+// TBD_MIN_ELEVATION_UNITS = 10, was 2 × SHAPE_ADAPT_GATE_FLOOR = 20):
+//   returned/2 = TBD_MIN_ELEVATION_UNITS = 5
+//     <= SHAPE_ADAPT_GATE_FLOOR (8) <= fresh gate
+//     => detector-subset invariant holds (min_usable <= p25 makes
+//        margin_UI >= margin_det, so UI-fail implies detector-fail);
+//   returned/2 = 5 <= TBD_MIN_ELEVATION_UNITS
+//     => any frame carrying a TBD-vote bin (elevation >= 5 above p25)
+//        passes the prefilter whenever min <= p25 — ZERO TBD votes lost.
+//     The former 2*FLOOR = 20 cap still dropped the 6..9 elevation band
+//     whenever min == p25, losing exactly the weak-signal votes the S1
+//     drain work was built to protect — the repair now fully closes
+//     that hole, not just the detector-subset half of it.
+// The base_cap < FLOOR sub-case is constant across frames (both clamp
+// branches yield base_cap, staleness is impossible) and
+// min(base_cap, 10)/2 <= base_cap holds for every base_cap >= 0, so it
+// needs no cap.
+// CLEAN-spectrum parity: auto_gate_ = FLOOR = 8 <= 10 there, so the cap
+// stays disengaged and the prefilter keeps its full ~30-cycle CPU saving;
+// it binds only on NOISY spectra (measured 3σ_IQR > 10, gate capped at
+// the raw Mar) and only ever
+// LOWERS the bar (fail-open direction), never raises it.
+constexpr uint8_t SHAPE_ADAPT_PREFILTER_CAP =
+    static_cast<uint8_t>(2u * static_cast<uint8_t>(TBD_MIN_ELEVATION_UNITS));
+
+static_assert(SHAPE_ADAPT_PREFILTER_CAP / 2u <= SHAPE_ADAPT_GATE_FLOOR,
+    "SHAPE_ADAPT_PREFILTER_CAP must keep the prefilter half-gate at or below "
+    "the detector floor, otherwise the UI subset invariant cannot hold");
+
+// ============================================================================
+// CFAR Detection Constants (Constant False Alarm Rate)
+// ============================================================================
+// CFAR adapts threshold to local noise level, reducing false alarms
+// in varying noise environments (WiFi, Bluetooth, etc.)
+
+/**
+ * @brief CFAR mode selection
+ */
+enum class CFARMode : uint8_t {
+    OFF = 0,    // CFAR disabled — use fixed threshold
+    CA = 1,     // Cell Averaging CFAR — best for homogeneous noise
+    GO = 2,     // Greatest Of CFAR — robust at noise edges
+    SO = 3,     // Smallest Of CFAR — better in cluttered environments
+    HYBRID = 4, // Hybrid CFAR — weighted combination of CA/GO/SO
+    OS = 5,     // Ordered Statistic CFAR — best for multi-target environments
+    VI = 6      // Variability Index CFAR — adaptive mode switching based on local statistics
+};
+
+/**
+ * @brief Default CFAR mode (USER DEFAULT: OFF — fixed threshold detection)
+ * @note Fixed-threshold mode collects all bins above noise_floor + margin,
+ *       sorts by power and takes the top N — maximum sensitivity for weak
+ *       analog FPV carriers (CFAR's CE-variance robustness is not needed when
+ *       the shape filters + Mahalanobis/variance post-filters are disabled by
+ *       default too).
+ * @note OS-CFAR (previous default, FPV-optimized) ranks reference cells and
+ *       picks the k-th order statistic as the noise estimate — best for
+ *       MULTI-TARGET environments; kept available in the settings UI as
+ *       CFARMode::OS. Cost of OS: sorting 32 reference cells per CUT
+ *       (~32×log₂32 = 160 ops), fits the 1.6s sweep cycle budget.
+ */
+constexpr CFARMode DEFAULT_CFAR_MODE = CFARMode::OFF;
+
+/**
+ * @brief CFAR reference window size (number of reference cells)
+ * @note Must be power of 2 for efficient computation
+ * @note Typical: 8-32 cells. More cells = better noise estimate, slower adaptation
+ */
+constexpr uint8_t DEFAULT_CFAR_REF_CELLS = 32;
+
+/**
+ * @brief CFAR guard cells (protect signal from contaminating noise estimate)
+ * @note Cells adjacent to CUT (Cell Under Test) that are excluded from reference
+ * @note Typical: 2-4 cells
+ */
+constexpr uint8_t DEFAULT_CFAR_GUARD_CELLS = 3;
+
+/**
+ * @brief CFAR threshold offset (dB offset above noise in spectrum.db units)
+ * @note Additive offset in dB-compressed domain: threshold = noise_estimate + (value / 10)
+ * @note Higher = fewer false alarms, more missed detections
+ * @note Lower = more detections, more false alarms
+ * @note Each unit ≈ 0.2 dB. Typical: 1.0-10.0 dB offset
+ * @note FPV-OPTIMIZED: 60 (6.0 units, ≈1.2 dB offset) — at -95 dBm RSSI
+ *       sensitivity, the additional 1.0 dB margin cuts ~30% of false positives
+ *       from broadband spurs while preserving detection of real FPV signals.
+ * @note Previous default was 50; raised to 60 for FP suppression
+ */
+constexpr uint8_t DEFAULT_CFAR_THRESHOLD_X10 = 60;  // 6.0 units (≈1.2 dB offset above noise)
+
+/**
+ * @brief CFAR threshold range (×10 for integer storage, offset in spectrum.db units)
+ * @note Each unit ≈ 0.2 dB offset above noise floor
+ */
+constexpr uint8_t CFAR_THRESHOLD_MIN_X10 = 10;   // 1.0 (~0.2 dB)
+constexpr uint8_t CFAR_THRESHOLD_MAX_X10 = 100;  // 10.0 (~2.0 dB)
+
+/**
+ * @brief CFAR reference cells range
+ */
+constexpr uint8_t CFAR_REF_CELLS_MIN = 4;
+constexpr uint8_t CFAR_REF_CELLS_MAX = 64;
+
+/**
+ * @brief CFAR guard cells range
+ */
+constexpr uint8_t CFAR_GUARD_CELLS_MIN = 0;
+constexpr uint8_t CFAR_GUARD_CELLS_MAX = 8;
+
+/**
+ * @brief CFAR hybrid mode weights (×100 for integer storage)
+ * @note w_hybrid = α*w_CA + β*w_GO + γ*w_SO
+ * @note α + β + γ = 100
+ */
+constexpr uint8_t DEFAULT_CFAR_HYBRID_ALPHA = 50;  // CA weight (0.5)
+constexpr uint8_t DEFAULT_CFAR_HYBRID_BETA = 30;   // GO weight (0.3)
+constexpr uint8_t DEFAULT_CFAR_HYBRID_GAMMA = 20;  // SO weight (0.2)
+
+// ============================================================================
+// OS-CFAR Constants (Ordered Statistic)
+// ============================================================================
+
+/**
+ * @brief OS-CFAR k-th order statistic index (as fraction of N_ref × 100)
+ * @note k = (N_ref * OS_CFAR_K_PERCENT) / 100
+ * @note 75 = 75% of sorted cells (robust against multi-target masking)
+ * @note Higher = more aggressive noise estimate, fewer false alarms
+ * @note Lower = more sensitive, more false alarms in multi-target
+ */
+constexpr uint8_t DEFAULT_OS_CFAR_K_PERCENT = 75;
+
+/**
+ * @brief OS-CFAR k-th order range (percent)
+ */
+constexpr uint8_t OS_CFAR_K_PERCENT_MIN = 50;   // Median (most aggressive)
+constexpr uint8_t OS_CFAR_K_PERCENT_MAX = 90;   // Near-maximum (very conservative)
+
+// ============================================================================
+// VI-CFAR Constants (Variability Index)
+// ============================================================================
+
+/**
+ * @brief VI-CFAR variability index threshold (×10 for integer storage)
+ * @note VI = variance / mean^2
+ * @note VI < threshold → homogeneous noise → use CA-CFAR
+ * @note VI > threshold → clutter edge → use GO-CFAR or SO-CFAR
+ * @note FPV-OPTIMIZED: 2.0 (20) — analog FM at 5.8 GHz has more spectral
+ *       variability than narrowband digital. Higher VI threshold (2.0 vs
+ *       1.5) correctly classifies analog FM as "homogeneous" more often,
+ *       steering VI-CFAR to use CA-CFAR for the FPV case (best sensitivity).
+ * @note Previous default was 1.5 (15); raised to 2.0 (20) for analog FM
+ */
+constexpr uint8_t DEFAULT_VI_CFAR_THRESHOLD_X10 = 20;  // 2.0
+
+/**
+ * @brief VI-CFAR threshold range (×10)
+ */
+constexpr uint8_t VI_CFAR_THRESHOLD_MIN_X10 = 5;   // 0.5 (very sensitive)
+constexpr uint8_t VI_CFAR_THRESHOLD_MAX_X10 = 50;  // 5.0 (very tolerant)
+
+// ============================================================================
+// Mahalanobis Distance Constants
+// ============================================================================
+
+/**
+ * @brief Number of feature dimensions for Mahalanobis calculation
+ * @note Dimensions: [0]=RSSI normalized, [1]=Frequency stability
+ */
+constexpr uint8_t MAHALANOBIS_DIMENSIONS = 2;
+
+/**
+ * @brief History size for computing running statistics
+ * @note Must be power of 2 for efficient modulo operation
+ */
+constexpr uint8_t MAHALANOBIS_HISTORY_SIZE = 8;
+
+/**
+ * @brief Default Mahalanobis threshold ×10 (FPV-OPTIMIZED: 4.0)
+ * @note D²_M < threshold → signal accepted as valid drone
+ * @note Previous default was 3.0 (30). Raised to 4.0 to account for the wider
+ *       RSSI variance of analog FM at 5.8 GHz compared to narrowband digital
+ *       drone links (DJI OcuSync, ELRS). 4.0 keeps good FPV signals inside
+ *       the gate while pushing out statistical outliers (noise, spurs).
+ * @note Range: 1.0 (strict) to 10.0 (permissive)
+ */
+constexpr uint8_t DEFAULT_MAHALOBIS_THRESHOLD_X10 = 40;
+
+/**
+ * @brief Minimum Mahalanobis threshold ×10 (1.0)
+ */
+constexpr uint8_t MAHALANOBIS_THRESHOLD_MIN_X10 = 10;
+
+/**
+ * @brief Maximum Mahalanobis threshold ×10 (10.0)
+ */
+constexpr uint8_t MAHALANOBIS_THRESHOLD_MAX_X10 = 100;
+
+/**
+ * @brief Encoder step for the Mahalanobis threshold NumberField (0.5)
+ * @note ui::NumberField's 4th constructor positional is `step`, NOT a
+ *       default value (the widget has no default-value parameter; value_ is
+ *       overwritten by DroneSettingsView::apply_settings_to_ui). The
+ *       pre-audit code passed DEFAULT_MAHALOBIS_THRESHOLD_X10 (40) there,
+ *       so the encoder stepped by 4.0 over the range 1.0..10.0 and only
+ *       1.0 / 5.0 / 9.0 (then clipped to 10.0) were reachable — the whole
+ *       documented 0.1-granularity tuning range was dead. Step 5 = 0.5
+ *       matches the shape-filter fields' step-5 convention.
+ */
+constexpr uint8_t MAHALANOBIS_THRESHOLD_STEP_X10 = 5;
+
+static_assert(MAHALANOBIS_THRESHOLD_STEP_X10 > 0 &&
+        (MAHALANOBIS_THRESHOLD_MAX_X10 - MAHALANOBIS_THRESHOLD_MIN_X10) %
+                MAHALANOBIS_THRESHOLD_STEP_X10 == 0,
+    "Mahalanobis threshold step must divide the MIN..MAX range evenly "
+    "(otherwise the MAX endpoint is unreachable from MIN)");
+
+/**
+ * @brief Q-format for fixed-point arithmetic (Q8.8 = 8 integer bits, 8 fractional bits)
+ * @note Range: -128.0 to 127.99 with 0.004 precision
+ */
+constexpr uint8_t MAHALANOBIS_Q_FORMAT = 8;
+
+/**
+ * @brief Q_SCALE for Q8.8 arithmetic (2^8 = 256)
+ */
+constexpr int32_t MAHALANOBIS_Q_SCALE = 256;
+
+/**
+ * @brief Minimum variance for clamping (LEGACY Q8.8 constant, kept for API compat)
+ * @note The statistics layer now works in raw feature units (0..256); the
+ *       live floor is 64 inside compute_distance_squared(). This constant is
+ *       no longer consumed — do NOT reintroduce it into the distance path
+ *       (256 raw units = std 16 = a dead gate).
+ */
+constexpr int32_t MAHALANOBIS_MIN_VARIANCE = 256;
+
+/**
+ * @brief Variance decay interval (UNUSED since exact-recompute fix, kept for compat)
+ * @note update_statistics() recomputes mean/variance exactly from the 8-sample
+ *       ring on every call, so there is nothing to decay. Left defined so
+ *       external references keep compiling.
+ */
+constexpr uint8_t MAHALANOBIS_VARIANCE_DECAY_INTERVAL = 64;
+
+/**
+ * @brief RSSI normalization range (dBm)
+ */
+constexpr int32_t MAHALANOBIS_RSSI_MIN_DBM = -120;
+constexpr int32_t MAHALANOBIS_RSSI_MAX_DBM = -20;
+
+// ============================================================================
+// Neighbor Margin Check Constants
+// ============================================================================
+
+/**
+ * @brief Default neighbor margin in dB (center must be stronger than neighbors)
+ * @note 0 = disabled, 3 = default (like FPV detect), 5 = strict
+ * @note FPV-OPTIMIZED: 2 dB — analog FM video at 5.8 GHz is WIDE (~15 MHz)
+ *       and often has flat-top shape; strict neighbor margin (3-5 dB) would
+ *       reject legitimate FPV signals whose center bin is NOT the strongest.
+ *       2 dB provides FP rejection against single-bin noise spikes while
+ *       accepting real analog FM with its natural flat-top profile.
+ * @note Previous default was 3; lowered to 2 for FPV wide-signal acceptance
+ * @note Eliminates wideband noise false positives (WiFi, BT, microwave)
+ * @note DB WIDEBAND GATE (audit fix D-B): in DB scan this check runs for
+ *       shape-validated verdicts TOO whenever the shape chain is DISARMED
+ *       (MaxW >= 114 = no cap, Sharp <= 100 = dead-band, Flat = 0 — the
+ *       legacy permissive set). The 2026-10 strict defaults (MaxW = 110 —
+ *       A-2: at the DB extent cap, so it can REJECT a wall-to-wall sweep
+ *       emission and counts as armed; Sharp = 165, Flat = 25) leave the
+ *       chain ARMED, so at
+ *       defaults the legacy skip applies and the chain owns the wideband
+ *       verdict; the D-B fallback engages only when a user re-disarms the
+ *       chain (Sharp <= 100 AND Flat = 0). Step 6c is sweep-only either
+ *       way, so without both this note and the chain DB scan would have NO
+ *       wideband gate for a disarmed configuration.
+ * @note EFFECTIVE ARMING (audit M3, scanner.cpp process_spectrum_message):
+ *       in Sensitive mode the chain is judged by the SAME w-eased limits
+ *       apply_shape_filters applies (Steps 6/7/10), fed with this frame's
+ *       primary-peak margin and the fresh gate — a chain eased to its
+ *       permissive floors in the gate..gate+SLACK band counts as DISARMED
+ *       here even when the raw config looks armed. With Sens OFF (w = 100)
+ *       the limits are the raw config values; corrections vs legacy are
+ *       the Flat abstention band 99..100 (FLATNESS_EFFECTIVE_CEILING — F1:
+ *       a 99-bar rejects only the synthetic pct == 100 ⇒ not armed) and the
+ *       flat run-guards below; Flat = 0 keeps the disarmed reading that
+ *       D-B relies on for the legacy permissive set (no longer the
+ *       defaults — the 2026-10 strict defaults arm the chain via Sharp/
+ *       Flat). The MaxW term compares against DB_EXTENT_CAP_BINS (110,
+ *       the DB measurable cap) — NOT the sweep cap 114 (F2: at the
+ *       shipped MaxW = 110 the sweep constant read "armed" in DB where
+ *       nothing measurable can exceed 110, wrongly skipping the neighbor
+ *       post-filter under a Sharp<=100 + Flat=0 config).
+ * @note EFFECTIVE ARMING rev. 2 (dependency audit): the limits are the raw
+ *       MaxW (read straight from config; the eased_maxw_bins helper was
+ *       removed — see its tombstone in scanner.cpp) plus the SHARED
+ *       eased_sharpness_limit / eased_flatness_limit helpers
+ *       (shape_gate_logic.hpp)
+ *       that Steps 7/10 also consume — test and chain cannot drift. The Flat
+ *       arm further
+ *       mirrors THE THREE OUTER Step-10 run guards (Flat > 0, peak margin
+ *       >= flatness_min_peak_margin(rssi_sens) — 40 when rssi_sens <= 0,
+ *       Sens <= 75 —, adapt_w > 0; the step's inner narrowband-width
+ *       guard never abstains for the wideband threat Step 13 models):
+ *       a flat config whose step abstained for this peak
+ *       cannot own the wideband verdict. At Sens OFF with Flat > 0 and
+ *       margin < 40 this reads DISARMED where legacy read "armed" —
+ *       deliberate STRICTER reading (Step 13 runs) closing the same
+ *       D-B-shaped hole in the raw-config regime.
+ */
+constexpr int32_t DEFAULT_NEIGHBOR_MARGIN_DB = 2;
+
+/**
+ * @brief Minimum neighbor margin (disabled)
+ */
+constexpr int32_t NEIGHBOR_MARGIN_MIN_DB = 0;
+
+/**
+ * @brief Maximum neighbor margin (very strict)
+ */
+constexpr int32_t NEIGHBOR_MARGIN_MAX_DB = 15;
+
+// ============================================================================
+// Confirm Count Constants
+// ============================================================================
+
+/**
+ * @brief Default number of confirmations before creating a drone
+ * @note Higher = fewer false positives but slower detection
+ */
+constexpr uint8_t DEFAULT_CONFIRM_COUNT = 2;
+
+/**
+ * @brief Minimum confirm count
+ */
+constexpr uint8_t CONFIRM_COUNT_MIN = 1;
+
+/**
+ * @brief Maximum confirm count
+ */
+constexpr uint8_t CONFIRM_COUNT_MAX = 10;
+
+/**
+ * @brief Default miss tolerance (consecutive misses before breaking lock)
+ * @note Independently configurable from confirm_count.
+ *       Default: 6 misses (~100ms at 50ms/scan) — tolerates FHSS/burst fading
+ *       without dropping lock. Higher values prevent premature lock-break on
+ *       fading analog FM signals while still allowing scanner to resume
+ *       after sustained signal loss.
+ * @note Previous default was 4; raised to 6 for better FPV signal retention
+ */
+constexpr uint8_t DEFAULT_MISS_TOLERANCE = 6;
+constexpr uint8_t MISS_TOLERANCE_MIN = 1;
+constexpr uint8_t MISS_TOLERANCE_MAX = 20;
+
+// ============================================================================
+// RSSI Variance Noise Rejection Constants
+// ============================================================================
+
+/**
+ * @brief RSSI variance threshold for noise rejection
+ * @note Real drones: variance < 25 (stable signal)
+ * @note Noise: variance > 100 (chaotic fluctuations)
+ * @note 0 = disabled
+ */
+constexpr int32_t DEFAULT_RSSI_VARIANCE_THRESHOLD = 100;
+
+/**
+ * @brief Noise blacklist threshold — consecutive noise events before frequency is skipped.
+ * @note If scanner force-resumes from a frequency 3+ times without threat upgrade → skip it.
+ */
+constexpr uint8_t NOISE_BLACKLIST_THRESHOLD = 3;
+
+// ============================================================================
+// Band Sweep Constants
+// ============================================================================
+
+constexpr FreqHz SWEEP_DEFAULT_START_HZ = 5645000000;   // 5.645 GHz - full 5.8 GHz FPV band
+constexpr FreqHz SWEEP_DEFAULT_END_HZ = 5945000000;     // 5.945 GHz - 300 MHz span
+
+/**
+ * @brief Factory-default sweep-window bounds for windows 2..4 (Hz)
+ * @note SINGLE SOURCE OF TRUTH — referenced by ScanConfig (scanner.hpp) and
+ *       SettingsStruct (settings_manager.cpp). The Demo PRESET
+ *       (sweep_presets.hpp) carries its own explicit spans (2026-10 band
+ *       plan) and no longer reuses these constants. The two config tables
+ *       used to drift apart here:
+ *       SettingsStruct shipped W3 = 900..1000 MHz (the GSM900 downlink —
+ *       pure cellular junk) and W4 = 1200..1300 MHz (a duplicate of the
+ *       1.2 GHz FPV band, dropping the sub-GHz control/telemetry band
+ *       entirely). The band plan below is the drone-relevant one:
+ *       W3 = 1.2 GHz long-range FPV, W4 = 433/868/915 MHz ISM control links.
+ * @note W2 end is 2483 MHz, not the 2483.5 MHz ISM edge: every path that edits
+ *       or persists a window bound is MHz-quantized (the SWP NumberFields step
+ *       by 1 MHz, the settings file stores whole MHz), so a .5 default was
+ *       floored to 2483 on the first round trip. That left three disagreeing
+ *       values — an unsaved default swept 500 kHz wider than a saved one while
+ *       the NumberField showed 2483 — so the default is declared here as the
+ *       value that actually survives quantization: default, UI and file agree.
+ */
+constexpr FreqHz SWEEP2_DEFAULT_START_HZ = 2400000000;   // 2.4 GHz ISM (drones, Wi-Fi)
+constexpr FreqHz SWEEP2_DEFAULT_END_HZ = 2483000000;     // …to 2483 MHz (quantization-safe)
+constexpr FreqHz SWEEP3_DEFAULT_START_HZ = 1120000000;   // 1.2 GHz long-range FPV
+constexpr FreqHz SWEEP3_DEFAULT_END_HZ = 1360000000;
+constexpr FreqHz SWEEP4_DEFAULT_START_HZ = 433000000;    // 433/868/915 MHz ISM: RC, telemetry
+constexpr FreqHz SWEEP4_DEFAULT_END_HZ = 928000000;
+
+// ============================================================================
+// Sweep Detection Window Constants
+// ============================================================================
+
+/**
+ * @brief Number of detection-range slots per sweep window
+ * @note Each slot is an inclusive [start, end] range stored in BOTH
+ *       ScanConfig and SettingsStruct as a MHz MIRROR (uint32 pairs —
+ *       8 B/slot; a FreqRangeHz Hz array is 16 B/slot and breaks the
+ *       512 B static_assert on ScanConfig). MHz→Hz expansion happens in
+ *       SweepProcessor::is_detection_window_allowed() at gate time.
+ *       A slot is active iff start > 0 && end > 0 && start <= end.
+ *       When ALL slots of a window are inactive (0 by default), detection
+ *       runs over the ENTIRE sweep window range; otherwise detection runs
+ *       ONLY inside the active ranges. The spectrum is always drawn fully
+ *       (the old exception-radius "cutting" was removed — see sweep_processor).
+ */
+constexpr uint8_t DETECTION_WINDOWS_PER_WINDOW = 5;
+/**
+ * @brief Number of spectrum bands carrying detection-window brackets
+ * @note Band 0 = upper sweep band (single mode renders here too), band 1 =
+ *       lower sweep band (dual-sweep mode). DroneDisplay keeps one MHz
+ *       bracket mirror per band (see det_win_start_mhz_/det_win_end_mhz_).
+ */
+constexpr uint8_t DET_WIN_BAND_COUNT = 2;
+
+/**
+ * @brief Slot activation rule for detection-window ranges — SINGLE SOURCE OF TRUTH
+ * @param start_mhz Range lower bound in MHz (0 = slot unset)
+ * @param end_mhz   Range upper bound in MHz (0 = slot unset)
+ * @return true iff the slot gates detection (start > 0 && end > 0 && start <= end)
+ * @note Consumed by four call sites that must never drift apart:
+ *       SweepProcessor::is_detection_window_allowed() (scanner gate),
+ *       DroneDisplay::set_detection_windows() (bracket mirror activation),
+ *       DroneDisplay::draw_detection_brackets() (bracket rendering) and
+ *       SettingsFileManager::write_dw_slot() (file serialization skip).
+ *       The rule is invariant under MHz→Hz expansion (monotonic,
+ *       zero-preserving), so gate-time checks on Hz and UI-time checks on
+ *       MHz agree on every input.
+ */
+[[nodiscard]] constexpr bool is_det_win_slot_active(uint32_t start_mhz, uint32_t end_mhz) noexcept {
+    return start_mhz != 0 && end_mhz != 0 && start_mhz <= end_mhz;
+}
+
+/**
+ * @brief Upper bound (MHz) of any detection-window From/To value
+ * @note Derived from the hardware frequency ceiling, so the settings-file
+ *       parser clamp, the UI NumberField range {0, 7200} and the MHz mirror
+ *       in ScanConfig/SettingsStruct always agree on the same maximum.
+ */
+constexpr uint32_t MAX_DET_WIN_MHZ = static_cast<uint32_t>(HARDWARE_MAX_FREQ_HZ / MHZ);
+
+// ============================================================================
+// String Constants (Flash Storage)
+// ============================================================================
+
+/**
+ * @brief String for unknown drone type
+ */
+constexpr const char DRONE_TYPE_UNKNOWN[] = "Unknown";
+constexpr const char DRONE_TYPE_DJI[] = "DJI";
+constexpr const char DRONE_TYPE_PARROT[] = "Parrot";
+constexpr const char DRONE_TYPE_YUNEEC[] = "Yuneec";
+constexpr const char DRONE_TYPE_3DR[] = "3DR";
+constexpr const char DRONE_TYPE_AUTEL[] = "Autel";
+constexpr const char DRONE_TYPE_HOBBY[] = "Hobby";
+constexpr const char DRONE_TYPE_FPV[] = "FPV";
+constexpr const char DRONE_TYPE_CUSTOM[] = "Custom";
+constexpr const char DRONE_TYPE_OTHER[] = "Other";
+
+// ============================================================================
+// Movement Trend Constants
+// ============================================================================
+
+/**
+ * @brief Threshold for drone approaching detection (dB)
+ * @note RSSI increase of 3 dB means drone is getting closer
+ */
+constexpr int32_t MOVEMENT_TREND_THRESHOLD_APPROACHING_DB = 3;
+
+/**
+ * @brief Threshold for drone receding detection (dB)
+ * @note RSSI decrease of 3 dB means drone is moving away
+ */
+constexpr int32_t MOVEMENT_TREND_THRESHOLD_RECEEDING_DB = -3;
+
+/**
+ * @brief Threshold for sweep-mode trend detection (dB)
+ * @note Tighter than normal-mode (2 dB vs 3 dB) because sweep cycle-peak
+ *       comparisons across different frequencies have less dynamic range
+ *       than split-buffer RSSI averaging within a single frequency.
+ */
+constexpr int32_t SWEEP_TREND_THRESHOLD_DB = 2;
+
+/**
+ * @brief Minimum history samples for trend calculation
+ * @note Need at least 3 samples for reliable trend
+ * @note Must be <= RSSI_HISTORY_SIZE
+ */
+constexpr uint8_t MOVEMENT_TREND_MIN_HISTORY = 3;
+
+/**
+ * @brief Silence threshold for RSSI filtering (dBm)
+ * @note RSSI values below -110 dBm are ignored as noise
+ */
+constexpr int32_t MOVEMENT_TREND_SILENCE_THRESHOLD_DBM = -110;
+
+/**
+ * @brief Movement trend symbols for UI display
+ */
+constexpr char MOVEMENT_TREND_SYMBOL_APPROACHING = '<';
+constexpr char MOVEMENT_TREND_SYMBOL_RECEEDING = '>';
+constexpr char MOVEMENT_TREND_SYMBOL_STATIC = '~';
+constexpr char MOVEMENT_TREND_SYMBOL_UNKNOWN = '-';
+
+// ============================================================================
+// Status Messages (Flash Storage)
+// ============================================================================
+
+/**
+ * @brief Status message shown in the detections zone when nothing is detected
+ */
+constexpr const char STATUS_NO_SIGNALS[] = "No signals detected";
+constexpr const char STATUS_SCANNING[] = "Scanning...";
+constexpr const char STATUS_ERROR[] = "Error";
+constexpr const char STATUS_LOADING[] = "Loading...";
+constexpr const char STATUS_READY[] = "Ready";
+
+// ============================================================================
+// Validation Constants
+// ============================================================================
+
+/**
+ * @brief Maximum frequency entry name length
+ */
+constexpr size_t MAX_FREQUENCY_NAME_LENGTH = 32;
+
+/**
+ * @brief Maximum frequency description length
+ */
+constexpr size_t MAX_FREQUENCY_DESCRIPTION_LENGTH = 64;
+
+/**
+ * @brief Maximum file path length
+ */
+constexpr size_t MAX_FILE_PATH_LENGTH = 64;
+
+// ============================================================================
+// Performance Constants
+// ============================================================================
+
+/**
+ * @brief Target UI refresh rate (FPS)
+ */
+constexpr uint32_t TARGET_UI_FPS = 60;
+
+/**
+ * @brief UI refresh interval in milliseconds
+ */
+constexpr uint32_t UI_REFRESH_INTERVAL_MS = 16;
+
+/**
+ * @brief Target scan rate (frequencies per second)
+ */
+constexpr uint32_t TARGET_SCAN_RATE_HZ = 10;
+
+// ============================================================================
+// Fast Scanner Constants
+// ============================================================================
+
+/**
+ * @brief Scanner sleep time per frequency (ms)
+ * @note 50ms = 20 frequencies/second
+ */
+constexpr uint32_t SCANNER_SLEEP_MS = 50;
+
+/**
+ * @brief Statistics updates per second
+ */
+constexpr uint32_t STATISTICS_UPDATES_PER_SEC = 10;
+
+/**
+ * @brief Maximum frequency lock cycles
+ * @note 10 cycles × 50ms = 500ms to verify signal
+ */
+constexpr uint32_t MAX_FREQ_LOCK = 10;
+
+/**
+ * @brief Signal lock time (ms)
+ * @note 10 × 50ms = 500ms
+ */
+constexpr uint32_t SIGNAL_LOCK_TIME_MS = 500;
+
+/**
+ * @brief Drone type display duration (ms)
+ * @note 500ms for showing "FPV", "DJI", etc.
+ */
+constexpr uint32_t DRONE_TYPE_DISPLAY_DURATION_MS = 500;
+
+/**
+ * @brief Maximum drone type display length
+ * @note 4 characters + null terminator
+ */
+constexpr size_t MAX_DRONE_TYPE_DISPLAY = 4;
+
+// ============================================================================
+// Debug Constants
+// ============================================================================
+
+#ifdef DEBUG
+/**
+ * @brief Enable debug logging
+ */
+constexpr bool DEBUG_LOGGING_ENABLED = true;
+
+/**
+ * @brief Enable lock order validation
+ */
+constexpr bool DEBUG_LOCK_ORDER_VALIDATION = true;
+
+/**
+ * @brief Enable stack usage monitoring
+ */
+constexpr bool DEBUG_STACK_MONITORING = true;
+#else
+/**
+ * @brief Disable debug logging
+ */
+constexpr bool DEBUG_LOGGING_ENABLED = false;
+
+/**
+ * @brief Disable lock order validation
+ */
+constexpr bool DEBUG_LOCK_ORDER_VALIDATION = false;
+
+/**
+ * @brief Disable stack usage monitoring
+ */
+constexpr bool DEBUG_STACK_MONITORING = false;
+#endif
+
+// ============================================================================
+// Compile-time consistency checks
+// Enforce that hardcoded array sizes in drone_types.hpp match these constants.
+// Required because drone_types.hpp is parsed before constants.hpp (circular include).
+// ============================================================================
+
+static_assert(RSSI_HISTORY_SIZE == 6,
+    "RSSI_HISTORY_SIZE changed — update rssi_history_[6] in TrackedDrone");
+static_assert(TIMESTAMP_HISTORY_SIZE == RSSI_HISTORY_SIZE,
+    "TIMESTAMP_HISTORY_SIZE must equal RSSI_HISTORY_SIZE");
+static_assert(MAHALANOBIS_HISTORY_SIZE == 8,
+    "MAHALANOBIS_HISTORY_SIZE changed — update history[8] in MahalanobisStatistics");
+static_assert(DRONE_TYPE_NAME_LENGTH == 16,
+    "DRONE_TYPE_NAME_LENGTH changed — update type_name[16] in DisplayDroneEntry");
+static_assert(MAX_DISPLAYED_DRONES == 12,
+    "MAX_DISPLAYED_DRONES changed — update drones[12] in DisplayData");
+static_assert(DISPLAY_MIN_THREAT > ThreatLevel::NONE,
+    "DISPLAY_MIN_THREAT must stay above NONE — NONE rows are tracked but hidden "
+    "from the detection list (gray-row regression guard)");
+
+} // namespace drone_analyzer
+
+#endif // CONSTANTS_HPP

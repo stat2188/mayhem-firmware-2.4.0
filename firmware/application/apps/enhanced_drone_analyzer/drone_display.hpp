@@ -1,0 +1,812 @@
+#ifndef DRONE_DISPLAY_HPP
+#define DRONE_DISPLAY_HPP
+
+#include <cstdint>
+#include <cstddef>
+#include <array>
+#include <string_view>
+#include "ui_widget.hpp"
+#include "ui_font_fixed_5x8.hpp"
+#include "drone_types.hpp"
+#include "constants.hpp"
+#include "mini_waterfall.hpp"
+
+namespace drone_analyzer {
+
+/**
+ * @brief Display component for drone analyzer UI
+ * @note Inherits from ui::View, renders spectrum, signal timeline, drone list, status bar
+ * @note Uses static storage for large buffers to reduce stack usage
+ * @note Removed features: mini spectrum, RSSI history, frequency ruler, detailed info
+ */
+class DroneDisplay : public ui::View {
+public:
+    DroneDisplay(const Rect parent_rect) noexcept;
+    ~DroneDisplay() noexcept override;
+
+    DroneDisplay(const DroneDisplay&) = delete;
+    DroneDisplay& operator=(const DroneDisplay&) = delete;
+
+    /**
+     * @brief Paint method - main rendering entry point
+     * @note Uses static storage for large buffers to reduce stack usage
+     * @note Stack optimized: large buffers in static storage
+     */
+    void paint(Painter& painter) override;
+
+    /**
+     * @brief Render spectrum display
+     * @param painter Painter instance for drawing
+     * @param spectrum_data Spectrum data buffer
+     * @param spectrum_size Size of spectrum data
+     * @param start_x Starting X coordinate
+     * @param start_y Starting Y coordinate
+     * @param width Display width
+     * @param height Display height
+     */
+    void render_spectrum(
+        Painter& painter,
+        const uint8_t* spectrum_data,
+        size_t spectrum_size,
+        uint16_t start_x,
+        uint16_t start_y,
+        uint16_t width,
+        uint16_t height
+    ) noexcept;
+
+    /**
+     * @brief Render per-window sweep waterfalls (side-by-side layout).
+     * @param painter Painter instance for drawing
+     * @param start_x Starting X coordinate
+     * @param start_y Starting Y coordinate
+     * @param width Total display width (divided equally among active windows)
+     * @param height Display height
+     * @note Each active window gets width/N pixels. Windows separated by 1px line.
+     *       Rows are per-window independent: NEWEST at top, older rows scroll downward.
+     */
+    void render_sweep_waterfalls(
+        Painter& painter,
+        uint16_t start_x,
+        uint16_t start_y,
+        uint16_t width,
+        uint16_t height
+    ) noexcept;
+
+    /**
+     * @brief Render drone list display
+     * @param painter Painter instance for drawing
+     * @param drones Array of drone entries to display
+     * @param drone_count Number of drones to display
+     * @param start_x Starting X coordinate
+     * @param start_y Starting Y coordinate
+     * @param width Display width
+     * @param height Display height
+     */
+    void render_drone_list(
+        Painter& painter,
+        const DisplayDroneEntry* drones,
+        size_t drone_count,
+        uint16_t start_x,
+        uint16_t start_y,
+        uint16_t width,
+        uint16_t height
+    ) noexcept;
+
+    /**
+     * @brief Render status bar
+     * @param painter Painter instance for drawing
+     * @param status_text Status text to display
+     * @param start_x Starting X coordinate
+     * @param start_y Starting Y coordinate
+     * @param width Display width
+     * @param height Display height
+     */
+    void render_status_bar(
+        Painter& painter,
+        const char* status_text,
+        uint16_t start_x,
+        uint16_t start_y,
+        uint16_t width,
+        uint16_t height
+    ) noexcept;
+
+    /**
+     * @brief Update display data
+     * @param display_data New display data
+     * @return ErrorCode::SUCCESS if updated, error code otherwise
+     */
+    ErrorCode update_display_data(const DisplayData& display_data) noexcept;
+
+    /**
+     * @brief Get current display data
+     * @return Reference to current display data
+     */
+    [[nodiscard]] const DisplayData& get_display_data() const noexcept;
+
+    /**
+     * @brief Clear display
+     * @param painter Painter instance for drawing
+     */
+    void clear_display(Painter& painter) noexcept;
+
+    /**
+     * @brief Set spectrum data for rendering
+     * @param spectrum_data Spectrum data buffer
+     * @param spectrum_size Size of spectrum data
+     * @return ErrorCode::SUCCESS if set, error code otherwise
+     */
+    ErrorCode set_spectrum_data(
+        const uint8_t* spectrum_data,
+        size_t spectrum_size
+    ) noexcept;
+
+
+
+
+    /**
+     * @brief Push one window's composite directly into its per-window waterfall.
+     * @param window_index Window index (0-3), maps directly to sweep_waterfalls_[index].
+     * @param composite_240 Pointer to 240-byte composite spectrum data.
+     * @param freq_start Start frequency in Hz (for label rendering).
+     * @param freq_end End frequency in Hz (for label rendering).
+     * @note Called from DroneScannerUI on pair_complete for per-window push.
+     *       Each sweep pass produces one row in the window's independent waterfall.
+     */
+    void push_sweep_waterfall_window(
+        uint8_t window_index,
+        const uint8_t* composite_240,
+        FreqHz freq_start = 0,
+        FreqHz freq_end = 0
+    ) noexcept;
+
+    /**
+     * @brief Set which sweep windows are active for independent waterfall rendering.
+     * @param enabled_mask Bitmask: bit i set -> sweep window i is active
+     *        (bit 0 = window 1, bit 3 = window 4). 0 = no sweep waterfalls.
+     * @note Called from DroneScannerUI on sweep mode entry/exit.
+     *       Layout is slot-based: each active window gets an equal width slice
+     *       placed by its order among active windows - stable across sweep passes.
+     */
+    void set_active_sweep_windows(uint8_t enabled_mask) noexcept;
+
+    /**
+     * @brief Set status text
+     * @param status_text Status text to display
+     */
+    void set_status_text(const char* status_text) noexcept;
+
+    void set_spectrum_visible(bool visible) noexcept { spectrum_visible_ = visible; dirty_flags_ = DIRTY_ALL; set_dirty(); }
+    void set_timeline_visible(bool visible) noexcept { timeline_visible_ = visible; dirty_flags_ = DIRTY_ALL; set_dirty(); }
+    [[nodiscard]] bool get_timeline_visible() const noexcept { return timeline_visible_; }
+    void set_drone_list_visible(bool visible) noexcept { drone_list_visible_ = visible; dirty_flags_ = DIRTY_ALL; set_dirty(); }
+    void set_status_bar_visible(bool visible) noexcept { status_bar_visible_ = visible; dirty_flags_ = DIRTY_ALL; set_dirty(); }
+
+    /**
+     * @brief Compute maximum drone entries that fit on screen given current layout.
+     * @return Max visible entries (0 if no space). Accounts for spectrum/waterfall
+     *         visibility and dual-column mode.
+     * @note Used by refresh_ui() to cap get_tracked_drones() copy count,
+     *       avoiding sort/memcpy/memcmp on entries that can never be rendered.
+     * @note Stack: ~16 bytes. Flash: ~64 bytes.
+     */
+    [[nodiscard]] uint16_t max_visible_drones() const noexcept;
+
+    void set_spectrum_filter(uint8_t min_power) noexcept { min_color_power_ = min_power; dirty_flags_ |= DIRTY_SPEC; set_dirty(); }
+
+    /**
+     * @brief Set spectrum shape filter parameters (margin, min_width, max_width)
+     * @param margin Minimum peak margin above noise floor (bins below this are suppressed)
+     * @param min_width Minimum signal width in bins (isolated spikes removed)
+     * @param max_width Maximum signal width (flat noise rejected)
+     */
+    void set_spectrum_shape_params(uint8_t margin, uint8_t min_width, uint8_t max_width) noexcept {
+        spectrum_shape_margin_ = margin;
+        spectrum_shape_min_width_ = min_width;
+        spectrum_shape_max_width_ = max_width;
+    }
+
+    void set_composite_mode(bool enabled) noexcept { composite_mode_ = enabled; dirty_flags_ = DIRTY_ALL; set_dirty(); }
+    void set_composite_data(const uint8_t* data, size_t size) noexcept;
+    void set_sweep_range(FreqHz start, FreqHz end) noexcept {
+        sweep_freq_start_ = start;
+        sweep_freq_end_ = end;
+        dirty_flags_ |= DIRTY_SPEC;
+        set_dirty();
+    }
+
+    // Dual-sweep support
+    void set_dual_sweep_mode(bool enabled) noexcept {
+        if (enabled == dual_sweep_mode_) return;
+        dual_sweep_mode_ = enabled;
+        dirty_flags_ |= DIRTY_SPEC;
+        set_dirty();
+    }
+    void set_sweep2_data(const uint8_t* data, size_t size) noexcept;
+    void set_sweep2_range(FreqHz start, FreqHz end) noexcept {
+        sweep2_freq_start_ = start;
+        sweep2_freq_end_ = end;
+        dirty_flags_ |= DIRTY_SPEC;
+        set_dirty();
+    }
+
+    /**
+     * @brief Push detection-window ranges (MHz mirror) for one spectrum band.
+     * @param band      0 = band1 (upper / single mode), 1 = band2 (dual lower)
+     * @param start_mhz Lower bounds of the 5 slots (MHz; 0 = unset)
+     * @param end_mhz   Upper bounds of the 5 slots (MHz; 0 = unset)
+     * @note Slot activation rule: constants.hpp::is_det_win_slot_active()
+     *       (single source of truth — the scanner gate applies the same rule).
+     *       Active slots are drawn as red brackets in the band's title strip.
+     * @note Content is compared against the stored mirror first: an unchanged
+     *       push (every sweep frame) costs two memcmps and no repaint.
+     * @note Band 1 mirror is retained in single mode (NOT cleared): a later
+     *       return to dual-sweep mode redraws the correct brackets from the
+     *       retained mirror via the DIRTY_SPEC raised by set_dual_sweep_mode() —
+     *       no extra push is needed (L3 audit contract).
+     * @note Stack: ~0 bytes. SRAM: 80 B (2 bands × 5 slots × 2 mirrors).
+     */
+    void set_detection_windows(
+        uint8_t band,
+        const uint32_t (&start_mhz)[DETECTION_WINDOWS_PER_WINDOW],
+        const uint32_t (&end_mhz)[DETECTION_WINDOWS_PER_WINDOW]) noexcept;
+
+    // Dual-column drone list (compact rows, splits above DUAL_COLUMN_MIN_COUNT detections)
+    void set_dual_column_mode(bool enabled) noexcept { dual_column_mode_ = enabled; dirty_flags_ = DIRTY_ALL; set_dirty(); }
+    [[nodiscard]] bool get_dual_column_mode() const noexcept { return dual_column_mode_; }
+
+    /**
+     * @brief Reset EMA persistence buffer and auto-computed noise floor.
+     * @note Call from sweep pass boundary (pair_complete / exit_sweep_mode) so
+     *       stale peaks from the previous pass do not mask fresh pixels of the
+     *       new pass. Without this, the auto-noise-floor stays at the level of
+     *       the previous pass's signals and subtraction zeroes new pixels.
+     * @pre  Called only from UI thread.
+     * @post s_dd.composite_persist = 0, init = false, noise_floor_valid = false.
+     *       composite_data_ and composite_data_size_ are PRESERVED — the zeroed
+     *       persist buffer renders empty bars until set_composite_data() fills it.
+     *       This prevents the layout collapse that caused the sweep-hang bug.
+     * @note Stack: 0 B. SRAM: 0 B (in-place zeroing of existing buffer).
+     */
+    void reset_composite_persistence() noexcept;
+
+    /**
+     * @brief Recompute noise floor from EMA persistence buffer using quickselect.
+     * @note Called once per sweep pass (pair_complete), NOT per frame.
+     *       Eliminates ~1200 integer comparisons per frame that previously ran
+     *       in set_composite_data() and set_sweep2_data().
+     * @note Uses s_dd.composite_sort / s_dd.sweep2_sort as temporary storage.
+     * @note SRAM: 0 B additional (uses existing sort buffers).
+     */
+    void update_noise_floor() noexcept;
+
+    /**
+     * @brief Set the user shelf offset (-9..+9 units, SWEEP_SHELF_OFFSET_*).
+     * @note Biases the auto-computed composite floor at RENDER time:
+     *       effective_floor = clamp(composite_noise_floor_ + offset, 0, 255).
+     *       The raw percentile keeps updating every pass (update_noise_floor);
+     *       only the user's relative adjustment is sticky.
+     * @note Coupled to the detector: the scanner applies the SAME offset to
+     *       its per-frame p25 shelf (ScanConfig::sweep_shelf_offset), so
+     *       revealed peaks are also revealed to the relative detection gates.
+     * @note Raises DIRTY_SPEC_DATA: the incremental renderer stores
+     *       floor-subtracted values in band.shadow, so a floor change must
+     *       invalidate every column — render_composite_partial_band detects
+     *       the new floor via last_noise_floor and forces a full repaint.
+     * @note Clamped to [SWEEP_SHELF_OFFSET_MIN, SWEEP_SHELF_OFFSET_MAX];
+     *       unchanged value is a no-op. UI thread only.
+     */
+    void set_shelf_offset(int8_t offset) noexcept {
+        if (offset < SWEEP_SHELF_OFFSET_MIN) offset = SWEEP_SHELF_OFFSET_MIN;
+        if (offset > SWEEP_SHELF_OFFSET_MAX) offset = SWEEP_SHELF_OFFSET_MAX;
+        if (offset == shelf_offset_) return;
+        shelf_offset_ = offset;
+        dirty_flags_ |= DIRTY_SPEC_DATA;
+        set_dirty();
+    }
+
+    /**
+     * @brief Set real-time scan-head position for the upper and lower composite bands.
+     * @param upper Pixel index 0..COMPOSITE_SIZE-1, or -1 to hide on upper band.
+     * @param lower Pixel index 0..COMPOSITE_SIZE-1, or -1 to hide on lower band.
+     * @note Draws a 1-px white vertical marker so the user sees where the sweep
+     *       currently is, independent of pixel-value filtering.
+     * @note MARKER-ONLY update: sets DIRTY_SPEC_MARKER (2 column redraws),
+     *       NOT a full spectrum repaint. Early-returns when position is
+     *       unchanged — the common case between hops in dual-sweep mode.
+     * @note Stack: 0 B. Cost per call: ~4 comparisons.
+     */
+    void set_scan_head(int16_t upper, int16_t lower) noexcept {
+        if (scan_head_position_[0] == upper && scan_head_position_[1] == lower) {
+            return;  // No-op: avoids a pointless dirty cycle per hop
+        }
+        scan_head_position_[0] = upper;
+        scan_head_position_[1] = lower;
+        dirty_flags_ |= DIRTY_SPEC_MARKER;
+        set_dirty();
+    }
+
+    [[nodiscard]] const char* get_status_text() const noexcept;
+
+private:
+    /**
+     * @brief Draw spectrum line
+     * @param painter Painter instance for drawing
+     * @param x X coordinate
+     * @param y Y coordinate
+     * @param color Line color
+     */
+    void draw_spectrum_line(
+        Painter& painter,
+        uint16_t x,
+        uint16_t y,
+        uint32_t color
+    ) noexcept;
+
+    /**
+     * @brief Draw drone entry
+     * @param painter Painter instance for drawing
+     * @param drone Drone entry to draw
+     * @param x X coordinate
+     * @param y Y coordinate
+     * @param width Entry width
+     * @param height Entry height
+     */
+    void draw_drone_entry(
+        Painter& painter,
+        const DisplayDroneEntry& drone,
+        uint16_t x,
+        uint16_t y,
+        uint16_t width,
+        uint16_t height
+    ) noexcept;
+
+    /**
+     * @brief Draw text
+     * @param painter Painter instance for drawing
+     * @param text Text to draw
+     * @param x X coordinate
+     * @param y Y coordinate
+     * @param color Text color
+     */
+    void draw_text(
+        Painter& painter,
+        const char* text,
+        uint16_t x,
+        uint16_t y,
+        uint32_t color
+    ) noexcept;
+
+    void draw_text(
+        Painter& painter,
+        std::string_view text,
+        uint16_t x,
+        uint16_t y,
+        uint32_t color
+    ) noexcept;
+
+    void draw_text_small(
+        Painter& painter,
+        const char* text,
+        uint16_t x,
+        uint16_t y,
+        uint32_t color
+    ) noexcept;
+
+    void draw_text_small(
+        Painter& painter,
+        std::string_view text,
+        uint16_t x,
+        uint16_t y,
+        uint32_t color
+    ) noexcept;
+
+    /**
+     * @brief Draw rectangle
+     * @param painter Painter instance for drawing
+     * @param x X coordinate
+     * @param y Y coordinate
+     * @param width Rectangle width
+     * @param height Rectangle height
+     * @param color Rectangle color
+     * @param fill Fill rectangle if true, outline only if false
+     */
+    void draw_rectangle(
+        Painter& painter,
+        uint16_t x,
+        uint16_t y,
+        uint16_t width,
+        uint16_t height,
+        uint32_t color,
+        bool fill = true
+    ) noexcept;
+
+    /**
+     * @brief Map RSSI value to display height
+     * @param rssi RSSI value in dBm
+     * @param max_height Maximum display height
+     * @return Mapped height in pixels
+     */
+    [[nodiscard]] uint16_t map_rssi_to_height(
+        RssiValue rssi,
+        uint16_t max_height
+    ) const noexcept;
+
+    /**
+     * @brief Get color for threat level
+     * @param threat Threat level
+     * @return Color value
+     */
+    [[nodiscard]] uint32_t get_threat_color(ThreatLevel threat) const noexcept;
+
+    /**
+     * @brief Format frequency for display
+     * @param frequency Frequency in Hz
+     * @param buffer Buffer to store formatted string
+     * @param buffer_size Buffer size
+     */
+    void format_frequency(
+        FreqHz frequency,
+        char* buffer,
+        size_t buffer_size
+    ) const noexcept;
+
+    /**
+     * @brief Format RSSI for display
+     * @param rssi RSSI value in dBm
+     * @param buffer Buffer to store formatted string
+     * @param buffer_size Buffer size
+     */
+    void format_rssi(
+        RssiValue rssi,
+        char* buffer,
+        size_t buffer_size
+    ) const noexcept;
+
+    /**
+     * @brief Validate spectrum data
+     * @param spectrum_data Spectrum data buffer
+     * @param spectrum_size Size of spectrum data
+     * @return ErrorCode::SUCCESS if valid, error code otherwise
+     */
+    [[nodiscard]] ErrorCode validate_spectrum_data(
+        const uint8_t* spectrum_data,
+        size_t spectrum_size
+    ) const noexcept;
+
+    /**
+     * @brief Clamp value to range
+     * @param value Value to clamp
+     * @param min Minimum value
+     * @param max Maximum value
+     * @return Clamped value
+     */
+    [[nodiscard]] uint16_t clamp(
+        int32_t value,
+        int32_t min,
+        int32_t max
+    ) const noexcept;
+
+private:
+    // Display data (static storage, no heap allocation)
+    DisplayData display_data_;
+
+    // Spectrum data buffer (static storage for stack optimization)
+    std::array<uint8_t, SPECTRUM_BUFFER_SIZE> spectrum_buffer_;
+
+    // Per-window sweep waterfalls (one independent history per sweep window).
+    // Each MiniWaterfall stores 15 rows × 30 bytes = 450 bytes.
+    // Total: 4 × 450 = 1,800 bytes BSS.
+    static constexpr uint8_t NUM_SWEEP_WATERFALLS = MAX_SWEEP_WINDOWS;
+    std::array<MiniWaterfall, NUM_SWEEP_WATERFALLS> sweep_waterfalls_{};
+
+    // Per-window frequency ranges for waterfall labels (Flash: 0, SRAM: 4×8 = 32 bytes).
+    // Updated on each push_sweep_waterfall_window() call.
+    std::array<FreqHz, NUM_SWEEP_WATERFALLS> sweep_wf_freq_start_{};
+    std::array<FreqHz, NUM_SWEEP_WATERFALLS> sweep_wf_freq_end_{};
+
+    // Bitmask of active sweep windows for independent waterfall rendering.
+    // Bit i = sweep window i active; 0 = no sweep waterfalls to render.
+    uint8_t active_waterfall_mask_{0};
+
+    // Per-window dirty bitmask for incremental waterfall rendering.
+    // Bit i = window i has new data and needs repaint. Cleared after paint().
+    // Saves ~75% of RLE row renders when only 1 of 4 windows completes a pass.
+    uint8_t dirty_waterfall_windows_{0xFF};  // init all dirty for first paint
+
+    // Status text buffer
+    char status_text_[MAX_TEXT_LENGTH];
+
+    // Spectrum data size
+    size_t spectrum_data_size_;
+
+    // Display flags
+    bool spectrum_visible_;
+    bool timeline_visible_;
+    bool drone_list_visible_;
+    bool status_bar_visible_;
+
+    // Section-level dirty flags — each bit controls whether a section repaints.
+    static constexpr uint8_t DIRTY_SPEC      = 1 << 0;
+    static constexpr uint8_t DIRTY_WATERFALL = 1 << 1;
+    static constexpr uint8_t DIRTY_DRONES    = 1 << 2;
+    static constexpr uint8_t DIRTY_STATUS    = 1 << 3;
+    static constexpr uint8_t DIRTY_ALL       = 0x0F;
+    // Incremental spectrum sub-flags (sweep composite only).
+    // DIRTY_SPEC        — full spectrum repaint (mode/layout/title change).
+    // DIRTY_SPEC_DATA   — composite data changed → neighbour-aware INCREMENTAL
+    //                     band repaint (changed columns + their right
+    //                     neighbours; the white envelope connector at column i
+    //                     depends on tops [i-1,i] — see
+    //                     render_composite_partial_band).
+    // DIRTY_SPEC_MARKER — scan head moved → 2 column writes only (data unchanged).
+    static constexpr uint8_t DIRTY_SPEC_DATA   = 1 << 4;
+    static constexpr uint8_t DIRTY_SPEC_MARKER = 1 << 5;
+    static constexpr uint8_t DIRTY_SPEC_ANY =
+        DIRTY_SPEC | DIRTY_SPEC_DATA | DIRTY_SPEC_MARKER;
+    uint8_t dirty_flags_{DIRTY_ALL};
+
+    // Spectrum filter threshold — auto-managed by sweep mode entry/exit.
+    // Normal mode: 0 (show all). Sweep mode: SWEEP_DISPLAY_NOISE_MARGIN (8).
+    uint8_t min_color_power_{0};
+
+    // Spectrum shape filter params (from Settings: margin, min_width, max_width)
+    // Used only for syncing from config when user changes settings via set_spectrum_shape_params()
+    uint8_t spectrum_shape_margin_{0};
+    uint8_t spectrum_shape_min_width_{DEFAULT_SPECTRUM_MIN_WIDTH};
+    uint8_t spectrum_shape_max_width_{DEFAULT_SPECTRUM_MAX_WIDTH};
+
+    // Display-only margin filter (separate from detection margin)
+    // Default: 0 = show full spectrum (no noise floor filtering)
+    // When > 0, only shows bins above noise_floor + display_margin
+    // Updated independently from scanner config to allow different display vs detection behavior
+    uint8_t display_margin_{0};
+
+    // Band sweep composite mode
+    bool composite_mode_{false};
+    const uint8_t* composite_data_{nullptr};
+    size_t composite_data_size_{0};
+    FreqHz sweep_freq_start_{0};
+    FreqHz sweep_freq_end_{0};
+
+    // composite_persist_buf_, composite_sort_buf_ moved to file-scope static
+    // (drone_display.cpp) — saves 480 bytes of heap per DroneDisplay instance.
+    bool composite_persist_initialized_{false};
+
+    // Auto-computed noise floor for composite display noise floor subtraction.
+    uint8_t composite_noise_floor_{0};
+    bool composite_noise_floor_valid_{false};
+
+    // User shelf offset (-9..+9 units) — biases the render-time floor for
+    // BOTH bands (single + dual sweep). Raw percentile values above stay
+    // unbiased; apply_shelf_offset() is applied at the render call sites.
+    // Coupled to ScanConfig::sweep_shelf_offset (detector shelf) via the UI.
+    int8_t shelf_offset_{SWEEP_SHELF_OFFSET_DEFAULT};
+
+    /**
+     * @brief Apply the user shelf offset to one band's raw noise floor.
+     * @param nf Raw auto-computed floor (15th percentile of the persist buf).
+     * @return clamp(nf + shelf_offset_, 0, 255) — the floor the render
+     *         subtracts (bar value = composite - result).
+     */
+    [[nodiscard]] uint8_t apply_shelf_offset(uint8_t nf) const noexcept;
+
+    // sweep2_persist_buf_, sweep2_sort_buf_ moved to file-scope static
+    // (drone_display.cpp) — saves 480 bytes of heap per DroneDisplay instance.
+    bool sweep2_persist_initialized_{false};
+    uint8_t sweep2_noise_floor_{0};
+    bool sweep2_noise_floor_valid_{false};
+
+    /**
+     * @brief Envelope state for connecting bar tops with a white trace.
+     * @note Used by render_composite_full_band(); the partial-band path
+     *       mirrors the same draw order inline.
+     * @note Stack: ~6 bytes when embedded in caller.
+     */
+    struct EnvelopeState {
+        uint16_t prev_y{0};
+        bool prev_valid{false};
+        uint8_t gap_count{0};
+        static constexpr uint8_t MAX_GAP = 5;
+    };
+
+    /**
+     * @brief Draw a single bar column and update the envelope trace.
+     * @note Envelope only draws on above-threshold bars, eliminating the
+     *       sub-threshold white dot line bug that existed in render_composite().
+     * @param x Screen X coordinate
+     * @param y Bar top Y coordinate (chart_start_y + chart_height - bar_height)
+     * @param bar_height Bar height in pixels
+     * @param color Bar color (RGB), or COLOR_BACKGROUND if below threshold
+     * @param state Envelope state (updated in-place)
+     * @note Stack: ~0 bytes (all state in EnvelopeState ref). Flash: ~200 bytes.
+     */
+    void draw_bar_with_envelope(
+        Painter& painter,
+        uint16_t x,
+        uint16_t y,
+        uint16_t bar_height,
+        uint32_t color,
+        EnvelopeState& state
+    ) noexcept;
+
+    /**
+     * @brief Per-band render state (sweep composite): screen shadow + marker
+     *        tracking for the marker-only fast path (new data → full repaint).
+     * @note shadow points into file-scope s_dd (BSS) — NOT owned, never freed.
+     * @note last_* fields snapshot every screen-visible input; any mismatch
+     *       forces a full band repaint (correctness over speed).
+     * @note SRAM: ~36 B per instance (band_idx_ + 2x FreqHz pads 20 → 36).
+     *       Stack: 0 B (member).
+     */
+    struct BandRenderCtx {
+        constexpr BandRenderCtx() noexcept = default;
+        constexpr explicit BandRenderCtx(uint8_t idx) noexcept : band_idx_(idx) {}
+        uint8_t* shadow{nullptr};      // [COMPOSITE_SIZE] rendered values on screen
+        int16_t marker_on_screen{-1};  // marker column currently visible
+        bool shadow_valid{false};      // false until first full render
+        uint8_t last_noise_floor{0};
+        uint8_t last_threshold{0};
+        uint16_t last_x{0};
+        uint16_t last_y{0};
+        uint16_t last_w{0};
+        uint16_t last_h{0};
+        FreqHz last_title_start{0};
+        FreqHz last_title_end{0};
+        // Mirror index for the det-window brackets (det_win_*_mhz_): fixed at
+        // construction, read by render_composite_full_band() — replaces the
+        // fragile (&band == &band1_) pointer-identity check (M1 audit fix).
+        uint8_t band_idx_{0};
+    };
+    BandRenderCtx band1_{};   // band 0: upper band (single mode renders here too)
+    BandRenderCtx band2_{1};  // band 1: lower band (dual-sweep only)
+
+    /**
+     * @brief Full composite render of one band (clear + title + all columns).
+     * @note Rebuilds band.shadow to match the screen exactly.
+     * @note Stack: ~48 B (title buffer + envelope state). Flash: ~400 B.
+     */
+    void render_composite_full_band(
+        Painter& painter, BandRenderCtx& band,
+        const uint8_t* composite_data, size_t composite_size,
+        uint16_t start_x, uint16_t start_y, uint16_t width, uint16_t height,
+        int16_t scan_head, uint8_t noise_floor,
+        FreqHz title_start, FreqHz title_end
+    ) noexcept;
+
+    /**
+     * @brief Composite render of one band. New data → neighbour-aware
+     *        INCREMENTAL repaint (changed columns + their right neighbours);
+     *        unchanged data → marker-only fast path (restore old marker
+     *        column from shadow + draw new). Screen-visible params changed
+     *        (layout/threshold/noise floor/title) → full repaint via
+     *        render_composite_full_band.
+     * @note The white envelope connector for transition (i-1 → i) is drawn
+     *       AT COLUMN i spanning [min(top[i-1],top[i]), max(...)] — a
+     *       cross-column dependency. The incremental diff therefore expands
+     *       each changed column to its right neighbour
+     *       (redraw(i) ⟺ Δp[i] ∨ Δp[i-1], tracked via loop state): a
+     *       top[i-1]-only change moves connector pixels AT COLUMN i, which a
+     *       naive per-column value diff would miss (the historical stale
+     *       envelope-line defect). Envelope state is replayed over every
+     *       column, so redrawn columns are pixel-identical to a full repaint.
+     * @note Stack: ~14 B (envelope state + loop scalars). Flash: ~550 B.
+     *       Typical data frame: 1-60 thin column redraws (vs the former
+     *       full clear + 240-column repaint that caused visible flicker).
+     */
+    void render_composite_partial_band(
+        Painter& painter, BandRenderCtx& band,
+        const uint8_t* composite_data, size_t composite_size,
+        uint16_t start_x, uint16_t start_y, uint16_t width, uint16_t height,
+        int16_t scan_head, uint8_t noise_floor, bool data_changed,
+        FreqHz title_start, FreqHz title_end
+    ) noexcept;
+
+    void render_composite(
+        Painter& painter,
+        const uint8_t* composite_data,
+        size_t composite_size,
+        uint16_t start_x,
+        uint16_t start_y,
+        uint16_t width,
+        uint16_t height,
+        int16_t scan_head = -1,
+        uint8_t noise_floor = 0,
+        FreqHz freq_start_override = 0,
+        FreqHz freq_end_override = 0
+    ) noexcept;
+
+    void render_dual_composite(
+        Painter& painter,
+        uint16_t start_x,
+        uint16_t start_y,
+        uint16_t width,
+        uint16_t height
+    ) noexcept;
+
+    /**
+     * @brief Draw red [ ]-style brackets over the title strip for every active
+     *        detection-window slot of the band.
+     * @param band_idx        Band whose det-window mirror to use (0 or 1)
+     * @param f_min           Band lower frequency bound (Hz)
+     * @param f_max           Band upper frequency bound (Hz)
+     * @param composite_size  Composite buffer length (bins)
+     * @param bar_count       On-screen bar count (may be < composite_size)
+     * @param chart_start_x   Pixel X of composite bin 0 (same anchor as bars)
+     * @param title_y         Pixel Y of the title strip top line
+     * @pre Call from render_composite_full_band() only — the incremental
+     *      renderer never touches the title strip, so brackets persist
+     *      between full repaints.
+     * @note Inverse of the composite mapping in SweepProcessor::process_frame
+     *       (index = (freq − f_min) · size / range); u64 integer math only —
+     *       no float, no heap. Stack: ~0 bytes (registers).
+     */
+    void draw_detection_brackets(
+        Painter& painter,
+        uint8_t band_idx,
+        FreqHz f_min,
+        FreqHz f_max,
+        size_t composite_size,
+        uint16_t bar_count,
+        uint16_t chart_start_x,
+        uint16_t title_y
+    ) noexcept;
+
+public:
+    /**
+     * @brief Layout metrics computed once per paint/hit_test cycle.
+     * @note SINGLE SOURCE OF TRUTH for all coordinate calculations.
+     *       Eliminates the desync bug where paint() and hit_test() computed
+     *       section heights independently with potentially different logic.
+     */
+    struct LayoutMetrics {
+        uint16_t spec_h;         // Spectrum/composite section height (0 if hidden)
+        uint16_t timeline_h;     // Signal timeline section height (0 if hidden)
+        uint16_t status_h;       // Status bar height (0 if hidden)
+        uint16_t drone_h;        // Drone list section height (remaining space)
+        uint16_t list_start_y;   // Y offset where drone list begins (relative to parent)
+    };
+
+    /**
+     * @brief Calculate layout metrics from current display state.
+     * @return LayoutMetrics struct with all computed heights.
+     * @note Used by both paint() and hit_test() — single source of truth.
+     * @note Stack: ~0 bytes (all data returned by value, small struct).
+     */
+    [[nodiscard]] LayoutMetrics calculate_layout() const noexcept;
+
+    /**
+     * @brief Hit-test: determine drone index at touch coordinates.
+     * @param x Local X within DroneDisplay.
+     * @param y Local Y within DroneDisplay.
+     * @return Drone index (0-based) or -1 if miss.
+     * @note Must mirror paint() layout — update here when paint() changes.
+     */
+    [[nodiscard]] int16_t hit_test(uint16_t x, uint16_t y) const noexcept;
+
+private:
+    // Dual-sweep rendering (two horizontal bands)
+    bool dual_sweep_mode_{false};
+    const uint8_t* sweep2_data_{nullptr};
+    size_t sweep2_data_size_{0};
+    FreqHz sweep2_freq_start_{0};
+    FreqHz sweep2_freq_end_{0};
+
+    // Detection-window bracket mirror (SWP From/To ranges), per band:
+    // [0] = band1 (upper/single), [1] = band2 (dual lower). Stored as the same
+    // MHz mirror as ScanConfig — SRAM: 2 bands × 5 slots × 2 × 4 B = 80 B BSS.
+    uint32_t det_win_start_mhz_[DET_WIN_BAND_COUNT][DETECTION_WINDOWS_PER_WINDOW]{};
+    uint32_t det_win_end_mhz_[DET_WIN_BAND_COUNT][DETECTION_WINDOWS_PER_WINDOW]{};
+    bool det_win_active_[DET_WIN_BAND_COUNT]{false, false};  // >= 1 active slot per band
+    bool det_win_dirty_{false};             // config changed → force full band repaint
+
+    // Dual-column drone list (two narrow detection columns)
+    bool dual_column_mode_{true};
+
+    // Real-time scan-head position [0]=upper band, [1]=lower band (dual mode).
+    // -1 means "no marker" for that band.
+    std::array<int16_t, 2> scan_head_position_{ {-1, -1} };
+};
+
+} // namespace drone_analyzer
+
+#endif // DRONE_DISPLAY_HPP

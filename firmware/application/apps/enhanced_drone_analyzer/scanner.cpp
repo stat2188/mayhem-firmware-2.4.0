@@ -1,0 +1,5596 @@
+#include <cstdint>
+#include <algorithm>
+
+#include "ch.h"
+
+#include "scanner.hpp"
+#include "shape_gate_logic.hpp"
+#include "sweep_processor.hpp"
+#include "sweep_sensitivity.hpp"
+#include "receiver_model.hpp"
+#include "portapack.hpp"
+#include "portapack_persistent_memory.hpp"
+
+namespace drone_analyzer {
+
+/**
+ * @brief Convert a spectrum.db uint8_t value to calibrated dBm (with cached gain)
+ * @param value Raw spectrum.db value (0-255, from baseband)
+ * @param total_gain LNA + VGA + (RF_AMP enabled ? RF_AMP_GAIN_DB : 0) in dB
+ * @return RSSI in dBm, gain-compensated
+ * @note Encoding: spectrum.db = clamp(dBV*5 + 255, 0, 255) => dBV_norm = (value - 255) / 5
+ * @note dBm = dBV_norm - total_gain
+ */
+static int32_t spectrum_value_to_dbm(const uint8_t value, int32_t total_gain) noexcept {
+    // Round toward nearest instead of truncating toward zero.
+    // Raw encoding: spectrum.db = clamp(dBV*5 + 255, 0, 255).
+    // Inverse: dBV = (value - 255) / 5. Without rounding, truncation loses
+    // up to 0.2 dB per sample (e.g., value=254 gives 0 instead of -0.2).
+    // Rounding recovers ~0.1 dB average precision at zero cost (no float).
+    const int32_t raw = static_cast<int32_t>(value) - 255;
+    const int32_t dbv_norm = (raw >= 0) ? ((raw + 2) / 5) : ((raw - 2) / 5);
+    int32_t rssi = dbv_norm - total_gain;
+    if (rssi < RSSI_MIN_DBM) rssi = RSSI_MIN_DBM;
+    if (rssi > RSSI_MAX_DBM) rssi = RSSI_MAX_DBM;
+    return rssi;
+}
+
+/**
+ * @brief Read total gain from hardware (SPI access).
+ * @note Call once and pass to spectrum_value_to_dbm() to avoid repeated SPI reads.
+ */
+static int32_t get_current_total_gain() noexcept {
+    return static_cast<int32_t>(portapack::receiver_model.lna()) +
+           static_cast<int32_t>(portapack::receiver_model.vga()) +
+           (portapack::receiver_model.rf_amp() ? RF_AMP_GAIN_DB : 0);
+}
+
+/**
+ * @brief RSSI extraction — scan usable bins with edge skip
+ * @param spectrum Channel spectrum
+ * @param out_peak Optional output for the usable-bin peak power (used to fill
+ *        last_peak_power_ without a second full spectrum scan). Excludes the DC
+ *        spike region and edge bins — same cells used for RSSI, so the returned
+ *        value is the power that actually determines signal detection.
+ */
+static int32_t extract_rssi(const ChannelSpectrum& spectrum, uint8_t* out_peak = nullptr) noexcept {
+    uint8_t peak = 0;
+
+    for (size_t i = FFT_EDGE_SKIP; i < FFT_DC_SPIKE_START; ++i) {
+        if (spectrum.db[i] > peak) peak = spectrum.db[i];
+    }
+    for (size_t i = FFT_DC_SPIKE_END; i < (FFT_BIN_COUNT - FFT_EDGE_SKIP); ++i) {
+        if (spectrum.db[i] > peak) peak = spectrum.db[i];
+    }
+
+    if (out_peak != nullptr) *out_peak = peak;
+
+    const int32_t total_gain = get_current_total_gain();
+    return spectrum_value_to_dbm(peak, total_gain);
+}
+
+/**
+ * @brief Compute k-th percentile via quickselect (O(n) average, in-place)
+ * @param buf Buffer to partition (will be modified)
+ * @param count Number of elements in buffer
+ * @param percentile Percentile to compute (0-100, where 25 = 25th percentile)
+ * @return Percentile value (0 if count == 0)
+ * @note 25th percentile is more robust than median for noise floor estimation
+ *       when signal occupies >50% of bins (WiFi-dense environments).
+ *       Median becomes signal-biased in that case; 25th percentile stays near
+ *       the true noise floor.
+ */
+static uint8_t quickselect_percentile(uint8_t* buf, size_t count, uint8_t percentile) noexcept {
+    if (count == 0) return 0;
+    const size_t k = (count * static_cast<size_t>(percentile)) / 100;
+    const size_t k_safe = (k < count) ? k : count - 1;
+    size_t left = 0;
+    size_t right = count - 1;
+    while (left < right) {
+        const size_t pivot_idx = left + (right - left) / 2;
+        const uint8_t pivot = buf[pivot_idx];
+        buf[pivot_idx] = buf[right];
+        buf[right] = pivot;
+        size_t store = left;
+        for (size_t i = left; i < right; ++i) {
+            if (buf[i] < pivot) {
+                const uint8_t t = buf[store];
+                buf[store] = buf[i];
+                buf[i] = t;
+                ++store;
+            }
+        }
+        buf[right] = buf[store];
+        buf[store] = pivot;
+        if (store == k_safe) break;
+        if (store < k_safe) left = store + 1;
+        else right = store - 1;
+    }
+    return buf[k_safe];
+}
+
+/**
+ * @brief Frame's two noise shelves in ONE buffer pass setup (audit fix W1).
+ * @param buf             Usable-bin buffer — MODIFIED by the quickselects
+ *                        (order is irrelevant to a selection algorithm, so
+ *                        p10 after p25 is exact).
+ * @param count           Number of usable bins (sweep ~228, DB ~236).
+ * @param robust_enabled  ScanConfig::robust_width_floor_enabled — the W1
+ *                        kill switch (settings checkbox "RbF", default ON).
+ *                        OFF skips the p10 pass and returns width == noise,
+ *                        i.e. the legacy p25 anchor byte-for-byte.
+ * @return {noise, width}: noise = 25th percentile (the legacy shelf — drives
+ *         the Step-3 margin, valley/symmetry/flatness margins, Step 6c walls);
+ *         width = the WIDTH-ANCHOR shelf — p25 itself when the band is clean
+ *         or the kill switch is OFF, the 10th percentile when
+ *         p25 - p10 >= WIDTH_FLOOR_CONTAM_DELTA_UNITS (the band is occupied
+ *         and p25 is the signal, not the noise).
+ * @note SINGLE SOURCE: both shape paths (analyze_spectrum_shape_multi and
+ *       process_spectrum_sweep) derive their shelves from this helper, so the
+ *       contamination rule exists exactly once. The DB TBD block keeps its own
+ *       direct p25 (its width anchor is the W2 gate/3 floor, not the W1
+ *       demotion); the sweep TBD path inherits this helper's p25 via
+ *       process_spectrum_sweep.
+ * @note Stack: 2 bytes (returned in registers). Flash: ~60 bytes.
+ */
+struct ShapeFloors {
+    uint8_t noise;
+    uint8_t width;
+};
+
+static ShapeFloors select_shape_floors(
+    uint8_t* buf,
+    size_t count,
+    bool robust_enabled
+) noexcept {
+    ShapeFloors floors{0, 0};
+    if (count == 0) return floors;
+    floors.noise = quickselect_percentile(buf, count, 25);
+    if (!robust_enabled) return floors;  // kill switch: legacy p25 anchor
+    const uint8_t p10 = quickselect_percentile(buf, count, 10);
+    // uint16: p10 (<=255) + delta (10) cannot wrap; p10 <= p25 holds for any
+    // multiset, so the subtraction sign is never in play.
+    const bool contaminated =
+        static_cast<uint16_t>(floors.noise) >=
+        static_cast<uint16_t>(p10) + WIDTH_FLOOR_CONTAM_DELTA_UNITS;
+    floors.width = contaminated ? p10 : floors.noise;
+    return floors;
+}
+
+// shape_adapt_weight() moved to shape_gate_logic.hpp (single-author easing
+// formulas shared with the host regression tests, audit F4 2026-10).
+
+/**
+ * @brief Sensitivity stringency of the RSSI threshold vs the -95 dBm anchor.
+ * @param cfg ScanConfig whose rssi_threshold_dbm is measured
+ * @return RSSI_DETECTION_THRESHOLD_DBM - threshold: > 0 when the threshold
+ *         sits BELOW the -95 dBm anchor (Sens > 75, high sensitivity),
+ *         0 at the anchor (Sens 75), < 0 above it (Sens < 75, strict).
+ * @note SINGLE AUTHOR for the expression previously inlined at
+ *       shape_gate_margin(), shape_gate_margin_try() and
+ *       apply_shape_filters() — plus the Step-13 EFFECTIVE-ARMING flat
+ *       guard (audit M3 rev. 2), so all four consumers can never disagree.
+ * @note ANCHOR DEPENDENCY: the zero point is RSSI_DETECTION_THRESHOLD_DBM
+ *       (constants.hpp), never a bare literal — algebraically identical
+ *       (−95 − thr ≡ −(thr + 95)); the Sens mapping crosses zero there
+ *       (rssi_sens = Sens − 75 via threshold = −20 − Sens).
+ * Stack: ~4 bytes (register). SRAM: 0. Flash: ~24 bytes. No FP.
+ */
+static int32_t rssi_sens_units(const ScanConfig& cfg) noexcept {
+    return RSSI_DETECTION_THRESHOLD_DBM - cfg.rssi_threshold_dbm;
+}
+
+// flatness_min_peak_margin() / FLATNESS_MIN_MARGIN_FLOOR moved to
+// shape_gate_logic.hpp (shared with the host tests, audit F4 2026-10).
+
+/**
+ * @brief `eased_maxw_bins` was REMOVED (dependency + sensitivity audit,
+ *        2026-10). It returned MaxW + MaxW·(10000−w2)/20000 — up to 1.5× the
+ *        user's MaxW near the entry gate. MaxW is a USER band edge (the upper
+ *        half of [MinW..MaxW]), not a noise-adaptive threshold: easing it UP
+ *        near the gate let a wideband flat-top of width in (MaxW .. 1.5·MaxW)
+ *        slip through at w ≈ 0 — the exact mirror of the MinW relaxation
+ *        (which eased DOWN) that was removed at Step 5. MaxW is now read
+ *        directly from config_.spectrum_max_width at both consumers (Step 6
+ *       fragment + emission extent, and Step-13 EFFECTIVE-ARMING).
+ * BYTE-IDENTITY AT THE OLD SHIPPED DEFAULT (MaxW = 120, ≥ the 114-bin
+ * DC-gap extent cap): the DC-gap-bounded walks
+ * can measure at most one sideband (≤110 DB / ≤114 sweep bins), and 114 ≤ 120
+ * ≤ 382, so both the old eased limit and the new raw limit pass every real
+ * measurement — no default-path behavior changes. Only MaxW < 114 (a user who
+ * actually lowered MaxW) is affected, and there it becomes STRICTER near the
+ * gate, which is the requested direction.
+ * A-2 (2026-10): the shipped default is now 110 — AT the DB sideband cap
+ * (inert in DB: ≤ 110 always passes) and BELOW the sweep cap, so sweep
+ * extents of 111-114 bins are rejected by the raw MaxW ahead of Step 6c
+ * (intended extra wideband gate; see DEFAULT_SPECTRUM_MAX_WIDTH).
+ * SIDE EFFECT (fix, not regression): the Step-13 arming predicate
+ * previously consumed the EASED value, so at MaxW = 100 with w ≈ 0 it read
+ * 150 ≥ cap and concluded "MaxW cannot reject" while the chain's raw
+ * MaxW = 100 CAN reject a 110-bin emission — arming and chain now agree by
+ * construction (both read the raw config value; see the arming site in
+ * process_spectrum_message). F2 fix (2026-10): the comparison constant is
+ * DB_EXTENT_CAP_BINS (110, the DB measurable cap), not the old local 114
+ * (the SWEEP cap) — at the shipped MaxW = 110 the sweep constant read
+ * "armed" in DB where nothing measurable can exceed 110, wrongly skipping
+ * the neighbor post-filter under the documented Sharp≤100 + Flat = 0
+ * config. (The old name MAXW_NO_CAP_BINS died with the local constant.)
+ * CONSISTENCY FIX: tbd_peak_is_narrowband already read the raw
+ * config_.spectrum_max_width; the in-frame path was the outlier. Both now
+ * apply the identical limit.
+ */
+
+// SHARPNESS_NOOP_CEILING / eased_sharpness_limit / eased_flatness_limit /
+// eased_valley_limit / eased_sym_limit moved to shape_gate_logic.hpp
+// (single-author easing formulas shared with the host regression tests,
+// audit F4 2026-10).
+
+// ============================================================================
+// ScanConfig Implementation
+// ============================================================================
+
+ScanConfig::ScanConfig() noexcept
+    : mode(DEFAULT_SCANNING_MODE)
+    , start_frequency(MIN_FREQUENCY_HZ)
+    , end_frequency(MAX_FREQUENCY_HZ)
+    , scan_interval_ms(SCAN_CYCLE_INTERVAL_MS)
+    , rssi_threshold_dbm(DEFAULT_ALERT_RSSI_THRESHOLD_DBM)
+    , stale_timeout_ms(DRONE_REMOVAL_TIMEOUT_MS)
+    , sweep_start_freq(SWEEP_DEFAULT_START_HZ)
+    , sweep_end_freq(SWEEP_DEFAULT_END_HZ)
+    , sweep_step_freq(SWEEP_GAPLESS_STEP_MAX_HZ)  // round-trip only (see ScanConfig note)
+    , dwell_enabled(true)
+    , confirm_count_enabled(true)
+    , noise_blacklist_enabled(true)
+    , spectrum_detection_enabled(true)
+    , median_enabled(true)
+    , spectrum_margin(DEFAULT_SPECTRUM_MARGIN)
+    , spectrum_min_width(DEFAULT_SPECTRUM_MIN_WIDTH)
+    , spectrum_max_width(DEFAULT_SPECTRUM_MAX_WIDTH)
+    , spectrum_peak_sharpness(DEFAULT_SPECTRUM_PEAK_SHARPNESS)
+    , spectrum_peak_ratio(DEFAULT_SPECTRUM_PEAK_RATIO)
+    , spectrum_valley_depth(DEFAULT_SPECTRUM_VALLEY_DEPTH)
+    , spectrum_flatness(DEFAULT_SPECTRUM_FLATNESS)
+    , spectrum_symmetry(DEFAULT_SPECTRUM_SYMMETRY)
+    , neighbor_margin_db(DEFAULT_NEIGHBOR_MARGIN_DB)
+    , rssi_variance_enabled(true)
+    , confirm_count(DEFAULT_CONFIRM_COUNT)
+    , sensitive_mode(true) {
+    // sweep2/3/4 fields use in-class defaults: disabled
+    // mahalanobis_enabled uses in-class default (true)
+}
+
+ScanConfig::ScanConfig(ScanningMode m, FreqHz start, FreqHz end) noexcept
+    : mode(m)
+    , start_frequency(start)
+    , end_frequency(end)
+    , scan_interval_ms(SCAN_CYCLE_INTERVAL_MS)
+    , rssi_threshold_dbm(DEFAULT_ALERT_RSSI_THRESHOLD_DBM)
+    , stale_timeout_ms(DRONE_REMOVAL_TIMEOUT_MS)
+    , sweep_start_freq(SWEEP_DEFAULT_START_HZ)
+    , sweep_end_freq(SWEEP_DEFAULT_END_HZ)
+    , sweep_step_freq(SWEEP_GAPLESS_STEP_MAX_HZ)  // round-trip only (see ScanConfig note)
+    , dwell_enabled(true)
+    , confirm_count_enabled(true)
+    , noise_blacklist_enabled(true)
+    , spectrum_detection_enabled(true)
+    , median_enabled(true)
+    , spectrum_margin(DEFAULT_SPECTRUM_MARGIN)
+    , spectrum_min_width(DEFAULT_SPECTRUM_MIN_WIDTH)
+    , spectrum_max_width(DEFAULT_SPECTRUM_MAX_WIDTH)
+    , spectrum_peak_sharpness(DEFAULT_SPECTRUM_PEAK_SHARPNESS)
+    , spectrum_peak_ratio(DEFAULT_SPECTRUM_PEAK_RATIO)
+    , spectrum_valley_depth(DEFAULT_SPECTRUM_VALLEY_DEPTH)
+    , spectrum_flatness(DEFAULT_SPECTRUM_FLATNESS)
+    , spectrum_symmetry(DEFAULT_SPECTRUM_SYMMETRY)
+    , neighbor_margin_db(DEFAULT_NEIGHBOR_MARGIN_DB)
+    , rssi_variance_enabled(true)
+    , confirm_count(DEFAULT_CONFIRM_COUNT)
+    , sensitive_mode(true) {
+    // sweep2/3/4 fields use in-class defaults: disabled
+    // mahalanobis_enabled uses in-class default (true)
+}
+
+
+
+// ========================================================================
+// ScanStatistics Implementation
+// ============================================================================
+
+ScanStatistics::ScanStatistics() noexcept
+    : total_scan_cycles(0)
+    , successful_cycles(0)
+    , failed_cycles(0)
+    , drones_detected(0)
+    , drones_evicted(0)
+    , max_rssi_dbm(RSSI_NOISE_FLOOR_DBM) {
+}
+
+void ScanStatistics::reset() noexcept {
+    total_scan_cycles = 0;
+    successful_cycles = 0;
+    failed_cycles = 0;
+    drones_detected = 0;
+    drones_evicted = 0;
+    max_rssi_dbm = RSSI_NOISE_FLOOR_DBM;
+}
+
+// ============================================================================
+// DroneScanner Implementation
+// ============================================================================
+
+DroneScanner::DroneScanner(DatabaseManager& database, HardwareController& hardware) noexcept
+    : database_(database)
+    , hardware_(hardware)
+    , state_(ScannerState::IDLE)
+    , config_()
+    , freq_lock_count_{0}
+    , locked_frequency_{0}
+    , track_start_time_{0}
+    , current_drone_type_{'\0', '\0', '\0', '\0', '\0'}
+    , drone_type_valid_{false}
+    , statistics_()
+    , tracked_drones_()
+    , tracked_count_{0}
+    , current_frequency_{0}
+    , pending_frequency_{0}
+    , pending_count_{0}
+    , missed_lock_count_{0}
+    , noise_blacklist_{}
+    , last_scan_time_{0}
+    , scanning_active_()
+    , alert_callback_(nullptr)
+    , mutex_()
+    , state_transition_allowed_()
+    , force_resume_flag_()
+    , dwell_request_()
+    , dwell_cycles_{0}
+    , lock_start_time_{0}
+    , confirm_start_time_{0}
+    , spectrum_sort_buf_{}
+    , envelope_buf_{}
+    , lock_timeout_count_{0}
+    , sweep_usable_buf_{}
+    , alert_callback_in_progress_()
+    , rssi_detector_()
+    , rssi_median_filter_()
+    , median_filter_enabled_{false}
+    , neighbor_margin_checker_()
+    , mahalanobis_detector_()
+    , waterfall_history_()
+    , adaptive_threshold_() {
+
+    // Initialize mutex
+    chMtxInit(&mutex_);
+
+    (void)rssi_detector_.initialize(DEFAULT_ALERT_RSSI_THRESHOLD_DBM);
+}
+
+DroneScanner::~DroneScanner() noexcept {
+    // Stop scanning if active
+    if (scanning_active_.test()) {
+        (void)stop_scanning();
+    }
+
+    // Note: Do NOT call chMtxDeinit - it doesn't exist in ChibiOS
+}
+
+ErrorCode DroneScanner::initialize() noexcept {
+    MutexLock<LockOrder::DATA_MUTEX> lock(mutex_);
+
+    if (state_ != ScannerState::IDLE) {
+        return ErrorCode::INITIALIZATION_INCOMPLETE;
+    }
+
+    ErrorCode hw_result = hardware_.initialize();
+    if (hw_result != ErrorCode::SUCCESS) {
+        return hw_result;
+    }
+
+    // Try to get first frequency from database
+    ErrorResult<FreqHz> freq_result = database_.get_next_frequency(0);
+    if (freq_result.has_value()) {
+        current_frequency_ = freq_result.value();
+    } else {
+        // Database empty or not loaded — scanner still works on default freq
+        current_frequency_ = MIN_FREQUENCY_HZ;
+    }
+
+    state_ = ScannerState::IDLE;
+    statistics_.reset();
+
+    return ErrorCode::SUCCESS;
+}
+
+// ============================================================================
+// Fast Scanner Integration Getters
+// ============================================================================
+
+uint32_t DroneScanner::get_freq_lock_count() const noexcept {
+    MutexTryLock<LockOrder::DATA_MUTEX> lock(mutex_);
+    if (!lock.is_locked()) {
+        return __atomic_load_n(&freq_lock_count_, __ATOMIC_RELAXED);
+    }
+    return freq_lock_count_;
+}
+
+void DroneScanner::set_freq_lock_count(uint32_t count) noexcept {
+    MutexLock<LockOrder::DATA_MUTEX> lock(mutex_);
+    freq_lock_count_ = count;
+}
+
+FreqHz DroneScanner::get_locked_frequency() const noexcept {
+    MutexLock<LockOrder::DATA_MUTEX> lock(mutex_);
+    return locked_frequency_;
+}
+
+// ============================================================================
+// Scanner Control Methods (Restored for functionality)
+// ============================================================================
+
+ErrorCode DroneScanner::start_scanning() noexcept {
+    MutexLock<LockOrder::DATA_MUTEX> lock(mutex_);
+
+    if (state_ == ScannerState::SCANNING) {
+        return ErrorCode::SUCCESS;
+    }
+
+    ErrorCode hw_result = hardware_.start_spectrum_streaming();
+    if (hw_result != ErrorCode::SUCCESS) {
+        return hw_result;
+    }
+
+    state_ = ScannerState::SCANNING;
+    scanning_active_.set();
+
+    return ErrorCode::SUCCESS;
+}
+
+ErrorCode DroneScanner::stop_scanning() noexcept {
+    MutexLock<LockOrder::DATA_MUTEX> lock(mutex_);
+
+    if (state_ == ScannerState::IDLE) {
+        return ErrorCode::SUCCESS;
+    }
+
+    state_ = ScannerState::IDLE;
+    scanning_active_.clear();
+
+    (void)hardware_.stop_spectrum_streaming();
+
+    return ErrorCode::SUCCESS;
+}
+
+ErrorCode DroneScanner::pause_scanning() noexcept {
+    MutexLock<LockOrder::DATA_MUTEX> lock(mutex_);
+    
+    if (state_ != ScannerState::SCANNING) {
+        return ErrorCode::SUCCESS;
+    }
+    
+    state_ = ScannerState::PAUSED;
+    return ErrorCode::SUCCESS;
+}
+
+ErrorCode DroneScanner::resume_scanning() noexcept {
+    MutexLock<LockOrder::DATA_MUTEX> lock(mutex_);
+    
+    if (state_ != ScannerState::PAUSED) {
+        return ErrorCode::SUCCESS;
+    }
+    
+    state_ = ScannerState::SCANNING;
+    return ErrorCode::SUCCESS;
+}
+
+void DroneScanner::force_resume_scanning() noexcept {
+    // Set flag — actual state transition happens inside perform_scan_cycle()
+    // under mutex protection. This avoids data race on state_ between
+    // scanner thread and UI thread.
+    force_resume_flag_.set();
+}
+
+void DroneScanner::request_dwell() noexcept {
+    // Set dwell request — scanner thread will check this BEFORE hopping frequency.
+    // This is the critical link: UI detects signal → requests dwell → scanner holds.
+    dwell_request_.set();
+}
+
+bool DroneScanner::try_consume_force_resume_flag() noexcept {
+    if (!force_resume_flag_.test_and_set()) {
+        return false;
+    }
+    force_resume_flag_.clear();
+    MutexLock<LockOrder::DATA_MUTEX> lock(mutex_);
+    if (state_ == ScannerState::LOCKING || state_ == ScannerState::TRACKING) {
+        state_ = ScannerState::SCANNING;
+        // Clear lock timing when force-resuming (consistent with perform_scan_cycle_internal)
+        lock_start_time_ = 0;
+        confirm_start_time_ = 0;
+        return true;
+    }
+    return false;
+}
+
+void DroneScanner::remove_drone_on_frequency(FreqHz frequency) noexcept {
+    MutexLock<LockOrder::DATA_MUTEX> lock(mutex_);
+    for (size_t i = 0; i < tracked_count_; ++i) {
+        if (tracked_drones_[i].frequency == frequency) {
+            tracked_count_--;
+            if (i < tracked_count_) {
+                tracked_drones_[i] = tracked_drones_[tracked_count_];
+            }
+            return;
+        }
+    }
+}
+
+void DroneScanner::increment_noise_count(FreqHz frequency) noexcept {
+    MutexLock<LockOrder::DATA_MUTEX> lock(mutex_);
+    increment_noise_count_internal(frequency);
+}
+
+void DroneScanner::increment_noise_count_internal(FreqHz frequency) noexcept {
+    // Find existing entry or first empty slot
+    // @pre Caller holds DATA_MUTEX
+    size_t empty_slot = MAX_NOISE_ENTRIES;
+    for (size_t i = 0; i < MAX_NOISE_ENTRIES; ++i) {
+        if (noise_blacklist_[i].freq == frequency) {
+            if (noise_blacklist_[i].count < 255) {
+                noise_blacklist_[i].count++;
+            }
+            return;
+        }
+        if (noise_blacklist_[i].freq == 0 && empty_slot == MAX_NOISE_ENTRIES) {
+            empty_slot = i;
+        }
+    }
+    // New entry
+    if (empty_slot < MAX_NOISE_ENTRIES) {
+        noise_blacklist_[empty_slot].freq = frequency;
+        noise_blacklist_[empty_slot].count = 1;
+    }
+}
+
+void DroneScanner::reset_noise_count(FreqHz frequency) noexcept {
+    for (size_t i = 0; i < MAX_NOISE_ENTRIES; ++i) {
+        if (noise_blacklist_[i].freq == frequency) {
+            noise_blacklist_[i].freq = 0;
+            noise_blacklist_[i].count = 0;
+            return;
+        }
+    }
+}
+
+bool DroneScanner::is_blacklisted(FreqHz frequency) const noexcept {
+    for (size_t i = 0; i < MAX_NOISE_ENTRIES; ++i) {
+        if (noise_blacklist_[i].freq == frequency) {
+            return noise_blacklist_[i].count >= NOISE_BLACKLIST_THRESHOLD;
+        }
+    }
+    return false;
+}
+
+bool DroneScanner::is_detection_window_allowed(uint8_t win_idx, FreqHz freq) const noexcept {
+    if (win_idx >= MAX_SWEEP_WINDOWS) return true;  // guard: malformed index never kills detection
+    return SweepProcessor::is_detection_window_allowed(
+        config_.sweep_det_win_start_mhz[win_idx],
+        config_.sweep_det_win_end_mhz[win_idx],
+        DETECTION_WINDOWS_PER_WINDOW, freq);
+}
+
+uint8_t DroneScanner::resolve_det_win_label_internal(uint8_t win_idx, FreqHz freq_hz) const noexcept {
+    // Stack: ~16 bytes. Flash: ~120 bytes. O(5) integer compares, no division
+    // (MHz-domain compare matches the SWP editor and the det-window gate).
+    if (win_idx >= MAX_SWEEP_WINDOWS) return 0;  // guard: malformed index never labels
+    const uint32_t freq_mhz = static_cast<uint32_t>(freq_hz / MHZ);
+    for (uint8_t i = 0; i < DETECTION_WINDOWS_PER_WINDOW; ++i) {
+        const uint32_t start_mhz = config_.sweep_det_win_start_mhz[win_idx][i];
+        const uint32_t end_mhz = config_.sweep_det_win_end_mhz[win_idx][i];
+        if (!is_det_win_slot_active(start_mhz, end_mhz)) continue;
+        if (freq_mhz >= start_mhz && freq_mhz <= end_mhz) {
+            return config_.sweep_det_win_name_idx[win_idx][i];
+        }
+    }
+    return 0;
+}
+
+ErrorCode DroneScanner::perform_scan_cycle() noexcept {
+    if (!scanning_active_.test()) {
+        return ErrorCode::SUCCESS;
+    }
+    
+    MutexLock<LockOrder::DATA_MUTEX> lock(mutex_);
+    
+    if (state_ == ScannerState::PAUSED || state_ == ScannerState::IDLE) {
+        return ErrorCode::SUCCESS;
+    }
+    
+    return perform_scan_cycle_internal();
+}
+
+ErrorCode DroneScanner::perform_scan_cycle_internal() noexcept {
+    // Check force-resume flag (set when max dwell expires)
+    if (force_resume_flag_.test_and_set()) {
+        force_resume_flag_.clear();
+        if (state_ == ScannerState::LOCKING || state_ == ScannerState::TRACKING) {
+            state_ = ScannerState::SCANNING;
+            // Clear lock timing when force-resuming
+            lock_start_time_ = 0;
+            confirm_start_time_ = 0;
+        }
+        dwell_cycles_ = 0;
+        return ErrorCode::SUCCESS;
+    }
+
+    // ABSOLUTE LOCK TIMEOUT: Force exit from LOCKING/TRACKING after MAX_LOCK_DURATION_MS
+    // This prevents infinite lock on noisy frequencies where signal intermittently exceeds threshold
+    if (state_ == ScannerState::LOCKING || state_ == ScannerState::TRACKING) {
+        if (lock_start_time_ != 0) {
+            const uint32_t lock_duration = chTimeNow() - lock_start_time_;
+            if (lock_duration >= MAX_LOCK_DURATION_MS) {
+                // Lock timeout exceeded - force transition to SCANNING
+                state_ = ScannerState::SCANNING;
+                freq_lock_count_ = 0;
+                locked_frequency_ = 0;
+                lock_start_time_ = 0;
+                confirm_start_time_ = 0;
+                dwell_cycles_ = 0;
+                lock_timeout_count_++;
+                // Continue to frequency hop (fall through to dwell check)
+            }
+        } else {
+            // Just entered LOCKING/TRACKING state - start timing
+            lock_start_time_ = chTimeNow();
+        }
+    } else {
+        // Not locked - clear timing
+        lock_start_time_ = 0;
+        confirm_start_time_ = 0;
+    }
+
+    // Check dwell request from UI thread (signal detected, hold frequency)
+    if (dwell_request_.test_and_set()) {
+        dwell_request_.clear();
+        dwell_cycles_ = 1;  // Start at 1 so should_dwell triggers immediately
+    }
+
+    // Dwell: if UI requested hold or state is LOCKING/TRACKING, skip frequency hop
+    const bool should_dwell = config_.dwell_enabled &&
+        (dwell_cycles_ > 0 || state_ == ScannerState::LOCKING || state_ == ScannerState::TRACKING);
+
+    if (should_dwell) {
+        dwell_cycles_++;
+
+        // Max dwell: 300ms total (6 cycles × 50ms).
+        // Enough for median filter to warm up (4 samples) + 2 more frames for
+        // reliable lock accumulation. At 60fps, 6 frames ≈ 6 increments of
+        // freq_lock_count_ toward MAX_FREQ_LOCK (10) → TRACKING transition.
+        // Reduced from 8 cycles (400ms) to allow faster return to scanning
+        // when multiple FPV transmitters are present in the band.
+        static constexpr uint8_t LOCAL_MAX_DWELL_CYCLES = 6;
+        const uint8_t max_dwell = config_.confirm_count_enabled
+            ? LOCAL_MAX_DWELL_CYCLES : (LOCAL_MAX_DWELL_CYCLES / 2);
+
+        if (dwell_cycles_ >= max_dwell) {
+            // Max dwell reached — force resume scanning so other frequencies
+            // get airtime (multi-target fairness).
+            //
+            // ANTI-DEADLOCK FIX (old bug: a strong persistent signal became
+            // permanently undetectable). Previously EVERY dwell expiry treated
+            // the locked frequency as noise: incremented its blacklist count
+            // AND removed the tracked drone. A real continuous carrier (analog
+            // FPV) re-detected on every visit re-added the drone, and after
+            // NOISE_BLACKLIST_THRESHOLD (3) expiries the frequency was
+            // blacklisted and skipped by the hop loop forever — detection
+            // could never run on it again, so reset_noise_count() (which only
+            // fires on a threat upgrade) could never clear the entry. Result:
+            // a signal at maximum RSSI with perfect shape became permanently
+            // invisible while still on the air.
+            //
+            // Correct semantics (per the blacklist contract "3+ force-resumes
+            // WITHOUT threat upgrade", scanner.hpp): a frequency that produced
+            // a tracked drone is a REAL signal — resume scanning, keep the
+            // tracker, never blacklist. Only a lock that never produced a
+            // drone (a noise spike holding the lock) is blacklisted; in that
+            // case there is no tracker to preserve and nothing to remove.
+            const FreqHz locked_freq = locked_frequency_;
+            const FreqHz mrg_hz = static_cast<FreqHz>(config_.freq_match_radius_mhz) * 1'000'000ULL;
+            const bool has_real_drone = (locked_freq != 0)
+                && find_nearest_drone_internal(locked_freq, mrg_hz).has_value();
+            if (!has_real_drone && config_.noise_blacklist_enabled && locked_freq != 0) {
+                increment_noise_count_internal(locked_freq);
+            }
+            force_resume_flag_.set();
+            dwell_cycles_ = 0;
+        }
+
+        // Stay on current frequency — do NOT hop
+        statistics_.successful_cycles++;
+        return ErrorCode::SUCCESS;
+    }
+
+    // No dwell — normal frequency hop
+    dwell_cycles_ = 0;
+    statistics_.total_scan_cycles++;
+
+    apply_rssi_decay();
+
+    // Try to get next frequency from database
+    ErrorResult<FreqHz> freq_result = database_.get_next_frequency(current_frequency_);
+
+    if (freq_result.has_value()) {
+        current_frequency_ = freq_result.value();
+
+        // Skip blacklisted frequencies
+        if (config_.noise_blacklist_enabled) {
+            bool found_clean_freq = false;
+            for (size_t skip_count = 0; skip_count < MAX_NOISE_ENTRIES; ++skip_count) {
+                if (!is_blacklisted(current_frequency_)) {
+                    found_clean_freq = true;
+                    break;
+                }
+                freq_result = database_.get_next_frequency(current_frequency_);
+                if (!freq_result.has_value()) {
+                    break;  // Database exhausted
+                }
+                current_frequency_ = freq_result.value();
+            }
+            
+            if (!found_clean_freq) {
+                // All frequencies are blacklisted - fallback to minimum frequency
+                current_frequency_ = MIN_FREQUENCY_HZ;
+            }
+        }
+    } else {
+        // Database empty — sweep through frequency range
+        if (current_frequency_ < MIN_FREQUENCY_HZ || current_frequency_ >= MAX_FREQUENCY_HZ) {
+            current_frequency_ = MIN_FREQUENCY_HZ;
+        } else {
+            current_frequency_ += FREQUENCY_STEP_HZ;
+            if (current_frequency_ > MAX_FREQUENCY_HZ) {
+                current_frequency_ = MIN_FREQUENCY_HZ;
+            }
+        }
+    }
+
+    ErrorCode tune_result = hardware_.tune_to_frequency(current_frequency_);
+    if (tune_result != ErrorCode::SUCCESS) {
+        statistics_.failed_cycles++;
+        return tune_result;
+    }
+
+    rssi_median_filter_.reset();
+    neighbor_margin_checker_.reset();
+
+    if (current_frequency_ != pending_frequency_) {
+        pending_frequency_ = 0;
+        pending_count_ = 0;
+        // Secondary pending belongs to the OLD frame: drop every slot on tune
+        // change or a stale secondary frequency would confirm instantly after
+        // the retune (FIX B6 tuneaway invalidation). Stack: 0. SRAM: 0 extra.
+        for (size_t s = 0; s < SECONDARY_SLOTS; ++s) {
+            secondary_pending_freq_[s] = 0;
+            secondary_pending_time_[s] = 0;
+            secondary_pending_count_[s] = 0;
+        }
+    }
+
+    statistics_.successful_cycles++;
+    return ErrorCode::SUCCESS;
+}
+
+ErrorCode DroneScanner::update_tracked_drones(
+    FreqHz frequency,
+    RssiValue rssi,
+    SystemTime timestamp
+) noexcept {
+    if (frequency < MIN_FREQUENCY_HZ || frequency > MAX_FREQUENCY_HZ) {
+        return ErrorCode::INVALID_PARAMETER;
+    }
+
+    if (rssi < RSSI_MIN_DBM || rssi > RSSI_MAX_DBM) {
+        return ErrorCode::INVALID_PARAMETER;
+    }
+
+    ErrorCode result = ErrorCode::SUCCESS;
+    {
+        MutexLock<LockOrder::DATA_MUTEX> lock(mutex_);
+        result = update_tracked_drone_internal(frequency, rssi, timestamp);
+    }
+    // ALERT DEFER (audit D-ALERT-LOCK): fire the staged threat alert AFTER
+    // DATA_MUTEX is released — the audio callback may busy-wait on a full
+    // baseband queue and would otherwise extend the lock hold (blocking the
+    // UI thread's setters and the frame TryLock). Stack: 0 bytes.
+    deliver_pending_alert();
+    return result;
+}
+
+FreqHz DroneScanner::get_spectrum_frequency() noexcept {
+    MutexTryLock<LockOrder::DATA_MUTEX> lock(mutex_);
+    if (lock.is_locked()) {
+        return current_frequency_;
+    }
+    return 0;
+}
+
+ErrorCode DroneScanner::process_spectrum_message(const ChannelSpectrum& spectrum, FreqHz frequency) noexcept {
+    MutexTryLock<LockOrder::DATA_MUTEX> lock(mutex_);
+
+    if (!lock.is_locked()) {
+        return ErrorCode::MUTEX_LOCK_FAILED;
+    }
+
+    if (frequency == 0) {
+        return ErrorCode::INVALID_PARAMETER;
+    }
+
+    // ChannelSpectrum has fixed-size array (256 bins), no empty check needed
+    // Track peak power for timeline display, fused with the RSSI scan below
+    // (single pass over usable bins — DC spike/edge bins carry no real signal
+    // energy and would crush timeline scaling; mirrors sweep path at :2206).
+    const int32_t raw_rssi = extract_rssi(spectrum, &last_peak_power_);
+
+    // Feed temporal history for multi-frame analysis (TBD, FHSS, Doppler)
+    waterfall_history_.push(spectrum.db.data());
+
+    // Median filter: reject single-sample noise spikes
+    // Feed every sample; use median only when enabled and filter is warm
+    rssi_median_filter_.add(raw_rssi);
+    const int32_t rssi = (median_filter_enabled_ && rssi_median_filter_.is_warm())
+        ? rssi_median_filter_.get_median()
+        : raw_rssi;
+
+    const SystemTime now = chTimeNow();
+
+    // Track whether the detection came from the multi-frame TBD integrator
+    // (below) rather than the single-frame shape/RSSI path. TBD already
+    // carries its own narrowband guard (tbd_peak_is_narrowband, MaxW
+    // semantics) — the B1 hard gate below must not kill it.
+    // Stack: 1 byte. SRAM: 0.
+    bool tbd_confirmed = false;
+
+    // ----- RSSI Hysteresis (Schmitt trigger) -----
+    // Reset waterfall history on frequency change — old frames are stale
+    if (frequency != last_hysteresis_freq_) {
+        last_hysteresis_freq_ = frequency;
+        waterfall_history_.reset();
+        clear_shape_veto();  // D5: veto lifetime == waterfall window lifetime
+    }
+
+    // Effective threshold: 2 dB harder to turn ON, 2 dB easier to stay ON
+    // Prevents signal toggling at the threshold boundary (8-bit FFT quantization
+    // causes ±1 bin fluctuation = ~0.19 dB, enough to toggle detection)
+    //
+    // FIX: Do NOT reset signal_present_ on frequency change. When the signal
+    // persists across frequency hops (scanner still in detection zone), hysteresis
+    // carries over — first frame on new freq uses the easier threshold. This is
+    // correct: the signal was confirmed present on the previous frequency.
+    // signal_present_ only resets when signal actually drops (lines 761/770).
+    const int32_t rssi_threshold = signal_present_
+        ? (config_.rssi_threshold_dbm - RSSI_HYSTERESIS_DB)
+        : (config_.rssi_threshold_dbm + RSSI_HYSTERESIS_DB);
+
+    int32_t effective_rssi = rssi;
+    bool signal_detected = false;
+
+    // Multi-peak shape analysis: find ALL independent signals in the 20 MHz frame.
+    // Primary detection (index 0 = strongest) drives hysteresis, TBD, and lock state.
+    // Secondary detections (index 1..N) are tracked as additional drones.
+    ShapeDetectionResult shape_result{};
+    bool has_shape_result = false;
+
+    if (config_.spectrum_detection_enabled) {
+        has_shape_result = analyze_spectrum_shape_multi(spectrum, shape_result, frequency);
+
+        if (has_shape_result && shape_result.count > 0) {
+            // Primary detection: strongest peak that passed shape filters.
+            // FIX (audit D6 — RSSI ATTRIBUTION): the gate AND the recorded
+            // strength now come from THIS peak (detections[0]), not from
+            // `rssi` (frame/median maximum). The old code gated on the frame
+            // maximum while tracking the shape-passed peak, so a weak drone
+            // peak below the threshold could ride a strong WiFi frame over
+            // the gate and be tracked with the WiFi's power (threat
+            // classification inflated). spectrum_rssi is a single bin of the
+            // SAME frame measured in the SAME cell set as extract_rssi, so it
+            // never exceeds the raw frame peak by construction.
+            const int32_t spectrum_rssi = shape_result.detections[0].rssi;
+            if (spectrum_rssi > rssi_threshold) {
+                signal_detected = true;
+                signal_present_ = true;
+                // Effective RSSI = the tracked peak itself, clamped to the
+                // legacy excess bound: a shape-validated peak may sit at most
+                // SHAPE_RSSI_MAX_EXCESS_DB above the (possibly median-filtered)
+                // frame RSSI — protects statistics/threat classification from
+                // conversion outliers when the median lags a fresh signal.
+                // PATCH 1 (audit D6 follow-up): floor the CAP at the gate that
+                // just fired. When the median lags the fresh peak by more than
+                // SHAPE_RSSI_MAX_EXCESS_DB + hysteresis, the raw cap
+                // (rssi + 10) can sit BELOW rssi_threshold while
+                // signal_detected == true — that fed rssi_detector_ (below)
+                // a below-gate sample (violating its "above-threshold only"
+                // contract) and tracked a drone UNDER the detection gate.
+                // Invariant now: signal_detected ⇒ effective_rssi >= threshold.
+                // Stack: ~4 bytes (2 register locals). SRAM: 0. Flash: ~24 B.
+                constexpr int32_t SHAPE_RSSI_MAX_EXCESS_DB = 10;
+                const int32_t excess_cap = rssi + SHAPE_RSSI_MAX_EXCESS_DB;
+                if (spectrum_rssi <= excess_cap) {
+                    effective_rssi = spectrum_rssi;
+                } else {
+                    effective_rssi = (excess_cap > rssi_threshold)
+                        ? excess_cap
+                        : rssi_threshold;
+                }
+            } else if (signal_present_) {
+                signal_present_ = false;
+            }
+        } else {
+            // Shape analysis failed — no drone signal on this frequency.
+            // Must reset signal_present_ so hysteresis doesn't carry over
+            // from a previous frequency (prevents false easy threshold on
+            // next frequency when no signal was detected here).
+            signal_present_ = false;
+        }
+    } else {
+        signal_detected = (rssi > rssi_threshold);
+        if (signal_detected) {
+            signal_present_ = true;
+        } else if (signal_present_) {
+            signal_present_ = false;
+        }
+    }
+
+    // ---- Track-Before-Detect (TBD) Pass ----
+    // When single-frame detection fails, check if multi-frame integration
+    // confirms a weak signal. Uses WaterfallHistory to accumulate power
+    // across recent frames. Provides ~9 dB SNR gain (8 frames = 3× sensitivity).
+    // Only runs when waterfall_history_ has enough frames and single-frame failed.
+    //
+    // TBD-RESURRECTION GUARD (FIX): shape_rejected_after_margin blocks TBD for
+    // this frame whenever a candidate cleared the margin gate but failed a
+    // shape step — TBD honors width gates only, so without this flag the
+    // Valley/Sharp/Flat/Sym rejections were silently resurrected
+    // TBD_MIN_FRAMES later and every shape setting below the gate was dead.
+    // Targets BELOW the margin gate keep the integration path (weak-signal
+    // purpose of TBD is preserved).
+    if (!signal_detected && waterfall_history_.is_warm(TBD_MIN_FRAMES)
+        && config_.spectrum_detection_enabled
+        && !shape_result.shape_rejected_after_margin) {
+
+        // Compute noise floor for TBD narrowband guard.
+        // FIX: When shape analysis found nothing (CFAR peak_count == 0),
+        // shape_result.noise_floor stays at 0 (zero-initialized struct).
+        // Passing 0 to tbd_peak_is_narrowband() makes elevated_threshold =
+        // peak/3 instead of noise_floor + margin/3, corrupting the width
+        // measurement: weak signals appear wider (false reject) and strong
+        // wideband signals may appear narrower (false accept). Compute
+        // independently from the current frame's raw FFT data to guarantee
+        // a correct noise floor regardless of shape analysis outcome.
+        // Stack: 0 bytes — REUSES spectrum_sort_buf_ (256 B class member)
+        // instead of a 256-byte local (the largest stack frame in the DB
+        // path). The shape chain that also uses this scratch (Step 1
+        // quickselect + Step 12 kurtosis) has fully completed before this
+        // block runs — sequential, same scanner thread, no overlap.
+        // @pre This TBD block must never interleave with
+        //      analyze_spectrum_shape_multi()/apply_shape_filters() (true by
+        //      construction: it runs strictly AFTER them in
+        //      process_spectrum_message).
+        uint8_t* tbd_usable = spectrum_sort_buf_;
+        size_t tbd_usable_count = 0;
+        for (size_t i = FFT_EDGE_SKIP; i < FFT_DC_SPIKE_START; ++i) {
+            tbd_usable[tbd_usable_count++] = spectrum.db[i];
+        }
+        for (size_t i = FFT_DC_SPIKE_END; i < (FFT_BIN_COUNT - FFT_EDGE_SKIP); ++i) {
+            tbd_usable[tbd_usable_count++] = spectrum.db[i];
+        }
+        const uint8_t tbd_noise_floor = (tbd_usable_count > 0)
+            ? quickselect_percentile(tbd_usable, tbd_usable_count, 25)
+            : 0;
+
+        // Find peak bin from newest frame
+        size_t tbd_peak_bin = FFT_EDGE_SKIP;
+        uint8_t tbd_peak_power = 0;
+        for (size_t i = FFT_EDGE_SKIP; i < FFT_BIN_COUNT - FFT_EDGE_SKIP; ++i) {
+            if (i >= FFT_DC_SPIKE_START && i < FFT_DC_SPIKE_END) continue;
+            const uint8_t max_power = waterfall_history_.get_max_across_frames(i);
+            if (max_power > tbd_peak_power) {
+                tbd_peak_power = max_power;
+                tbd_peak_bin = i;
+            }
+        }
+
+        // Check if this bin was active in enough recent frames
+        // FIX: Use correct inverse of spectrum_value_to_dbm encoding.
+        // Forward:  dBm = (value - 255) / 5 - total_gain
+        // Inverse:  value = (dBm + total_gain) * 5 + 255
+        // Previously used legacy approximation (rssi_threshold + 120) which
+        // produced threshold ~37 vs actual ~170, making TBD pass everything.
+        const int32_t total_gain_tbd = get_current_total_gain();
+        // Confirm threshold = inverse-encoded RSSI term (Sens, here with the
+        // DB hysteresis offset) FLOORED at this frame's noise shelf +
+        // TBD_MIN_ELEVATION_UNITS. Single derivation shared with the sweep
+        // confirm gate and the sweep frame gate — without the floor the RSSI
+        // term clamps to 0 for any total gain <= 54 dB (default Sens) and
+        // "active_frames >= TBD_MIN_FRAMES" degrades to "non-zero in N frames",
+        // which pure noise satisfies.
+        const uint8_t threshold = sweep_tbd_effective_threshold(
+            sweep_tbd_threshold_units(rssi_threshold, total_gain_tbd),
+            tbd_noise_floor);
+        const uint8_t active_frames = waterfall_history_.count_above_threshold(tbd_peak_bin, threshold);
+
+        // PRESENT-NOW requirement (FIX): frame age 0 in the waterfall IS the
+        // current frame (pushed at the top of this handler), so history alone
+        // can never confirm. A bursty emitter must be radiating in THIS frame;
+        // this closes the "rejected frames 1..3, clean frame 4 confirms from
+        // stale history" resurrection path (paired with the shape-rejection
+        // gate above). Sensitivity-neutral: confirmation just waits for an
+        // "up" flicker of a marginal target instead of confirming during a
+        // fade.
+        // SHAPE-VETO (D5 cross-frame fix): bins rejected by the shape chain
+        // while above the margin gate earlier in THIS waterfall window stay
+        // vetoed — a peak flickering below the gate no longer slips past the
+        // per-frame guard (shape_rejected_after_margin) and gets resurrected
+        // with width-only validation.
+        if (active_frames >= TBD_MIN_FRAMES
+            && spectrum.db[tbd_peak_bin] >= threshold
+            && !shape_vetoed(tbd_peak_bin)) {
+            // Multi-frame confirmed — compute integrated RSSI
+            const uint16_t integrated = waterfall_history_.get_integrated_power(tbd_peak_bin);
+            const uint8_t avg_power = static_cast<uint8_t>(integrated / waterfall_history_.size());
+            const int32_t tbd_rssi = spectrum_value_to_dbm(avg_power, total_gain_tbd);
+
+            // NARROWBAND GUARD (MaxW): TBD integrates power only and never
+            // runs apply_shape_filters(), so a persistent WiFi/BT flat-top
+            // rejected by MaxW single-frame was re-confirmed after 3 frames
+            // and tracked as a drone — the user's MaxW setting was silently
+            // ignored with bypass OFF. Re-enforce the MaxW width semantics on
+            // the multi-frame ENVELOPE (union of bin positions across the
+            // waterfall window): wideband targets must stay rejected even
+            // when an individual frame catches a narrow slice.
+            // FIX: Use tbd_noise_floor (computed from current frame) instead of
+            // shape_result.noise_floor (0 when shape analysis found nothing).
+            if (tbd_rssi > rssi_threshold &&
+                tbd_peak_is_narrowband(
+                    tbd_peak_bin, FFT_BIN_COUNT,
+                    tbd_noise_floor, FFT_EDGE_SKIP)) {
+                signal_detected = true;
+                signal_present_ = true;
+                effective_rssi = tbd_rssi;
+                tbd_confirmed = true;
+            }
+        }
+    }
+
+    if (signal_detected) {
+        // FIX B1 (hard shape gate, defense-in-depth): when spectrum shape
+        // detection is enabled, a REJECTED shape verdict must be final. In the
+        // current pipeline signal_detected already implies (has_shape_result
+        // || tbd_confirmed) — the only setters are the shape-gated primary
+        // (line ~761), the RSSI-only opt-out branch (unreachable when enabled),
+        // and the narrowband-guarded TBD — so this gate is normally a no-op.
+        // It exists to keep DB-scan parity with process_spectrum_sweep()'s
+        // any_peak_passed_shape gate against FUTURE RSSI fallbacks: any new
+        // setter that is neither shape-validated nor TBD-guarded is dropped
+        // here instead of silently re-tracking WiFi/BT flat-tops.
+        // EXEMPT: tbd_confirmed — the multi-frame integrator carries its own
+        // narrowband guard (MaxW envelope semantics); it is a second opinion,
+        // not a bypass.
+        // Stack: 0 bytes. SRAM: 0. Statistics already updated above.
+        if (config_.spectrum_detection_enabled && !has_shape_result && !tbd_confirmed) {
+            signal_present_ = false;
+            return ErrorCode::SUCCESS;  // Shape rejected — no track, no dwell
+        }
+        // NOTE: no exception/detection-window filter here — the detection-window
+        // gate is a SWEEP-mode concept (see apply_sweep_tracking()); normal DB
+        // scanning accepts every shape-validated channel detection.
+
+        // Neighbor margin check (if enabled): center freq must dominate neighbors
+        // This eliminates wideband noise false positives (WiFi, BT, microwave)
+        // The check guards RSSI-only and TBD detections unconditionally.
+        // SKIPPED for shape-validated detections ONLY when the shape chain is
+        // effectively ARMED — then the chain owns the wideband verdict and the
+        // margin check would wrongly reject the weaker peak of a dual-carrier
+        // emitter (FPV video + audio subcarrier scanned as separate DB
+        // channels) whenever the other carrier is stronger.
+        // FIX (audit D-B — DISARMED-CHAIN GAP): under the legacy PERMISSIVE
+        // defaults
+        // (MaxW >= 114 = no measurable cap, Sharp <= 100 = math dead-band,
+        // Flat = 0) a WiFi/BT flat-top passes Steps 3-12 trivially, so the
+        // old unconditional skip left DB scan with NO wideband gate at all
+        // (Step 6c is sweep-only; Mahalanobis / RSSI-variance historically
+        // defaulted OFF),
+        // while constants.hpp promises DB flat-top rejection to exactly this
+        // post-filter. When the chain is DISARMED the check now also runs for
+        // shape-validated verdicts; arming Flat/MaxW/Sharp restores the
+        // legacy skip. The 2026-10 strict defaults (MaxW = 110 [A-2: AT the
+        // DB extent cap — INERT in DB, see the MaxW term below; the chain is
+        // armed by Sharp = 165 / Flat = 25 instead], Sharp = 165,
+        // Flat = 25) leave the chain ARMED at Sens OFF, so at current
+        // defaults the legacy skip applies and the chain owns the verdict.
+        // Stack: ~12 bytes (bools + locals, registers). SRAM: 0. Flash: ~64 B.
+        const bool shape_validated = has_shape_result;
+        // Armed = the chain, AT ITS EFFECTIVE stringency, can still reject a
+        // wideband flat top: raw MaxW below the DB DC-gap extent cap
+        // (DB_EXTENT_CAP_BINS = 110 — the Step-4 walk / emission_extent()
+        // can never measure MORE in DB, so a MaxW >= cap rejects nothing
+        // there; the sweep-side cap SWEEP_EXTENT_CAP_BINS = 114 does NOT
+        // apply here — this arming site is DB-only, F2 fix 2026-10: the
+        // sweep constant made the default MaxW = 110 read ARMED in DB while
+        // the chain could reject nothing — the exactly documented D-B
+        // disarmed-chain hole reopened), sharpness above the documented
+        // dead-band (51..100 can never reject — audit D5), or Flat below
+        // its effective ceiling (FLATNESS_EFFECTIVE_CEILING = 99: a 99-bar
+        // rejects only the synthetic pct == 100 — an abstention, F1 fix
+        // 2026-10). Valley/Symmetry are NOT wideband gates (README §14:
+        // Step 6c/MaxW/Flat own wideband) and deliberately do not count
+        // here.
+        // SENS EASED (audit M3): the raw-config test delegated the
+        // wideband verdict to steps that SHAPE_ADAPT_* w-easing had
+        // simultaneously relaxed toward their permissive floors — in the
+        // gate..gate+SLACK band the chain was effectively DISARMED while
+        // Step 13 stayed skipped as "armed". REV. 2 (dependency audit):
+        // the wideband limits come from the SAME values apply_shape_filters
+        // Steps 6/7/10 consume — MaxW is read raw from config (eased_maxw_bins
+        // removed), Sharp/Flat from eased_sharpness_limit /
+        // eased_flatness_limit — so the test and the chain cannot drift,
+        // instead of hand-copied formulas glued by comments. With Sens OFF
+        // (w = 100) the Sharp/Flat helpers collapse to the raw config values. D-ARM (2026-10): the Sharp/Flat no-op ceilings
+        // here are the SAME shared constants (SHARPNESS_NOOP_CEILING,
+        // FLATNESS_EFFECTIVE_CEILING) the similarity-score arming in
+        // apply_shape_filters now consumes — the score denominator and
+        // the wideband-ownership test can no longer disagree about what
+        // "informative" means (previously Step 13 already disarmed Flat =
+        // 100 while the score still took its always-pass seat).
+        // FLAT ARM MIRRORS THE THREE OUTER STEP-10 RUN
+        // GUARDS (the step's inner effective_width > 4 narrowband guard
+        // only ever ABSTAINS for narrow signals, never for the wideband
+        // flat-top threat Step 13 exists to protect):
+        // Flat > 0 (at F = 0 the step never RUNS), peak margin >=
+        // flatness_min_peak_margin(rssi_sens) (40 when rssi_sens <= 0,
+        // Sens <= 75 — below it Step 10 abstains, so a flat config alone
+        // cannot own the verdict), and adapt_w > 0 (w == 0 ⇒ the EASED
+        // seat abstains, D-W0). Note the A-1 raw fallback can make Step 10
+        // actually RUN at w == 0 (raw_armed_flat has no w term) — the
+        // mirror keeps its w > 0 term anyway: disarmed here ⇒ the neighbor
+        // post-filter still runs once, never a skipped filter (safe
+        // direction). The FLAT_WIDE_BAR_PCT judgment cap likewise never
+        // reaches this mirror: it lowers a PASS/FAIL limit only inside an
+        // already-armed seat, which this arming test already covers via
+        // the uncapped eased value.
+        // A-3 WAIVER (2026-10): the in-frame chain also arms Flat when
+        // effective_width >= FLATNESS_WIDE_WAIVER_BINS (40 bins ≈ 3.1 MHz)
+        // even below the margin floor. This mirror deliberately does NOT
+        // add the width term: ShapeDetection carries no width, and
+        // over-claiming arming here would SKIP the neighbor post-filter
+        // for a candidate the chain might not have fully owned (the unsafe
+        // direction). The safe asymmetry: a weak-wide candidate under a
+        // disarmed-MaxW+Sharp config gets ONE extra neighbor pass — a
+        // cheap FP rejection, never a missed detection.
+        // Corrections vs legacy: Flat limits in the abstention band 99..100
+        // (a 99-bar rejects only the synthetic pct == 100 — audit F1)
+        // counted as "armed" although they can never reject a real flat
+        // top ⇒ now DISARMED; Flat = 0 stays DISARMED
+        // (audit D-B, legacy permissive set — no longer the defaults);
+        // with Sens OFF + Flat > 0 + margin < 40
+        // legacy read "armed" while Step 10 never ran — this reads
+        // DISARMED (STRICTER, closes that D-B-shaped hole in the raw
+        // regime). Valley/Symmetry are NOT wideband gates and do not
+        // count here. Computed ONLY when shape_validated: otherwise Step 13
+        // is entered unconditionally via !shape_validated and every temp
+        // below would be dead weight (+32 B stack, ~96 B flash for a value
+        // nobody reads).
+        // Stack: +24 B (inner-scope temps, register-allocatable). SRAM: 0.
+        // Flash: ~120 B. No FP, no locks, same thread as the chain.
+        // MaxW arming compares against DB_EXTENT_CAP_BINS (constants.hpp,
+        // derived from the FFT window constants) — NOT the old local 114
+        // (the SWEEP cap): this site is DB-only, and at the shipped
+        // MaxW = 110 the sweep constant read `110 < 114` = ARMED, which
+        // skipped the neighbor post-filter exactly when the documented
+        // disarmed-chain config (Sharp <= 100 + Flat = 0) needed it (F2).
+        // SHARPNESS_NOOP_CEILING / FLATNESS_EFFECTIVE_CEILING come from
+        // shape_gate_logic.hpp / constants.hpp (single author, audit D-ARM
+        // + F1): the similarity-score arming in apply_shape_filters uses the
+        // identical constants, so `armed_sharp_eff > 100` and
+        // `armed_flat_eff < 99` mean the same thing in both places.
+        // ⇒ shape_validated by construction (set only inside the guard);
+        // the Step 13 predicate below still keeps its explicit
+        // !shape_validated term so a future refactor of this block can
+        // never silently re-open the RSSI-only/TBD paths (audit D-B).
+        bool shape_chain_armed = false;
+        if (shape_validated) {
+            const uint8_t armed_primary_margin =
+                (shape_result.count > 0 &&
+                 shape_result.detections[0].peak_power > shape_result.noise_floor)
+                    ? static_cast<uint8_t>(shape_result.detections[0].peak_power -
+                                           shape_result.noise_floor)
+                    : uint8_t{0};
+            const uint8_t armed_w = config_.sensitive_mode
+                ? shape_adapt_weight(armed_primary_margin, shape_gate_margin())
+                : uint8_t{100};
+            const uint16_t armed_w2 =
+                static_cast<uint16_t>(armed_w) * static_cast<uint16_t>(armed_w);
+            // MaxW arming reads the RAW config value (eased_maxw_bins removed
+            // — its tombstone at the top of this file). Previously the arming
+            // test consumed the EASED 1.5× value while the chain enforced the
+            // raw one, so at MaxW=100 with w≈0 the test read 150 ≥ the cap
+            // and concluded "MaxW cannot reject" even though the chain's raw
+            // MaxW=100 CAN reject a 110-bin emission. Both now read the same
+            // raw number — arming and chain cannot drift. F2 fix (2026-10):
+            // the comparison is against the DB cap (110), not the sweep cap
+            // (114) — at the shipped MaxW = 110 the sweep constant read
+            // "can reject" in DB where the measurable extent can NEVER
+            // exceed 110, so the neighbor post-filter was wrongly skipped
+            // under a Sharp<=100 + Flat=0 config (the documented D-B hole).
+            const int32_t armed_sharp_eff =
+                eased_sharpness_limit(config_.spectrum_peak_sharpness, armed_w2);
+            const uint16_t armed_flat_eff =
+                eased_flatness_limit(config_.spectrum_flatness, armed_w2);
+            // Step-10 run-guard parity (rev. 2): all three gates of the
+            // flat step, evaluated on THIS frame's primary peak — an armed
+            // Flat verdict requires the step to actually RUN for it.
+            const bool armed_flat_runs =
+                (config_.spectrum_flatness > 0) &&
+                (armed_primary_margin >=
+                 flatness_min_peak_margin(rssi_sens_units(config_))) &&
+                (!config_.sensitive_mode || armed_w > 0);
+            // PARALLEL SHAPE (Sens ON): a candidate accepted by the SIMILARITY
+            // SCORE may carry one dissenting shape filter (see
+             // shape_sim_threshold_pct) — the in-frame chain did NOT fully own
+            // the wideband verdict, so the neighbor-margin post-filter must
+            // still run for it. Legacy and full-score Sens both report
+            // similarity_pct == 100 (published only on success, and a legacy
+            // success implies sim_pass == sim_armed by construction), so this
+            // term is a no-op whenever the score did not relax anything.
+            const bool shape_fully_owned =
+                (shape_result.count == 0) ||
+                (shape_result.detections[0].similarity_pct >= 100);
+            shape_chain_armed = shape_fully_owned &&
+                ((config_.spectrum_max_width < DB_EXTENT_CAP_BINS) ||
+                 (armed_sharp_eff > SHARPNESS_NOOP_CEILING) ||
+                 (armed_flat_runs &&
+                  (armed_flat_eff < FLATNESS_EFFECTIVE_CEILING)));
+        }
+        // Step 13 (README §14 chain): Neighbor-margin tracking post-filter.
+        if (config_.neighbor_margin_db > 0 && (!shape_validated || !shape_chain_armed)) {
+            neighbor_margin_checker_.add(frequency, effective_rssi);
+            if (!neighbor_margin_checker_.check_margin(frequency, effective_rssi, config_.neighbor_margin_db)) {
+                // Current frequency not stronger than neighbors — wideband noise
+                return ErrorCode::SUCCESS;
+            }
+        }
+
+        // Feed RSSI detector only with above-threshold samples
+        // to prevent noise from polluting trend analysis
+        (void)rssi_detector_.process_rssi_sample(effective_rssi, now);
+
+        bool should_update = true;
+
+        if (config_.confirm_count_enabled) {
+            // Confirm count: require configurable N detections on same frequency
+            // before creating a drone. Prevents noise spikes from adding phantom drones.
+            //
+            // FIX: Added CONFIRM_TIMEOUT_MS to prevent infinite waiting on noisy frequencies.
+            // On 2400 MHz with intermittent noise, pending_count_ may never reach
+            // config_.confirm_count, causing scanner to wait forever.
+
+            if (frequency != pending_frequency_) {
+                // New frequency - start fresh confirmation
+                pending_frequency_ = frequency;
+                pending_count_ = 1;
+                confirm_start_time_ = now;  // Start confirmation timer
+            } else if (pending_count_ < config_.confirm_count) {
+                // Still accumulating confirmations on same frequency
+                pending_count_++;
+            }
+
+            // CONFIRM TIMEOUT: Force continue if taking too long to gather confirmations
+            // This prevents indefinite blocking on frequencies with intermittent noise.
+            if (confirm_start_time_ != 0) {
+                const uint32_t confirm_elapsed = now - confirm_start_time_;
+                if (confirm_elapsed >= CONFIRM_TIMEOUT_MS) {
+                    // Timeout exceeded - give up on confirmation, allow frequency hop
+                    // Blacklist this frequency to prevent re-triggering on intermittent noise
+                    // NOTE: Must use _internal variant — DATA_MUTEX is already held by caller
+                    if (config_.noise_blacklist_enabled && frequency != 0) {
+                        increment_noise_count_internal(frequency);
+                    }
+                    pending_frequency_ = 0;
+                    pending_count_ = 0;
+                    confirm_start_time_ = 0;
+                    // Continue to next part of logic (fall through to existing drone check)
+                }
+            }
+
+            ErrorResult<size_t> existing = find_nearest_drone_internal(
+                frequency, static_cast<FreqHz>(config_.freq_match_radius_mhz) * 1'000'000ULL);
+            if (!existing.has_value() && pending_count_ < config_.confirm_count) {
+                should_update = false;  // waiting for more confirmations
+            }
+        }
+
+        // Reuse the index returned by update_tracked_drone_internal (via out_index)
+        // instead of a second find_nearest_drone_internal() O(n) search.
+        // out_index is set on every SUCCESS path (existing drone, new drone, and
+        // the RSSI-variance rejection early return).
+        // When should_update is false (confirm count still accumulating), no drone
+        // exists and every consumer below is gated on should_update, so the stale
+        // SIZE_MAX index is never dereferenced.
+        size_t drone_idx = SIZE_MAX;
+        if (should_update) {
+            // Bin-corrected display frequency of THIS detection (0 when the
+            // shape step produced none). The tracker stores it only when the
+            // sample is a record peak, so a weak frame can no longer overwrite
+            // the record's signature — that used to be an unconditional
+            // set_measured_frequency() right after this call.
+            const FreqHz measured_freq =
+                (has_shape_result && shape_result.count > 0)
+                    ? shape_result.detections[0].frequency
+                    : 0;
+            const ErrorCode err = update_tracked_drone_internal(
+                frequency,
+                effective_rssi,
+                now,
+                &drone_idx,
+                measured_freq
+            );
+            if (err != ErrorCode::SUCCESS) {
+                return err;
+            }
+        }
+
+        // Reset decay counters for detected drone — signal confirmed present
+        if (should_update && drone_idx < tracked_count_) {
+            tracked_drones_[drone_idx].reset_missed();
+            tracked_drones_[drone_idx].rssi_decrease_counter_ = 0;
+        }
+
+        // NOTE: the bin-corrected display frequency for the primary detection is
+        // stored by update_tracked_drone_internal(..., measured_freq) above —
+        // and only when that detection is a record peak. The lookup key
+        // (`frequency`) stays the tune center: identity, DB type, confirm/lock
+        // state must remain exact on the tune frequency.
+
+        // Update max RSSI statistic
+        if (effective_rssi > statistics_.max_rssi_dbm) {
+            statistics_.max_rssi_dbm = effective_rssi;
+        }
+
+        // Frequency lock state machine
+        if (frequency == locked_frequency_) {
+            // Same frequency as locked — accumulate persistence count
+            missed_lock_count_ = 0;  // Reset miss counter on successful detection
+            if (freq_lock_count_ < MAX_FREQ_LOCK) {
+                freq_lock_count_++;
+            }
+            // Transition: LOCKING → TRACKING after sustained lock
+            if (freq_lock_count_ >= MAX_FREQ_LOCK && state_ == ScannerState::LOCKING) {
+                state_ = ScannerState::TRACKING;
+            }
+        } else {
+            // Different frequency detected
+            if (state_ == ScannerState::SCANNING) {
+                // No active lock — jump to new frequency immediately
+                locked_frequency_ = frequency;
+                freq_lock_count_ = 1;
+                missed_lock_count_ = 0;
+                state_ = ScannerState::LOCKING;
+                lock_start_time_ = chTimeNow();  // Start lock timing
+                confirm_start_time_ = 0;  // Reset confirm timer (not applicable for new lock)
+                // CRITICAL: Request scanner thread to hold frequency.
+                // Without this, the scanner thread hops to the next DB entry
+                // before the UI thread can transition state to LOCKING.
+                dwell_request_.set();
+            } else if (state_ == ScannerState::LOCKING || state_ == ScannerState::TRACKING) {
+                // Already locked — don't jump to transient signal.
+                // The current lock is more valuable than a momentary spike.
+                // Continue accumulating on the locked frequency.
+                // Note: The "different frequency" here is likely noise or interference
+                // on the locked frequency, not a genuine signal on another frequency.
+            }
+            // No action needed — stay in current state
+        }
+    } else {
+        // No signal on this frequency
+        // Decay is handled by apply_rssi_decay() every CYC cycles.
+        // Here we only handle lock cleanup.
+
+        // Only break lock if we're tuned to the locked freq and it's gone
+        if (locked_frequency_ != 0 && frequency == locked_frequency_) {
+            // Use configurable miss_tolerance (independent of confirm_count).
+            // Default 4 consecutive misses (~66ms) before breaking lock.
+            // Higher values tolerate more FHSS/burst fading without dropping lock.
+            missed_lock_count_++;
+            if (missed_lock_count_ >= config_.miss_tolerance) {
+                freq_lock_count_ = 0;
+                locked_frequency_ = 0;
+                missed_lock_count_ = 0;
+                if (state_ == ScannerState::LOCKING || state_ == ScannerState::TRACKING) {
+                    state_ = ScannerState::SCANNING;
+                }
+            }
+        } else {
+            missed_lock_count_ = 0;
+        }
+        // If tuned to a non-locked freq and no signal: normal scanning, ignore
+    }
+
+    // ---- Secondary detection tracking (multi-peak) ----
+    // Track additional independent signals found in the same 20 MHz FFT frame.
+    // Primary detection (index 0) was already handled above with full hysteresis,
+    // TBD, confirm count, and lock state machine.
+    // FIX B6: secondaries must confirm stability like the primary path (own
+    // per-slot pending counters keyed by FREQUENCY, not by CFAR rank position),
+    // instead of creating tracks instantly. A single-frame ripple otherwise
+    // becomes a track without confirm/TBD/lock. Stack: ~32 bytes (locals only,
+    // pending state lives in member arrays).
+    if (has_shape_result && shape_result.count > 1 && signal_detected) {
+        // Slot tolerance is BIN-LOCAL, not the tracker merge radius: two CFAR
+        // peaks inside one 20 MHz frame must confirm INDEPENDENTLY, while the
+        // 10 MHz merge radius would fuse them into one slot. Slots re-arm on
+        // equality (bin-quantized RF: stable emitter => identical det_freq
+        // frame to frame), any drift re-arms. Two-bin slop absorbs a 1-bin
+        // CFAR jitter (78 kHz) without fusing distinct emitters.
+        // Stack: 0 (scalar). SRAM: 0 extra.
+        constexpr FreqHz SEC_BIN_HZ = DB_CAPTURE_RATE_HZ / FFT_BIN_COUNT;
+        constexpr FreqHz SEC_TOL_HZ = SEC_BIN_HZ * static_cast<FreqHz>(2);
+        for (size_t d = 1; d < shape_result.count; ++d) {
+            const FreqHz det_freq = shape_result.detections[d].frequency;
+            const int32_t det_rssi = shape_result.detections[d].rssi;
+
+            // Skip if frequency is out of valid range
+            if (det_freq < MIN_FREQUENCY_HZ || det_freq > MAX_FREQUENCY_HZ) continue;
+
+            if (det_rssi < config_.rssi_threshold_dbm) continue;  // guard
+            // NOTE: no detection-window gate here — it is a SWEEP-mode concept
+            // (see apply_sweep_tracking()); DB scan accepts every confirmed
+            // channel detection, same as the primary path below.
+
+            // FIX CRITICAL-1: honor confirm_count_enabled. When the user opts
+            // out of confirmation, the primary path tracks from frame one —
+            // secondaries must not stay stricter than the primary.
+            if (!config_.confirm_count_enabled) {
+                (void)update_tracked_drone_internal(det_freq, det_rssi, now);
+                continue;
+            }
+
+            // FIX CRITICAL-2: slot = pending within bin tolerance, else a free
+            // slot. Rank position (d-1) flips with +-1 dB power jitter and
+            // would re-arm every frame (liveness failure: two stable drones
+            // never confirm when they swap CFAR order). Tolerance is BIN-LOCAL
+            // (2 bins ~= 156 kHz): the 10 MHz tracker merge radius would fuse
+            // two independent in-frame emitters into one slot.
+            size_t slot = SECONDARY_SLOTS;  // sentinel: no usable slot
+            size_t free_slot = SECONDARY_SLOTS;
+            for (size_t s = 0; s < SECONDARY_SLOTS; ++s) {
+                if (secondary_pending_freq_[s] == 0) {
+                    if (free_slot >= SECONDARY_SLOTS) free_slot = s;
+                    continue;
+                }
+                const FreqHz diff = (det_freq > secondary_pending_freq_[s])
+                    ? (det_freq - secondary_pending_freq_[s])
+                    : (secondary_pending_freq_[s] - det_freq);
+                if (diff <= SEC_TOL_HZ) {
+                    slot = s;
+                    break;
+                }
+            }
+            if (slot >= SECONDARY_SLOTS) {
+                if (free_slot >= SECONDARY_SLOTS) continue;  // all slots owned by others
+                slot = free_slot;
+                secondary_pending_freq_[slot] = det_freq;
+                secondary_pending_count_[slot] = 1;
+                secondary_pending_time_[slot] = now;
+                continue;
+            }
+            // FIX HIGH-1: confirm window. A lone sighting must expire like the
+            // primary CONFIRM_TIMEOUT_MS instead of confirming minutes later.
+            // NOTE: no drift re-check here — slot match above already enforces
+            // diff <= SEC_TOL_HZ, so a re-arm on drift is unreachable by
+            // construction (kept single-gate to avoid dead branches).
+            if ((now - secondary_pending_time_[slot]) >= CONFIRM_TIMEOUT_MS) {
+                secondary_pending_freq_[slot] = det_freq;
+                secondary_pending_count_[slot] = 1;
+                secondary_pending_time_[slot] = now;
+                continue;
+            }
+            if (secondary_pending_count_[slot] < config_.confirm_count) {
+                ++secondary_pending_count_[slot];
+            }
+            if (secondary_pending_count_[slot] < config_.confirm_count) continue;  // guard
+            // Track confirmed secondary detection. The full-tracker
+            // case is handled inside add_tracked_drone_internal(): the weakest
+            // resident is evicted when the candidate outranks it.
+            (void)update_tracked_drone_internal(det_freq, det_rssi, now);
+        }
+    }
+
+    return ErrorCode::SUCCESS;
+}
+
+ErrorCode DroneScanner::update_tracked_drone_internal(
+    FreqHz frequency,
+    RssiValue rssi,
+    SystemTime timestamp,
+    size_t* out_index,
+    FreqHz measured_freq
+) noexcept {
+    if (out_index != nullptr) *out_index = SIZE_MAX;
+    // Nearest-match lookup WITH duplicate consolidation ("MRG — merge the
+    // radius around the STRONG entry"): a detection landing inside the match
+    // radius updates an existing tracker instead of spawning a duplicate, and
+    // the strongest in-radius entry (the ANCHOR: threat, then recent_strength,
+    // then oldest) absorbs every entry lying within the radius measured AROUND
+    // IT. Their RSSI history, sweep cycle peaks and trend state merge, so the
+    // trend applies as if every detection had always hit one ("current")
+    // entry. Lower-severity threats NEVER displace higher-severity ones during
+    // merge. The returned index is the post-compaction ANCHOR; the signature
+    // anchor below then pins the record onto its STRONGEST observation, so slow
+    // RF drift (FHSS wander, TX/RX offset, 78 kHz FFT-bin quantization,
+    // overlapping sweep windows) is absorbed by the match radius without
+    // letting weak samples rewrite the record's identity.
+    // NOTE: in normal (DB scan) mode `frequency` IS the tune center, so the
+    // anchor below only fires when a frame STRICTLY exceeds the record peak —
+    // the key stays pinned to the database channel; only sweep-mode bin
+    // measurements can move it, and only on a record peak.
+    ErrorResult<size_t> index_result = match_and_consolidate_drone_internal(
+        frequency, static_cast<FreqHz>(config_.freq_match_radius_mhz) * 1'000'000ULL);
+
+    // Read-and-clear IMMEDIATELY after the merge: the flag must not outlive this
+    // call. The RSSI-variance gate below can return early (before the merge
+    // guard reads it), so clearing later would leak a stale "merge happened"
+    // into the NEXT detection and block its legitimate threat downgrade.
+    const bool merge_absorbed = last_merge_absorbed_;
+    last_merge_absorbed_ = false;
+
+    if (index_result.has_value()) {
+        // Existing drone — update and alert on threat increase
+        size_t index = index_result.value();
+        if (out_index != nullptr) *out_index = index;
+
+        // MRG ANTI-REWRITE RULE: only a STRICTLY STRONGER observation may
+        // redefine the record's signature — the matching key AND the displayed
+        // frequency, written together so the display can never describe a
+        // different observation than the key. Previously EVERY in-radius
+        // detection rewrote both fields, so a train of weak samples inside the
+        // radius walked the record away from the real emitter and the UI
+        // frequency jittered frame to frame ("переписывание слабой сигнатурой").
+        // Stack: 0 B (one 16-bit compare + one 64-bit store pair).
+        if (tracked_drones_[index].is_record_peak(rssi)) {
+            tracked_drones_[index].anchor_signature(frequency, measured_freq);
+        }
+        
+        // RSSI variance rejection: noise has chaotic fluctuations
+        // Real drones have stable signal (variance < 25), noise > 100
+        // FIX: record the observation WITHOUT threat reclassification
+        // (observe_rssi). Previously the sample was dropped entirely: the
+        // history never refreshed, so the variance stayed frozen above the
+        // threshold forever, threat never escalated, and the tracker could
+        // go stale while the (noisy) signal was still present.
+        // Step 15 (README §14 chain): RSSI-variance post-filter — runs LAST in
+        // both modes (after Step 13 in DB / Step 14 in sweep), inside the
+        // tracker update; a rejected sample still refreshes history.
+        if (config_.rssi_variance_enabled) {
+            const uint32_t variance = tracked_drones_[index].calculate_rssi_variance();
+            if (variance > static_cast<uint32_t>(DEFAULT_RSSI_VARIANCE_THRESHOLD)) {
+                tracked_drones_[index].observe_rssi(rssi, timestamp);
+                // RSSI too chaotic — likely noise, don't upgrade threat
+                return ErrorCode::SUCCESS;
+            }
+        }
+
+        // Update drone type from DB if it was UNKNOWN (DB may have loaded after first detection)
+        if (tracked_drones_[index].drone_type == DroneType::UNKNOWN) {
+            tracked_drones_[index].drone_type = determine_drone_type_internal(frequency);
+        }
+
+        // After merge, absorb_from() correctly set threat = max(anchor, absorbed).
+        // Capture this BEFORE update_rssi() reclassifies from current RSSI.
+        // merge_absorbed was read-and-cleared right after the match call; it is
+        // kept for diagnostics but the downgrade guard below intentionally
+        // ignores it (see MRG safety): plain updates need the same protection.
+        const ThreatLevel post_merge_threat = tracked_drones_[index].get_threat();
+        (void)merge_absorbed;
+
+        ThreatLevel old_threat = post_merge_threat;
+        tracked_drones_[index].update_rssi(rssi, timestamp, ThreatThresholds{
+            config_.threat_low_dbm, config_.threat_medium_dbm,
+            config_.threat_high_dbm, config_.threat_critical_dbm});
+        ThreatLevel new_threat = tracked_drones_[index].get_threat();
+
+        // MRG safety: a WEAK in-radius observation must never downgrade the
+        // record it matched — in sweep mode update_rssi() classifies from the
+        // direct new_rssi (history is cross-frequency contaminated), so one
+        // fade sample would drop CRITICAL→LOW and the next strong frame would
+        // re-raise it with a fresh raise_alert() — the "beep restarts, list
+        // flickers" symptom. Threat may only RISE on an in-radius update
+        // (escalation); DOWNGRADES happen exclusively via apply_rssi_decay()
+        // after CYC missed cycles. This extends the old merge-only guard to
+        // plain in-radius updates (merge_occurred==false was the hole).
+        // Normal mode is peak-classified and unaffected (post==new there).
+        if (post_merge_threat > new_threat) {
+            tracked_drones_[index].threat_level = post_merge_threat;
+            new_threat = post_merge_threat;
+        }
+        
+        if (new_threat > old_threat) {
+            raise_alert(new_threat);  // staged — drained after unlock (D-ALERT-LOCK)
+            // Real signal confirmed — clear noise blacklist for this frequency
+            reset_noise_count(frequency);
+        }
+    } else {
+        // New drone — add (when the tracker is full, the weakest resident is
+        // evicted to make room for this stronger signal) and alert for its
+        // actual threat level.
+        size_t new_index = SIZE_MAX;
+        ErrorCode add_result = add_tracked_drone_internal(
+            frequency, rssi, timestamp, &new_index);
+        if (add_result != ErrorCode::SUCCESS) {
+            return add_result;
+        }
+        if (out_index != nullptr) *out_index = new_index;
+        // The creation observation IS this record's strongest observation by
+        // definition (the record did not exist before it), so its bin-corrected
+        // display frequency may be stored immediately — this is NOT a rewrite by
+        // a weaker signature. The matching key stays the tune frequency, exactly
+        // as before the anchor rule (identity/lock/DB type stay on the centre).
+        if (measured_freq != 0) {
+            tracked_drones_[new_index].set_measured_frequency(measured_freq);
+        }
+        // First detection: mark as increasing to prevent immediate decay
+        // update_rssi() already sets last_rssi_ to the current RSSI
+        tracked_drones_[new_index].rssi_increased_ = true;
+        // Alert for newly added drone's actual threat level
+        ThreatLevel new_threat = tracked_drones_[new_index].get_threat();
+        if (new_threat > ThreatLevel::NONE) {
+            raise_alert(new_threat);  // staged — drained after unlock (D-ALERT-LOCK)
+        }
+    }
+
+    return ErrorCode::SUCCESS;
+}
+
+ErrorResult<size_t> DroneScanner::find_nearest_drone_internal(
+    FreqHz frequency,
+    FreqHz radius_hz
+) const noexcept {
+    // Stack: ~32 bytes. FreqHz is uint64_t — unsigned difference is computed
+    // by branch, never by signed cast, so no underflow is possible.
+    ErrorResult<size_t> best_match = ErrorResult<size_t>::failure(ErrorCode::INVALID_PARAMETER);
+    FreqHz best_diff = 0;
+
+    for (size_t i = 0; i < tracked_count_; ++i) {
+        const FreqHz entry_freq = tracked_drones_[i].frequency;
+        const FreqHz diff = (frequency > entry_freq) ? (frequency - entry_freq)
+                                                     : (entry_freq - frequency);
+        if (diff > radius_hz) {
+            continue;  // Outside match radius — not the same emitter
+        }
+        if (!best_match.has_value() || (diff < best_diff)) {
+            best_match = ErrorResult<size_t>::success(i);
+            best_diff = diff;
+            if (diff == 0) {
+                break;  // Exact match — cannot improve, stop scanning
+            }
+        }
+    }
+
+    return best_match;
+}
+
+ErrorResult<size_t> DroneScanner::match_and_consolidate_drone_internal(
+    FreqHz frequency,
+    FreqHz radius_hz
+) noexcept {
+    // Stack: ~36 bytes (bool in_radius[MAX_TRACKED_DRONES] + scalars).
+    // O(n) per pass with n <= MAX_TRACKED_DRONES; the absorb path is rare
+    // (duplicate healing), the common path is a single O(n) scan with zero
+    // absorptions.
+    if (tracked_count_ == 0) {
+        return ErrorResult<size_t>::failure(ErrorCode::INVALID_PARAMETER);
+    }
+
+    // Pass 1: mark every entry within the match radius of the DETECTION — the
+    // candidate set the detection could belong to.
+    // FreqHz is uint64_t — unsigned difference is computed by branch, never
+    // by signed cast, so no underflow is possible.
+    bool in_radius[MAX_TRACKED_DRONES];
+    size_t in_radius_count = 0;
+    for (size_t i = 0; i < tracked_count_; ++i) {
+        const FreqHz entry_freq = tracked_drones_[i].frequency;
+        const FreqHz diff = (frequency > entry_freq) ? (frequency - entry_freq)
+                                                     : (entry_freq - frequency);
+        in_radius[i] = (diff <= radius_hz);
+        if (in_radius[i]) {
+            ++in_radius_count;
+        }
+    }
+
+    // No candidate within radius — nothing to match, nothing to consolidate.
+    if (in_radius_count == 0) {
+        return ErrorResult<size_t>::failure(ErrorCode::INVALID_PARAMETER);
+    }
+
+    // Pass 2: pick the ANCHOR — "the strong one" among the candidates.
+    // Ordering keys:
+    //   1) threat_level descending — the documented safety invariant: a
+    //      higher-severity threat must never be absorbed into a lower-severity
+    //      one (CRITICAL survives over LOW regardless of age or strength).
+    //   2) recent_strength() descending — among equal threats the STRONGEST
+    //      candidate wins, so the merged record keeps the strongest signature.
+    //      Same key as has_higher_priority()/eviction: ONE convention.
+    //   3) oldest created_time_ — longest trend history.
+    //   4) lowest index — deterministic tie-break.
+    // Freshness is deliberately NOT a key here (unlike has_higher_priority()):
+    // the merge is destructive, so the newest sample must never decide which
+    // history survives.
+    size_t anchor = 0;
+    ThreatLevel best_threat = ThreatLevel::NONE;
+    RssiValue best_strength = 0;
+    SystemTime oldest_created = 0;
+    bool anchor_set = false;
+    for (size_t i = 0; i < tracked_count_; ++i) {
+        if (!in_radius[i]) {
+            continue;
+        }
+        const ThreatLevel threat = tracked_drones_[i].threat_level;
+        const RssiValue strength = recent_strength(tracked_drones_[i]);
+        const SystemTime created = tracked_drones_[i].created_time_;
+        bool outranks = false;
+        if (!anchor_set) {
+            outranks = true;
+        } else if (threat != best_threat) {
+            outranks = static_cast<uint8_t>(threat) > static_cast<uint8_t>(best_threat);
+        } else if (strength != best_strength) {
+            outranks = strength > best_strength;
+        } else {
+            outranks = created < oldest_created;
+        }
+        if (!outranks) {
+            continue;
+        }
+        anchor = i;
+        best_threat = threat;
+        best_strength = strength;
+        oldest_created = created;
+        anchor_set = true;
+    }
+
+    // Pass 3: the merge radius is measured AROUND THE ANCHOR, not around the
+    // detection. A candidate that is near the detection but FARTHER than
+    // radius_hz from the strongest entry is an INDEPENDENT emitter and must
+    // survive as its own record — otherwise one middling detection landing
+    // between two distinct emitters (each within radius of the detection, up
+    // to 2 x radius apart) fused them into a single record and destroyed a
+    // real target. radius_hz == 0 (MRG off / exact matches only) keeps its
+    // original semantics: the anchor and every entry sitting exactly on the
+    // detection frequency coincide, so the merge set is unchanged.
+    const FreqHz anchor_freq = tracked_drones_[anchor].frequency;
+    size_t absorbed_count = 0;
+    for (size_t i = 0; i < tracked_count_; ++i) {
+        if (!in_radius[i] || i == anchor) {
+            continue;
+        }
+        const FreqHz entry_freq = tracked_drones_[i].frequency;
+        const FreqHz diff = (entry_freq > anchor_freq) ? (entry_freq - anchor_freq)
+                                                       : (anchor_freq - entry_freq);
+        if (diff > radius_hz) {
+            in_radius[i] = false;  // outside the anchor — independent emitter
+            continue;
+        }
+        // Each duplicate's RSSI history, cycle peaks and decay state merge into
+        // the anchor, so the trend sees one continuous sample stream.
+        tracked_drones_[anchor].absorb_from(tracked_drones_[i]);
+        ++absorbed_count;
+    }
+    // True ONLY when something was really absorbed. The caller's merge-threat
+    // preservation guard must not fire for a plain in-radius update (that would
+    // block legitimate threat downgrades of a live, weakening signal).
+    last_merge_absorbed_ = (absorbed_count > 0);
+
+    // Pass 4: compact the array (same pattern as remove_stale_drones_internal),
+    // dropping the absorbed duplicates, and record the anchor's new index.
+    size_t write_index = 0;
+    size_t anchor_new_index = SIZE_MAX;
+    for (size_t read_index = 0; read_index < tracked_count_; ++read_index) {
+        if (in_radius[read_index] && read_index != anchor) {
+            continue;  // absorbed duplicate — drop
+        }
+        if (read_index == anchor) {
+            anchor_new_index = write_index;
+        }
+        if (write_index != read_index) {
+            tracked_drones_[write_index] = tracked_drones_[read_index];
+        }
+        ++write_index;
+    }
+    tracked_count_ = write_index;
+
+    return ErrorResult<size_t>::success(anchor_new_index);
+}
+
+ErrorCode DroneScanner::get_current_drone_type(char* buffer, size_t buffer_size) const noexcept {
+    if (buffer == nullptr || buffer_size < 2) {
+        return ErrorCode::INVALID_PARAMETER;
+    }
+
+    size_t copy_len = 0;
+    for (size_t i = 0; i < 4 && i < (buffer_size - 1); ++i) {
+        const char c = current_drone_type_[i];
+        if (c != '\0') {
+            buffer[i] = c;
+            copy_len++;
+        } else {
+            break;
+        }
+    }
+
+    buffer[copy_len] = '\0';
+    return ErrorCode::SUCCESS;
+}
+
+ErrorCode DroneScanner::add_tracked_drone_internal(
+    FreqHz frequency_hz,
+    RssiValue rssi_dbm,
+    SystemTime timestamp_ms,
+    size_t* out_index,
+    bool init_sweep_mode,
+    bool classify_drone_type
+) noexcept {
+    if (out_index != nullptr) {
+        *out_index = SIZE_MAX;
+    }
+
+    // Pick the write slot: free tail while space remains; otherwise the
+    // weakest resident (lowest threat/RSSI/freshness) — but ONLY when the new
+    // detection strictly outranks it. This is the "weak signals are displaced
+    // by strong signals" rule; a weak one-off blip never displaces a confirmed
+    // drone. find_add_slot_internal() returns SIZE_MAX when nothing qualifies.
+    const size_t slot = find_add_slot_internal(rssi_dbm, timestamp_ms);
+    if (slot == SIZE_MAX) {
+        return ErrorCode::BUFFER_FULL;
+    }
+
+    const bool evicting = (slot < tracked_count_);
+
+    DroneType type = classify_drone_type
+        ? determine_drone_type_internal(frequency_hz)
+        : DroneType::UNKNOWN;
+
+    tracked_drones_[slot] = TrackedDrone(frequency_hz, type, ThreatLevel::NONE);
+    TrackedDrone& drone = tracked_drones_[slot];
+    drone.created_time_ = timestamp_ms;
+    drone.last_increase_time_ = timestamp_ms;
+    if (init_sweep_mode) {
+        // Sweep mode: classify threat from the DIRECT RSSI — rssi_history_ is
+        // contaminated by mixed-frequency samples from other sweep windows.
+        drone.sweep_mode_active_ = true;
+    }
+    drone.update_rssi(rssi_dbm, timestamp_ms, ThreatThresholds{
+        config_.threat_low_dbm, config_.threat_medium_dbm,
+        config_.threat_high_dbm, config_.threat_critical_dbm});
+
+    if (!evicting) {
+        tracked_count_++;
+    }
+    statistics_.drones_detected++;
+    if (evicting) {
+        statistics_.drones_evicted++;
+        // Sticky notification for the UI slow tick: a displacement that leaves
+        // tracked_count_ unchanged would otherwise be invisible to the operator.
+        eviction_pending_ = true;
+    }
+
+    if (out_index != nullptr) {
+        *out_index = slot;
+    }
+
+    // NOTE: Do NOT call trigger_alert() here.
+    // update_rssi() set the initial threat level inside the drone.
+    // update_tracked_drone_internal() will compare and trigger the alert.
+
+    return ErrorCode::SUCCESS;
+}
+
+DroneType DroneScanner::determine_drone_type_internal(FreqHz frequency) const noexcept {
+    ErrorResult<FrequencyEntry> entry_result = database_.find_entry(frequency);
+    
+    if (entry_result.has_value()) {
+        const FrequencyEntry& entry = entry_result.value();
+        return entry.drone_type;
+    }
+    
+    return DroneType::UNKNOWN;
+}
+
+size_t DroneScanner::get_tracked_drones(
+    TrackedDrone* drones,
+    size_t max_count
+) const noexcept {
+    MutexLock<LockOrder::DATA_MUTEX> lock(mutex_);
+    
+    if (drones == nullptr || max_count == 0) {
+        return 0;
+    }
+    
+    // SELECT-TOP-N BY PRIORITY: the tracker array is insertion-ordered (new
+    // detections append at the tail, evictions replace in place) — NOT
+    // priority-ordered. Copying the first N slots would silently drop a
+    // CRITICAL / strong signal that lives at array index 20..24, keeping weak
+    // insertion-era entries forever on the render list.
+    //
+    // Selection uses the SAME key as eviction and the render sort:
+    //   1) threat_level desc, 2) rssi desc, 3) last_seen desc,
+    //   4) update_count desc. No reordering of the persistent array, so
+    //   index-based frequency lookups stay valid; only the copies are ranked.
+    //
+    // Stack: bool[MAX_TRACKED_DRONES] = 25 B + scalars (fits the <512 B cap).
+    // Complexity: O(select_n × tracked_count_) <= 12 × 25 = 300 compares.
+    bool selected[MAX_TRACKED_DRONES] = {};
+    const size_t select_n = tracked_count_ < max_count ? tracked_count_ : max_count;
+    size_t out_count = 0;
+
+    for (size_t rank = 0; rank < select_n; ++rank) {
+        size_t best = SIZE_MAX;
+        for (size_t i = 0; i < tracked_count_; ++i) {
+            if (selected[i]) {
+                continue;
+            }
+            if (best == SIZE_MAX || has_higher_priority(tracked_drones_[i], tracked_drones_[best])) {
+                best = i;
+            }
+        }
+        if (best == SIZE_MAX) {
+            break;  // safety — cannot happen while out_count < tracked_count_
+        }
+        selected[best] = true;
+
+        // BUGFIX (trend flicker / '-' reset): advance the trend hysteresis on
+        // the PERSISTENT tracked_drones_[best] object BEFORE copying.
+        //
+        // get_movement_trend() is const but mutates mutable hysteresis state
+        // (cached_trend_ / trend_hold_count_). It is only ever invoked from
+        // DisplayDroneEntry's constructor, which historically ran on a COPY
+        // (refresh_drones_[i] here). The copy is discarded after painting, so
+        // the hysteresis never accumulated across ticks: cached_trend_ on the
+        // persistent object stayed UNKNOWN forever.
+        //
+        // Consequence in sweep mode: finalize_sweep_cycle() resets
+        // last_cycle_peak_rssi_ to the sentinel at every pair boundary, so raw
+        // trend is UNKNOWN until the drone is re-detected in the next pass.
+        // The hysteresis branch "raw UNKNOWN + cached real → hold last real
+        // trend" was designed to cover exactly this gap, but it never fired —
+        // every evaluation started from a fresh copy with cached UNKNOWN — and
+        // ALL trends collapsed to '-' (UNKNOWN) after the second sweep window
+        // completed its pass (pair boundary = finalize).
+        //
+        // Evaluating on the original makes cached_trend_ persist, so during the
+        // sentinel gap the UI holds the last real trend ('<' / '>' / '~').
+        // Stack: ~8 bytes. Runs under DATA_MUTEX (UI thread; scanner thread is
+        // stopped in sweep mode and locks the same mutex in normal mode).
+        (void)tracked_drones_[best].get_movement_trend();
+        drones[out_count] = tracked_drones_[best];
+        ++out_count;
+    }
+
+    return out_count;
+}
+
+size_t DroneScanner::get_display_entries(
+    DisplayDroneEntry* out,
+    size_t max_count,
+    ThreatLevel min_threat
+) const noexcept {
+    MutexLock<LockOrder::DATA_MUTEX> lock(mutex_);
+
+    if (out == nullptr || max_count == 0) {
+        return 0;
+    }
+
+    // SELECT-TOP-N + DIRECT COMPACT CONVERSION: same ranking key as
+    // get_tracked_drones() (see its docs — threat desc, rssi desc, last_seen
+    // desc, update_count desc), but each selected original is converted to a
+    // 48 B DisplayDroneEntry in place under the lock. This removes the old
+    // 160 B TrackedDrone round-trip through a caller-side scratch array
+    // (~1.9 KB of DroneScannerUI heap) — the render snapshot is the compact
+    // form from the start.
+    //
+    // The DisplayDroneEntry constructor evaluates get_movement_trend() on the
+    // PERSISTENT original (not a copy), which is the required hysteresis
+    // advance site — same contract as get_tracked_drones() line above.
+    //
+    // min_threat filter runs during conversion: sub-min_threat entries are
+    // dropped without writing. Threat-descending order means every dropped
+    // entry outranks nothing that qualifies (all >= min_threat rank above
+    // all < min_threat), so the filter cannot starve a displayable drone out
+    // of the top-N window.
+    //
+    // Stack: bool[MAX_TRACKED_DRONES] = 25 B + scalars (fits the <512 B cap).
+    // Complexity: O(select_n × tracked_count_) <= 12 × 25 = 300 compares.
+    bool selected[MAX_TRACKED_DRONES] = {};
+    const size_t select_n = tracked_count_ < max_count ? tracked_count_ : max_count;
+    size_t out_count = 0;
+
+    for (size_t rank = 0; rank < select_n; ++rank) {
+        size_t best = SIZE_MAX;
+        for (size_t i = 0; i < tracked_count_; ++i) {
+            if (selected[i]) {
+                continue;
+            }
+            if (best == SIZE_MAX || has_higher_priority(tracked_drones_[i], tracked_drones_[best])) {
+                best = i;
+            }
+        }
+        if (best == SIZE_MAX) {
+            break;  // safety — cannot happen while out_count < tracked_count_
+        }
+        selected[best] = true;
+
+        if (tracked_drones_[best].threat_level < min_threat) {
+            continue;  // render gate — tracking untouched
+        }
+        out[out_count] = DisplayDroneEntry(tracked_drones_[best]);
+        ++out_count;
+    }
+
+    return out_count;
+}
+
+ScannerState DroneScanner::get_state() const noexcept {
+    MutexTryLock<LockOrder::DATA_MUTEX> lock(mutex_);
+    if (lock.is_locked()) {
+        return state_;
+    }
+    // Fallback: return last known state (atomic word-sized read is safe on Cortex-M4)
+    return state_;
+}
+
+bool DroneScanner::is_scanning() const noexcept {
+    return scanning_active_.test();
+}
+
+void DroneScanner::get_config(ScanConfig& out) const noexcept {
+    // M-2 FIX (audit): was a BLOCKING MutexLock - every UI-thread call site
+    // (settings/SWP/DB buttons, enter/exit sweep) could stall up to one full
+    // scan cycle (SPI tune + DB walk holding DATA_MUTEX) inside the 60 Hz
+    // event loop. All other UI readers here use MutexTryLock fail-open;
+    // get_config now joins them instead of being the one blocking outlier.
+    // Copy-below-is-safe proof (single writer): config_ is written ONLY by
+    // set_config() - all of whose call sites run on this same UI/event thread
+    // (drone_scanner_ui / drone_settings / drone_sweep_view) - and by the
+    // constructor before threads start; set_median_filter_enabled() (the other
+    // writer) has ZERO callers. On TryLock failure the holder is a
+    // scanner-thread READER under DATA_MUTEX, so this copy races
+    // read-against-read: no writer -> no torn field, no mixed old/new snapshot
+    // (aligned scalar loads are atomic on Cortex-M4). Callers always get a
+    // fully initialized, freshest snapshot instead of blocking.
+    MutexTryLock<LockOrder::DATA_MUTEX> lock(mutex_);
+    out = config_;
+}
+
+int32_t DroneScanner::get_threat_critical_dbm() const noexcept {
+    MutexTryLock<LockOrder::DATA_MUTEX> lock(mutex_);
+    if (!lock.is_locked()) {
+        return RSSI_CRITICAL_THREAT_THRESHOLD_DBM;
+    }
+    return config_.threat_critical_dbm;
+}
+
+bool DroneScanner::get_median_enabled() const noexcept {
+    MutexTryLock<LockOrder::DATA_MUTEX> lock(mutex_);
+    if (!lock.is_locked()) {
+        return false;
+    }
+    return config_.median_enabled;
+}
+
+uint32_t DroneScanner::get_scan_interval_ms() const noexcept {
+    MutexTryLock<LockOrder::DATA_MUTEX> lock(mutex_);
+    if (!lock.is_locked()) {
+        return SCANNER_SLEEP_MS;
+    }
+    return config_.scan_interval_ms;
+}
+
+bool DroneScanner::is_adaptive_cfar_enabled() const noexcept {
+    MutexTryLock<LockOrder::DATA_MUTEX> lock(mutex_);
+    if (!lock.is_locked()) {
+        return false;
+    }
+    return config_.adaptive_cfar_enabled;
+}
+
+uint8_t DroneScanner::shape_gate_margin_try() const noexcept {
+    MutexTryLock<LockOrder::DATA_MUTEX> lock(mutex_);
+    if (!lock.is_locked()) {
+        return 0;
+    }
+    // Inline of shape_gate_margin() internals (cannot call the locking
+    // version — ChibiOS fast mutexes are NOT recursive, same-thread relock
+    // would deadlock). Logic duplicated byte-for-byte from
+    // shape_gate_margin()/effective_spectrum_margin() above; any change
+    // there MUST be mirrored here.
+    uint8_t base = config_.spectrum_margin;
+    if (config_.sensitive_mode && base > 2) {
+        base = static_cast<uint8_t>(base - 2);
+    } else if (config_.sensitive_mode) {
+        base = 1;
+    }
+    // SENS ADAPTIVE GATE mirror (SHAPE_ADAPT_*): the same value the
+    // detector uses this frame — the last frame's measurement, written on
+    // this same UI drain thread by update_auto_gate() (never the scanner
+    // thread). Sentinel 0 (no measurement yet) falls back to base exactly
+    // like shape_gate_margin(). A one-frame-stale gate here feeds ONLY the
+    // UI-side half-gate prefilter — but "the rejected frame is still offered
+    // to TBD afterwards" is NOT a complete mitigation: a frame the prefilter
+    // drops never reaches waterfall_history_.push(), so it costs a TBD vote
+    // too. The "UI test is a strict subset of the detector test" contract
+    // therefore needs the cap below to actually hold.
+    // PREFILTER CAP (audit D-PRE-GATE, rev. 2 — see constants.hpp
+    // SHAPE_ADAPT_PREFILTER_CAP): this accessor feeds ONLY the UI-side
+    // sweep drain prefilter, whose rule is "keep the frame when
+    // (peak - min_bin) >= returned/2". The DETECTOR of the same frame uses
+    // the FRESH clamp(3s, FLOOR, base) >= FLOOR, so an uncapped STALE
+    // measurement can exceed 2xFLOOR and make the prefilter stricter than
+    // the detector (Mar > 22 + a falling usable-bin IQR) — dropping a frame
+    // before waterfall_history_.push() and costing a TBD vote too. Capping
+    // at 2*TBD_MIN_ELEVATION_UNITS (10) gives returned/2 = 5 <= FLOOR (8) <=
+    // fresh gate (subset restored), and because min_bin <= p25 the UI
+    // margin is always >= the detector margin, so UI-fail now IMPLIES
+    // detector-fail (provably). The same 5 = the TBD vote floor, so a
+    // frame that could vote in the integrator can never be dropped here
+    // either — the 2*FLOOR=20 rev.1 cap still lost the 6..9 elevation
+    // band at min == p25. Only ever LOWERS the bar; clean-spectrum
+    // behavior (auto_gate_ = FLOOR = 8 <= 10) is unchanged.
+    if (config_.sensitive_mode) {
+        const uint8_t sens_gate = (auto_gate_ != 0) ? auto_gate_ : base;
+        return (sens_gate > SHAPE_ADAPT_PREFILTER_CAP)
+            ? SHAPE_ADAPT_PREFILTER_CAP
+            : sens_gate;
+    }
+    const int32_t rssi_sens = rssi_sens_units(config_);
+    if (!config_.sensitive_mode && rssi_sens > 0) {
+        const uint16_t scaled = static_cast<uint16_t>(base) +
+            static_cast<uint16_t>(rssi_sens / 2);
+        return (scaled > 255) ? 255 : static_cast<uint8_t>(scaled);
+    }
+    return base;
+}
+
+bool DroneScanner::is_spectrum_shape_enabled_try() const noexcept {
+    MutexTryLock<LockOrder::DATA_MUTEX> lock(mutex_);
+    // Fail-open on contention: report "enabled" so the caller still runs
+    // the prefilter with the margin shape_gate_margin_try() returned on
+    // the same contention (0 => everything passes). Never fail-closed
+    // here: dropping the frame would lose sensitivity.
+    return lock.is_locked() ? config_.spectrum_detection_enabled : true;
+}
+
+uint8_t DroneScanner::sweep_tbd_threshold_units_try() const noexcept {
+    MutexTryLock<LockOrder::DATA_MUTEX> lock(mutex_);
+    if (!lock.is_locked()) {
+        // Fail-open: 0 is floored by sweep_tbd_effective_threshold() in the
+        // caller, so a contended read can only ADD frames to the integrator
+        // (never drop one) — the same policy as the two accessors above.
+        return 0;
+    }
+    // get_current_total_gain() reads cached receiver_model fields (no SPI, no
+    // lock) and is already called per frame on this thread by
+    // process_spectrum_sweep() and apply_sweep_tracking().
+    return sweep_tbd_threshold_units(config_.rssi_threshold_dbm,
+                                     get_current_total_gain());
+}
+
+int8_t DroneScanner::sweep_shelf_offset_try() const noexcept {
+    MutexTryLock<LockOrder::DATA_MUTEX> lock(mutex_);
+    // Fail-OPEN on contention (see the header contract): the MINIMUM offset
+    // gives the drain shelf clamp(min + MIN) <= clamp(p25 + off) for every
+    // legal off, so the UI gate can never be stricter than the detector's —
+    // a contended read only adds frames to the heavy path (CPU), it cannot
+    // cost sensitivity or a TBD vote.
+    if (!lock.is_locked()) {
+        return SWEEP_SHELF_OFFSET_MIN;
+    }
+    const int8_t off = config_.sweep_shelf_offset;
+    if (off < SWEEP_SHELF_OFFSET_MIN) return SWEEP_SHELF_OFFSET_MIN;
+    if (off > SWEEP_SHELF_OFFSET_MAX) return SWEEP_SHELF_OFFSET_MAX;
+    return off;
+}
+
+ErrorCode DroneScanner::set_config(const ScanConfig& config) noexcept {
+    ErrorCode validate_result = validate_config_internal(config);
+    if (validate_result != ErrorCode::SUCCESS) {
+        return validate_result;
+    }
+    
+    MutexLock<LockOrder::DATA_MUTEX> lock(mutex_);
+    config_ = config;
+    median_filter_enabled_ = config.median_enabled;
+
+    // Propagate configurable threat thresholds to RSSI detector
+    rssi_detector_.set_threat_thresholds(ThreatThresholds{
+        config.threat_low_dbm, config.threat_medium_dbm,
+        config.threat_high_dbm, config.threat_critical_dbm});
+
+    return ErrorCode::SUCCESS;
+}
+
+ErrorCode DroneScanner::validate_config_internal(const ScanConfig& config) const noexcept {
+    // Validate against HARDWARE limits (not theoretical MAX_FREQUENCY_HZ)
+    // HackRF One RFFC5072 mixer practical limit: 6 GHz
+    if (config.start_frequency < HARDWARE_MIN_FREQ_HZ ||
+        config.end_frequency > HARDWARE_MAX_FREQ_HZ ||
+        config.start_frequency >= config.end_frequency) {
+        return ErrorCode::INVALID_PARAMETER;
+    }
+    
+    if (config.rssi_threshold_dbm < RSSI_MIN_DBM ||
+        config.rssi_threshold_dbm > RSSI_MAX_DBM) {
+        return ErrorCode::INVALID_PARAMETER;
+    }
+    
+    // Validate scanning mode
+    const uint8_t mode_value = static_cast<uint8_t>(config.mode);
+    if (mode_value >= SCANNING_MODE_COUNT) {
+        return ErrorCode::INVALID_PARAMETER;
+    }
+
+    // Validate sweep windows against hardware limits
+    if (config.sweep_start_freq < HARDWARE_MIN_FREQ_HZ ||
+        config.sweep_end_freq > HARDWARE_MAX_FREQ_HZ ||
+        config.sweep_start_freq >= config.sweep_end_freq) {
+        return ErrorCode::INVALID_PARAMETER;
+    }
+    if (config.sweep2_enabled) {
+        if (config.sweep2_start_freq < HARDWARE_MIN_FREQ_HZ ||
+            config.sweep2_end_freq > HARDWARE_MAX_FREQ_HZ ||
+            config.sweep2_start_freq >= config.sweep2_end_freq) {
+            return ErrorCode::INVALID_PARAMETER;
+        }
+    }
+    if (config.sweep3_enabled) {
+        if (config.sweep3_start_freq < HARDWARE_MIN_FREQ_HZ ||
+            config.sweep3_end_freq > HARDWARE_MAX_FREQ_HZ ||
+            config.sweep3_start_freq >= config.sweep3_end_freq) {
+            return ErrorCode::INVALID_PARAMETER;
+        }
+    }
+    if (config.sweep4_enabled) {
+        if (config.sweep4_start_freq < HARDWARE_MIN_FREQ_HZ ||
+            config.sweep4_end_freq > HARDWARE_MAX_FREQ_HZ ||
+            config.sweep4_start_freq >= config.sweep4_end_freq) {
+            return ErrorCode::INVALID_PARAMETER;
+        }
+    }
+
+    // Validate spectrum shape filter parameters (prevent impossible detection configs)
+    if (config.spectrum_min_width > config.spectrum_max_width) {
+        return ErrorCode::INVALID_PARAMETER;
+    }
+    if (config.spectrum_min_width < 1 || config.spectrum_max_width < 2) {
+        return ErrorCode::INVALID_PARAMETER;
+    }
+    // AUDIT C2/a: margin 0 = "no margin filtering" is a legitimate knob
+    // (UI no longer shows 0 but files can). Keep accepting it — Step 3
+    // treats margin 0 as disabled and the sensitive-mode floor (1) still
+    // applies. Note: shape_gate_margin() then scales ONLY the floor.
+    if (config.confirm_count < CONFIRM_COUNT_MIN || config.confirm_count > CONFIRM_COUNT_MAX) {
+        return ErrorCode::INVALID_PARAMETER;
+    }
+    if (config.miss_tolerance < MISS_TOLERANCE_MIN || config.miss_tolerance > MISS_TOLERANCE_MAX) {
+        return ErrorCode::INVALID_PARAMETER;
+    }
+    if (config.cfar_ref_cells < CFAR_REF_CELLS_MIN || config.cfar_ref_cells > CFAR_REF_CELLS_MAX) {
+        return ErrorCode::INVALID_PARAMETER;
+    }
+    if (config.cfar_guard_cells > CFAR_GUARD_CELLS_MAX) {
+        return ErrorCode::INVALID_PARAMETER;
+    }
+    // CFAR ref cells must be >= guard cells + 2 for valid reference window
+    if (config.cfar_ref_cells < config.cfar_guard_cells + 2) {
+        return ErrorCode::INVALID_PARAMETER;
+    }
+
+    // User shelf offset: enforce the SWEEP_SHELF_OFFSET_* contract at the
+    // config boundary. The use-site clamps (display apply_shelf_offset,
+    // detector nf/wf clamp) already make an out-of-range value memory-safe,
+    // but rejecting it here keeps set_config() all-or-nothing and stops a
+    // hand-edited/corrupt config from reaching the drain-vs-detector shelf
+    // asymmetry in the first place. Third layer: NumberField range,
+    // file-parse clamp, this check.
+    if (config.sweep_shelf_offset < SWEEP_SHELF_OFFSET_MIN ||
+        config.sweep_shelf_offset > SWEEP_SHELF_OFFSET_MAX) {
+        return ErrorCode::INVALID_PARAMETER;
+    }
+
+    return ErrorCode::SUCCESS;
+}
+
+ScanStatistics DroneScanner::get_statistics() const noexcept {
+    MutexLock<LockOrder::DATA_MUTEX> lock(mutex_);
+    return statistics_;
+}
+
+void DroneScanner::reset_statistics() noexcept {
+    MutexLock<LockOrder::DATA_MUTEX> lock(mutex_);
+    statistics_.reset();
+}
+
+ErrorResult<FreqHz> DroneScanner::get_current_frequency() const noexcept {
+    MutexLock<LockOrder::DATA_MUTEX> lock(mutex_);
+    if (current_frequency_ == 0) {
+        return ErrorResult<FreqHz>::failure(ErrorCode::HARDWARE_NOT_INITIALIZED);
+    }
+    return ErrorResult<FreqHz>::success(current_frequency_);
+}
+
+void DroneScanner::set_scan_frequency(FreqHz frequency) noexcept {
+    MutexLock<LockOrder::DATA_MUTEX> lock(mutex_);
+    current_frequency_ = frequency;
+}
+
+void DroneScanner::clear_lock_state() noexcept {
+    MutexLock<LockOrder::DATA_MUTEX> lock(mutex_);
+    freq_lock_count_ = 0;
+    locked_frequency_ = 0;
+    missed_lock_count_ = 0;
+    // Clear lock timing timers for consistency
+    lock_start_time_ = 0;
+    confirm_start_time_ = 0;
+    // B6 secondary pendings are tune-scoped like the primary pair above: a
+    // clear mid-scan must not leave a half-confirmed secondary behind.
+    // Stack: 0. SRAM: 0 extra.
+    for (size_t s = 0; s < SECONDARY_SLOTS; ++s) {
+        secondary_pending_freq_[s] = 0;
+        secondary_pending_time_[s] = 0;
+        secondary_pending_count_[s] = 0;
+    }
+    // Reset sweep frequency tracking so first sweep frame always resets median filter
+    // (per-window arrays: same behavior as the old shared last_sweep_freq_ = 0).
+    last_sweep_freq_ = 0;
+    for (uint8_t i = 0; i < MAX_SWEEP_WINDOWS; ++i) {
+        last_sweep_freq_per_win_[i] = 0;
+        last_hyst_freq_per_win_[i] = 0;
+    }
+    // C3 barrier sentinel rides along with the keys: a lock clear must not
+    // leave a stale "window X last fed" behind, or the next ambiguous
+    // cross-window center could be evaluated against dead history.
+    last_sweep_win_idx_ = MAX_SWEEP_WINDOWS;
+    // Audit C1: sweep confirm pendings are integration evidence too — a
+    // lock clear must not leave a half-confirmed candidate behind (the
+    // DB primary/secondary pendings are cleared by the loops above).
+    // Visit-debounce state rides along: a stale visit key must not make
+    // the first post-clear sighting look like a repeat frame.
+    for (size_t s = 0; s < SWEEP_CONFIRM_SLOTS; ++s) {
+        sweep_pending_freq_[s] = 0;
+        sweep_pending_time_[s] = 0;
+        sweep_pending_count_[s] = 0;
+        sweep_pending_visit_[s] = 0;
+    }
+    sweep_confirm_visit_freq_ = 0;
+    sweep_confirm_visit_id_ = 0;
+    if (state_ == ScannerState::LOCKING || state_ == ScannerState::TRACKING) {
+        state_ = ScannerState::SCANNING;
+    }
+}
+
+void DroneScanner::reset_sweep_integrators() noexcept {
+    MutexLock<LockOrder::DATA_MUTEX> lock(mutex_);
+    // Unconditional reset — no read-modify-write: any frame captured in the
+    // OTHER mode (different slice step, bandwidth, trigger, gain regime) is
+    // poison for the TBD envelope and the median window. The DB path owns the
+    // same reset-before-push ordering on frequency change, so after this call
+    // the first frame of the new mode rebuilds both integrators from scratch.
+    rssi_median_filter_.reset();
+    waterfall_history_.reset();
+    clear_shape_veto();  // D5: mode switch drops all integration evidence
+    signal_present_ = false;
+    sweep_signal_present_ = false;
+    last_sweep_freq_ = 0;
+    last_hysteresis_freq_ = 0;
+    for (uint8_t i = 0; i < MAX_SWEEP_WINDOWS; ++i) {
+        last_sweep_freq_per_win_[i] = 0;
+        last_hyst_freq_per_win_[i] = 0;
+    }
+    // C3 barrier invalid ⇒ the first frame of the new mode forces the shared
+    // integrator rebuild (mirrors the per-window keys above being zeroed).
+    last_sweep_win_idx_ = MAX_SWEEP_WINDOWS;
+    // Audit C1: mode switch drops sweep confirm pendings along with every
+    // other integration artifact (frames captured in the OTHER mode must
+    // not count toward confirm_count of the new mode). Visit-debounce
+    // state clears with them; the Mahalanobis escalation counters clear
+    // too — one pre-switch sighting must not count toward a post-switch
+    // escalation.
+    for (size_t s = 0; s < SWEEP_CONFIRM_SLOTS; ++s) {
+        sweep_pending_freq_[s] = 0;
+        sweep_pending_time_[s] = 0;
+        sweep_pending_count_[s] = 0;
+        sweep_pending_visit_[s] = 0;
+    }
+    sweep_confirm_visit_freq_ = 0;
+    sweep_confirm_visit_id_ = 0;
+    for (uint8_t i = 0; i < MAX_TRACKED_DRONES; ++i) {
+        mahalanobis_escalation_count_[i] = 0;
+    }
+}
+
+size_t DroneScanner::get_tracked_count() const noexcept {
+    MutexTryLock<LockOrder::DATA_MUTEX> lock(mutex_);
+    if (!lock.is_locked()) {
+        return tracked_count_;  // Atomic word-read fallback on Cortex-M4
+    }
+    return tracked_count_;
+}
+
+bool DroneScanner::get_and_clear_eviction_pending() noexcept {
+    MutexLock<LockOrder::DATA_MUTEX> lock(mutex_);
+    if (!eviction_pending_) {
+        return false;
+    }
+    eviction_pending_ = false;
+    return true;
+}
+
+void DroneScanner::clear_tracked_drones() noexcept {
+    MutexLock<LockOrder::DATA_MUTEX> lock(mutex_);
+    tracked_count_ = 0;
+}
+
+void DroneScanner::reset_frequency() noexcept {
+    MutexLock<LockOrder::DATA_MUTEX> lock(mutex_);
+
+    // Get first frequency from new database
+    ErrorResult<FreqHz> freq_result = database_.get_next_frequency(0);
+    if (freq_result.has_value()) {
+        current_frequency_ = freq_result.value();
+    } else {
+        current_frequency_ = MIN_FREQUENCY_HZ;
+    }
+
+    // Reset tracking state
+    freq_lock_count_ = 0;
+    locked_frequency_ = 0;
+    missed_lock_count_ = 0;
+    // Reset lock timing for consistency
+    lock_start_time_ = 0;
+    confirm_start_time_ = 0;
+    // New database = new tune plan: primary AND secondary pendings belong to
+    // the old plan (same ownership as clear_lock_state() above).
+    for (size_t s = 0; s < SECONDARY_SLOTS; ++s) {
+        secondary_pending_freq_[s] = 0;
+        secondary_pending_time_[s] = 0;
+        secondary_pending_count_[s] = 0;
+    }
+}
+
+void DroneScanner::remove_stale_drones(SystemTime current_time) noexcept {
+    MutexLock<LockOrder::DATA_MUTEX> lock(mutex_);
+    remove_stale_drones_internal(current_time);
+}
+
+void DroneScanner::remove_stale_drones_internal(SystemTime current_time) noexcept {
+    size_t write_index = 0;
+    
+    for (size_t read_index = 0; read_index < tracked_count_; ++read_index) {
+        if (!tracked_drones_[read_index].is_stale(current_time, config_.stale_timeout_ms)) {
+            if (write_index != read_index) {
+                tracked_drones_[write_index] = tracked_drones_[read_index];
+            }
+            write_index++;
+        }
+    }
+    
+    tracked_count_ = write_index;
+}
+
+/**
+ * @brief Sets the alert callback function
+ * @param callback Function to call when alerts are triggered
+ * @note The callback function MUST be thread-safe and reentrant-safe
+ * @note The callback MUST NOT acquire any mutexes or perform blocking operations
+ * @note The callback MUST execute quickly (preferably < 1ms) to avoid delaying scanner thread
+ * @note Failure to meet timing requirements may result in missed alerts or buffer overflows
+ * @warning Violating these constraints can cause system instability
+ */
+void DroneScanner::set_alert_callback(ThreatAlertCallback callback) noexcept {
+    MutexLock<LockOrder::DATA_MUTEX> lock(mutex_);
+    alert_callback_ = callback;
+}
+
+void DroneScanner::trigger_alert(ThreatLevel threat_level) noexcept {
+    // Never alert for NONE level — this fires on threat decrease or initial NONE state
+    if (threat_level == ThreatLevel::NONE) {
+        return;
+    }
+
+    ThreatAlertCallback local_callback = alert_callback_;
+
+    if (local_callback == nullptr) {
+        return;
+    }
+
+    // Re-entrancy guard (AtomicFlag is lock-free)
+    if (alert_callback_in_progress_.test_and_set()) {
+        return;  // Already in progress
+    }
+
+    // Invoke callback outside any lock — producers on the DB path must go
+    // through raise_alert()/deliver_pending_alert() so this never runs while
+    // DATA_MUTEX is held (audit D-ALERT-LOCK).
+    local_callback(threat_level);
+
+    alert_callback_in_progress_.clear();
+}
+
+void DroneScanner::raise_alert(ThreatLevel threat_level) noexcept {
+    // STAGE, do not fire: called from update_tracked_drone_internal(), which
+    // the DB path invokes WITH DATA_MUTEX held. The audio callback
+    // (baseband beep request) may busy-wait on a full baseband queue —
+    // firing it here would extend the lock hold and make the UI thread's
+    // MutexTryLock in process_spectrum_message() fail (dropped FFT frames).
+    // Strongest level wins; plain byte write, UI thread only. Stack: ~4 B.
+    if (threat_level > pending_alert_) {
+        pending_alert_ = threat_level;
+    }
+}
+
+void DroneScanner::deliver_pending_alert() noexcept {
+    // Lock-free drain — MUST be called with DATA_MUTEX NOT held.
+    const ThreatLevel level = pending_alert_;
+    if (level == ThreatLevel::NONE) {
+        return;
+    }
+    pending_alert_ = ThreatLevel::NONE;  // clear BEFORE firing (re-entrancy)
+    trigger_alert(level);                // Stack: ~8 bytes total
+}
+
+void DroneScanner::set_median_filter_enabled(bool enabled) noexcept {
+    MutexLock<LockOrder::DATA_MUTEX> lock(mutex_);
+    median_filter_enabled_ = enabled;
+    config_.median_enabled = enabled;
+    rssi_median_filter_.reset();
+}
+
+void DroneScanner::reset_neighbor_checker() noexcept {
+    MutexLock<LockOrder::DATA_MUTEX> lock(mutex_);
+    neighbor_margin_checker_.reset();
+}
+
+// ============================================================================
+// Spectrum Shape Analysis — detect U/V peaks above flat noise floor
+// ============================================================================
+
+bool DroneScanner::analyze_spectrum_shape_impl(
+    const ChannelSpectrum& spectrum,
+    size_t peak_index,
+    uint8_t raw_peak,
+    uint8_t noise_floor,
+    uint8_t width_floor,
+    int32_t& out_rssi,
+    size_t edge_skip,
+    int32_t total_gain,
+    SignalExtent* out_extent,
+    bool reject_edge_clipped,
+    ShapeVerdict* out_verdict,
+    const uint8_t* shape_data
+) noexcept {
+    // shape_data == nullptr → legacy raw path (byte-for-byte). Non-null →
+    // the spatial envelope (config_.spectrum_envelope_enabled, default ON), whose
+    // monotone-raising property means the Step-3 margin (derived from the RAW
+    // raw_peak the caller measured) can only widen the walk, never tighten it.
+    const uint8_t* data = (shape_data != nullptr) ? shape_data : spectrum.db.data();
+    return apply_shape_filters(
+        data, peak_index, raw_peak, noise_floor, width_floor,
+        out_rssi, edge_skip, /*has_dc_gap=*/true, total_gain,
+        out_extent, reject_edge_clipped, out_verdict);
+}
+
+// ============================================================================
+// Multi-peak shape analysis: find ALL CFAR peaks, try shape filters on each
+// Critical for detecting multiple FPV transmitters in the same 20 MHz frame.
+// ============================================================================
+
+bool DroneScanner::analyze_spectrum_shape_multi(
+    const ChannelSpectrum& spectrum,
+    ShapeDetectionResult& out_result,
+    FreqHz center_freq
+) noexcept {
+    out_result.count = 0;
+
+    // Step 1: Noise floor (25th percentile of usable bins) + width-anchor
+    // shelf (select_shape_floors, audit fix W1: p10 fallback when the band is
+    // occupied). Both derive from the SAME filled buffer.
+    uint8_t* sorted = spectrum_sort_buf_;
+    size_t sort_count = 0;
+    for (size_t i = FFT_EDGE_SKIP; i < FFT_BIN_COUNT - FFT_EDGE_SKIP; ++i) {
+        if (i >= FFT_DC_SPIKE_START && i < FFT_DC_SPIKE_END) continue;
+        sorted[sort_count++] = spectrum.db[i];
+    }
+    const ShapeFloors floors =
+        select_shape_floors(sorted, sort_count, config_.robust_width_floor_enabled);
+    const uint8_t noise_floor = floors.noise;
+    const uint8_t width_floor = floors.width;
+    out_result.noise_floor = noise_floor;
+
+    // SENS ADAPTIVE GATE (SHAPE_ADAPT_*): measure this frame's noise-driven
+    // Step-3 gate BEFORE any consumer (CFAR veto, fixed-branch collection,
+    // the chain itself) reads shape_gate_margin(). Passes spectrum_sort_buf_
+    // DIRECTLY (P0/O3): the p25/p10 quickselects above permuted it but kept
+    // the multiset, so the p75 is byte-identical to the old refill — minus
+    // the redundant 236-bin re-extraction. Step 12 kurtosis re-fills the
+    // scratch later as before.
+    update_auto_gate(sorted, sort_count, noise_floor);
+
+    const int32_t total_gain = get_current_total_gain();
+
+    // SPATIAL ENVELOPE (config_.spectrum_envelope_enabled, default ON).
+    // Computed ONCE per frame over the two sidebands (DC gap never bridged).
+    // shape_data selects it for the crest TOPOLOGY test and the shape chain's
+    // width-walk / extent / valley / flatness / symmetry / kurtosis. The
+    // envelope is monotone-RAISING (env[i] >= raw[i]), so it can only fill
+    // one-bin notches on a jagged slope — it never lowers a peak, never
+    // shrinks the Step-3 margin (still measured on RAW below), and never
+    // moves a crest's frequency. When the flag is OFF this is a no-op and
+    // shape_data == raw — the legacy path, byte-for-byte.
+    // Stack: ~8 bytes (pointer). SRAM: envelope_buf_ = 256 B (class member).
+    if (config_.spectrum_envelope_enabled) {
+        compute_envelope_frame(spectrum.db.data(), envelope_buf_,
+                               FFT_EDGE_SKIP, FFT_DC_SPIKE_START, FFT_DC_SPIKE_END);
+    }
+    const uint8_t* shape_data = config_.spectrum_envelope_enabled
+        ? static_cast<const uint8_t*>(envelope_buf_)
+        : spectrum.db.data();
+
+    if (config_.cfar_mode != CFARMode::OFF) {
+        // Find ALL CFAR-passing peaks (up to MAX_SHAPE_DETECTIONS)
+        // Zero-initialized: find_peaks() fills only the first peak_count
+        // entries; {} removes the uninitialized-read hazard on refactor.
+        CFARPeak cfar_peaks[MAX_SHAPE_DETECTIONS]{};
+        // SENSITIVE PARITY with process_spectrum_sweep (audit D-CFAR-ASYM):
+        // sweep lowers the CFAR offset by 1.0 unit (×10) in sensitive mode —
+        // DB previously ignored the setting, making it silently mode-
+        // dependent. Adaptive takes precedence in BOTH paths (no sensitive
+        // delta on top of the self-tuning threshold). Floor:
+        // CFAR_THRESHOLD_MIN_X10, same expression as the sweep branch.
+        uint8_t effective_threshold = config_.cfar_threshold_x10;
+        if (config_.adaptive_cfar_enabled) {
+            effective_threshold = adaptive_threshold_.get_optimal_threshold();
+        } else if (config_.sensitive_mode) {
+            effective_threshold = (config_.cfar_threshold_x10 > CFAR_THRESHOLD_MIN_X10 + 10)
+                ? static_cast<uint8_t>(config_.cfar_threshold_x10 - 10)
+                : static_cast<uint8_t>(CFAR_THRESHOLD_MIN_X10);
+        }
+
+        const size_t peak_count = CFARDetector::find_peaks(
+            spectrum.db.data(), FFT_BIN_COUNT,
+            cfar_peaks, MAX_SHAPE_DETECTIONS,
+            config_.cfar_mode, config_.cfar_ref_cells, config_.cfar_guard_cells,
+            effective_threshold, FFT_EDGE_SKIP, FFT_EDGE_SKIP,
+            config_.cfar_hybrid_alpha, config_.cfar_hybrid_beta, config_.cfar_hybrid_gamma,
+            config_.os_cfar_k_percent, config_.vi_cfar_threshold_x10,
+            // OS-CFAR sliding-histogram scratch (256 B class member);
+            // nullptr here would keep the slower legacy insertion-sort path.
+            cfar_hist_buf_
+        );
+
+        if (peak_count == 0) {
+            // No CFAR detection — feed negative result only when adaptive active
+            if (config_.adaptive_cfar_enabled) {
+                adaptive_threshold_.update(
+                    false, RSSI_MIN_DBM,
+                    spectrum_value_to_dbm(noise_floor, total_gain),
+                    config_.cfar_threshold_x10);
+            }
+            return false;
+        }
+
+        // Feed first (strongest) peak to adaptive threshold (only when active)
+        if (config_.adaptive_cfar_enabled) {
+            adaptive_threshold_.update(
+                true,
+                spectrum_value_to_dbm(cfar_peaks[0].power, total_gain),
+                spectrum_value_to_dbm(noise_floor, total_gain),
+                config_.cfar_threshold_x10);
+        }
+
+        // Try shape filters on each CFAR peak independently.
+        // EMISSION DEDUP: peaks are sorted strongest-first; the first passing
+        // crest of an emission records its whole SignalExtent, and any later
+        // candidate INSIDE an accepted extent is the SAME emitter (a ripple
+        // crest of the WiFi/BT top that Step 6b measured as one wide band) —
+        // skipped instead of spawning a duplicate detection. Two extents of
+        // contiguous >= cont_level runs can never overlap, so a bin-inside-
+        // extent test is an exact same-emission test. Legit separate
+        // transmitters (deep null between them, e.g. FPV video + audio
+        // subcarrier) live in different extents and both survive.
+        // Stack: accepted[] = 48 bytes.
+        SignalExtent accepted[MAX_SHAPE_DETECTIONS]{};
+        size_t accepted_count = 0;
+        for (size_t i = 0; i < peak_count && out_result.count < MAX_SHAPE_DETECTIONS; ++i) {
+            // Hoist to size_t once: CFARPeak::bin is uint8_t; every consumer
+            // below compares against size_t extents (no sign-compare noise).
+            const size_t peak_bin = cfar_peaks[i].bin;
+
+            // Same-emission fast path: skip before running the filter chain.
+            bool duplicate = false;
+            for (size_t e = 0; e < accepted_count; ++e) {
+                if (peak_bin >= accepted[e].left
+                    && peak_bin <= accepted[e].right) {
+                    duplicate = true;
+                    break;
+                }
+            }
+            if (duplicate) continue;
+
+            SignalExtent det_extent{};
+            int32_t peak_rssi = RSSI_MIN_DBM;
+            // PARALLEL SHAPE bookkeeping: written by apply_shape_filters()
+            // ONLY on success (contract F3, same as out_extent).
+            // MUST be loop-scoped, not hoisted above the branch:
+            // apply_shape_filters() does not write *out_verdict on a failed
+            // step, so a hoisted instance would retain the PREVIOUS
+            // candidate's result; a later success overwrites it, but the
+            // stale-read window is a landmine for anyone who later adds an
+            // else-branch read. Loop-scoped = the compiler reuses one 4-byte
+            // slot for every iteration, so this costs exactly the same as a
+            // hoisted instance.
+            // Stack: +4 bytes (one reused slot for the whole loop).
+            ShapeVerdict shape_verdict{};
+            if (apply_shape_filters(
+                    shape_data, peak_bin, cfar_peaks[i].power,
+                    noise_floor, width_floor, peak_rssi, FFT_EDGE_SKIP,
+                    /*has_dc_gap=*/true, total_gain,
+                    &det_extent, /*reject_edge_clipped=*/false, &shape_verdict)) {
+                if (accepted_count < MAX_SHAPE_DETECTIONS) {
+                    accepted[accepted_count++] = det_extent;
+                }
+                ShapeDetection& det = out_result.detections[out_result.count];
+                det.frequency = normal_bin_to_freq(center_freq, peak_bin, spectrum.sampling_rate);
+                det.rssi = peak_rssi;
+                det.bin_index = static_cast<uint16_t>(peak_bin);
+                det.peak_power = cfar_peaks[i].power;
+                // Valid only because shape_verdict is loop-scoped and was
+                // just written by the successful call above — no stale-read
+                // window. Legacy Sens OFF reports 100 by construction.
+                det.similarity_pct = shape_verdict.similarity_pct();
+                out_result.count++;
+            } else {
+                // TBD-RESURRECTION GUARD (FIX): a peak that cleared the Step 3
+                // margin gate but failed a shape step (MinW/MaxW/valley/
+                // sharpness/flatness/symmetry) must block TBD confirmation for
+                // this frame — TBD integrates power only and would resurrect
+                // the rejected signal TBD_MIN_FRAMES later, silently voiding
+                // the user's shape settings. Short-circuit order guards the
+                // uint8 subtraction: the second operand evaluates only when
+                // power > noise_floor. Peaks BELOW the margin gate do NOT set
+                // the flag — they are the weak-signal class TBD exists for.
+                // Same gate value as apply_shape_filters Step 3 (single source
+                // of truth: shape_gate_margin()).
+                if ((cfar_peaks[i].power > noise_floor)
+                    && (cfar_peaks[i].power - noise_floor) >= shape_gate_margin()) {
+                    out_result.shape_rejected_after_margin = true;
+                    note_shape_veto(peak_bin);  // D5: persist across frames until waterfall reset
+                }
+            }
+        }
+    } else {
+        // No CFAR — FIXED-THRESHOLD FALLBACK, byte-for-byte parity with the
+        // sweep loop's fixed-threshold collection.
+        // FIX (audit D3 + D10): the old code collected the global maximum plus
+        // two probes at max_bin ± 5 — structurally AT MOST ONE independent
+        // target per frame at the default CFARMode::OFF, so this _multi
+        // function's raison d'être (multiple FPV transmitters in one 20 MHz
+        // frame) was dead in the default configuration; the probes could also
+        // land below FFT_EDGE_SKIP (max_bin in [10..14]) in the rolloff zone
+        // excluded from floor/RSSI. Now: collect every CREST bin at/above the
+        // full Step-3 gate (shape_gate_margin) within the usable region
+        // (edge policy + DC gap — the SAME cell set as Step 1 / extract_rssi /
+        // Step 4), keep the strongest MAX_SHAPE_DETECTIONS*2 in place (top-K —
+        // no buffer growth), sort strongest-first, NMS by
+        // CFAR_MIN_PEAK_SEPARATION.
+        // FIX (audit HIGH-1 / F1): collection is crest-filtered via
+        // is_crest_bin() — a plateau/slope now occupies ONE top-K slot
+        // instead of K, so a weaker distinct emitter can no longer be
+        // evicted before sort + NMS run (uniform gate ⇒ lossless: the run's
+        // apex always enters top-K). Stack: candidates[12] × sizeof(SimplePeak)
+        // = 12 × 8 B = 96 B on ARM32 (size_t 4 + uint8 1 + 3 pad → 8) — well
+        // within the 512 B frame budget.
+        struct SimplePeak { size_t bin; uint8_t power; };
+        SimplePeak candidates[MAX_SHAPE_DETECTIONS * 2];
+        size_t cand_count = 0;
+
+        const uint8_t gate = shape_gate_margin();
+        // GATE DOMAIN (envelope audit fix A): when the opt-in spatial envelope
+        // is active, gate on the ENVELOPE value — env[i] >= raw[i] by
+        // construction, so this admits a SUPERSET of raw-gated bins at the
+        // surviving (envelope) crest positions: the "never fewer candidates"
+        // invariant now holds END-TO-END, not just inside apply_shape_filters.
+        // The is_crest_bin topology test below still removes the jagged-slope
+        // phantoms — that is the envelope's purpose. Envelope OFF:
+        // shape_data == spectrum.db.data(), so shape_data[i] is byte-identical
+        // to the legacy spectrum.db[i] gate.
+        // ATRIBUTION (envelope audit fix B): a filled notch / widened spike is
+        // a full-height plateau in the envelope; is_crest_bin anchors the
+        // crest at the plateau TAIL whose raw power may understate the peak.
+        // refine_crest_to_raw_apex() walks the plateau and returns the RAW
+        // apex, so frequency and power stay on the measured peak. OFF path:
+        // the helper is skipped, apex == i — byte-identical to legacy.
+        for (size_t i = FFT_EDGE_SKIP; i < FFT_BIN_COUNT - FFT_EDGE_SKIP; ++i) {
+            if (i >= FFT_DC_SPIKE_START && i < FFT_DC_SPIKE_END) continue;
+            const int32_t gate_power = static_cast<int32_t>(shape_data[i]);
+            const int32_t margin = gate_power - static_cast<int32_t>(noise_floor);
+            // margin > 0 preserves the old "max_val <= noise_floor → nothing"
+            // semantics even if a pathological gate==0 config ever exists.
+            if (margin > 0 && margin >= static_cast<int32_t>(gate)) {
+                // F1 crest pre-filter (audit HIGH-1): sideband-local bounds —
+                // the DC gap already excluded i above, so the run can only
+                // span within one sideband.
+                const bool left_side = (i < FFT_DC_SPIKE_START);
+                const size_t lo = left_side ? static_cast<size_t>(FFT_EDGE_SKIP)
+                                            : static_cast<size_t>(FFT_DC_SPIKE_END);
+                const size_t hi = left_side
+                    ? static_cast<size_t>(FFT_DC_SPIKE_START - 1)
+                    : static_cast<size_t>(FFT_BIN_COUNT - FFT_EDGE_SKIP - 1);
+                if (!is_crest_bin(shape_data, i, lo, hi)) continue;
+                const size_t apex = config_.spectrum_envelope_enabled
+                    ? refine_crest_to_raw_apex(spectrum.db.data(), shape_data, i, lo, hi)
+                    : i;
+                keep_strongest(candidates, cand_count,
+                               SimplePeak{apex, spectrum.db[apex]});
+            }
+        }
+
+        if (cand_count == 0) return false;
+
+        // Sort by power descending (insertion sort — small array)
+        for (size_t i = 1; i < cand_count; ++i) {
+            const SimplePeak key = candidates[i];
+            size_t j = i;
+            while (j > 0 && candidates[j - 1].power < key.power) {
+                candidates[j] = candidates[j - 1];
+                --j;
+            }
+            candidates[j] = key;
+        }
+
+        // Non-maximum suppression (parity with sweep + CFAR): peaks within
+        // CFAR_MIN_PEAK_SEPARATION of a stronger kept peak are sidelobes of
+        // the same crest — dropped here; whole-emission ripple crests are
+        // owned by the extent dedup below.
+        size_t kept = 0;
+        for (size_t i = 0; i < cand_count; ++i) {
+            bool suppressed = false;
+            for (size_t j = 0; j < kept; ++j) {
+                const size_t a = candidates[i].bin;
+                const size_t b = candidates[j].bin;
+                const size_t bin_diff = (a > b) ? (a - b) : (b - a);
+                if (bin_diff < CFAR_MIN_PEAK_SEPARATION) {
+                    suppressed = true;
+                    break;
+                }
+            }
+            if (!suppressed) candidates[kept++] = candidates[i];
+        }
+        cand_count = kept;
+
+        // EMISSION DEDUP (same as the CFAR branch): candidates arrive
+        // strongest-first; the first passing crest of a wideband emission
+        // records its whole SignalExtent and later candidates inside it are
+        // ripple crests of the SAME emitter — skipped instead of spawning
+        // duplicate detections.
+        SignalExtent accepted[MAX_SHAPE_DETECTIONS]{};
+        size_t accepted_count = 0;
+        for (size_t i = 0; i < cand_count && out_result.count < MAX_SHAPE_DETECTIONS; ++i) {
+            bool duplicate = false;
+            for (size_t e = 0; e < accepted_count; ++e) {
+                if (candidates[i].bin >= accepted[e].left
+                    && candidates[i].bin <= accepted[e].right) {
+                    duplicate = true;
+                    break;
+                }
+            }
+            if (duplicate) continue;
+
+            SignalExtent det_extent{};
+            int32_t peak_rssi = RSSI_MIN_DBM;
+            // PARALLEL SHAPE bookkeeping — loop-scoped, see the CFAR branch
+            // above for why it must not be hoisted. Stack: +4 bytes (reused).
+            ShapeVerdict shape_verdict{};
+            if (apply_shape_filters(
+                    shape_data, candidates[i].bin, candidates[i].power,
+                    noise_floor, width_floor, peak_rssi, FFT_EDGE_SKIP,
+                    /*has_dc_gap=*/true, total_gain,
+                    &det_extent, /*reject_edge_clipped=*/false, &shape_verdict)) {
+                if (accepted_count < MAX_SHAPE_DETECTIONS) {
+                    accepted[accepted_count++] = det_extent;
+                }
+                ShapeDetection& det = out_result.detections[out_result.count];
+                det.frequency = normal_bin_to_freq(center_freq, candidates[i].bin, spectrum.sampling_rate);
+                det.rssi = peak_rssi;
+                det.bin_index = static_cast<uint16_t>(candidates[i].bin);
+                det.peak_power = candidates[i].power;
+                // Written by the successful call above (loop-scoped instance).
+                det.similarity_pct = shape_verdict.similarity_pct();
+                out_result.count++;
+            } else {
+                // TBD-RESURRECTION GUARD (FIX): mirror of the CFAR branch.
+                // Every fixed-threshold candidate cleared the full Step-3 gate
+                // by construction (collection gate == shape_gate_margin, and
+                // margin > 0 above), so a shape failure here ALWAYS sets the
+                // veto — identical semantics to the CFAR branch.
+                if ((candidates[i].power > noise_floor)
+                    && (candidates[i].power - noise_floor) >= shape_gate_margin()) {
+                    out_result.shape_rejected_after_margin = true;
+                    note_shape_veto(candidates[i].bin);  // D5: persist across frames until waterfall reset
+                }
+            }
+        }
+    }
+
+    return out_result.count > 0;
+}
+
+uint8_t DroneScanner::effective_spectrum_margin() const noexcept {
+    // Single source of truth for the sensitive-mode margin relaxation (BASE).
+    // The FULL Step 3 gate — including the high-sensitivity scaling — is
+    // shape_gate_margin(); apply_shape_filters Step 3, both candidate gates,
+    // and the TBD width anchor all consume the full gate from there.
+    if (config_.sensitive_mode) {
+        return (config_.spectrum_margin > 2)
+            ? static_cast<uint8_t>(config_.spectrum_margin - 2)
+            : 1;
+    }
+    return config_.spectrum_margin;
+}
+
+uint8_t DroneScanner::shape_gate_margin() const noexcept {
+    // FULL apply_shape_filters Step 3 gate: sensitive-mode BASE margin
+    // (effective_spectrum_margin) PLUS the sensitivity scaling Step 3 applies.
+    // rssi_sens > 0 only when the RSSI threshold sits BELOW the -95 dBm
+    // anchor (RSSI_DETECTION_THRESHOLD_DBM, Sens > 75 — high sensitivity):
+    // the RSSI gate is wide open there, so the shape gate scales UP
+    // (+1 unit per 2 sensitivity points) to compensate.
+    // Sensitive mode opts out of scaling by design — the user explicitly
+    // chose maximum weak-signal sensitivity, and scaling would partially
+    // cancel the relaxation.
+    // Saturate to 255: base (up to 200 via settings clamp) + rssi_sens/2
+    // (up to ~15) cannot exceed 215 today, but keep the sum in uint16 and
+    // clamp so a future clamp change cannot reintroduce uint8 wraparound.
+    const uint8_t base = effective_spectrum_margin();
+    // SENS ADAPTIVE GATE (constants.hpp SHAPE_ADAPT_* contract #1): in Sens
+    // mode the gate is the per-frame noise measurement (3σ of the usable-
+    // bin IQR), clamped in update_auto_gate() to [FLOOR, raw Mar] — it
+    // OPENS in clean noise and can never exceed the user's raw value.
+    // Sentinel 0 = no measurement yet (first frame / chain off) → the
+    // relaxed user base (Mar − 2) fallback.
+    if (config_.sensitive_mode) {
+        return (auto_gate_ != 0) ? auto_gate_ : base;
+    }
+    const int32_t rssi_sens = rssi_sens_units(config_);
+    if (!config_.sensitive_mode && rssi_sens > 0) {
+        const uint16_t scaled =
+            static_cast<uint16_t>(base) +
+            static_cast<uint16_t>(rssi_sens / 2);
+        return (scaled > 255) ? 255 : static_cast<uint8_t>(scaled);
+    }
+    return base;
+}
+
+void DroneScanner::update_auto_gate(
+    uint8_t* cells,
+    size_t count,
+    uint8_t noise_floor
+) noexcept {
+    // SENS ADAPTIVE GATE measurement (constants.hpp SHAPE_ADAPT_* contract #1):
+    // estimate σ from the usable-bin IQR (p75 − p25; σ ≈ IQR/1.349) and
+    // store the 3σ gate clamped to [SHAPE_ADAPT_GATE_FLOOR, raw user Mar]:
+    //   clean spectrum → 3σ under the floor → floor (2 dB ≈ 5σ at σ ≈ 2 —
+    //                      a single-bin noise excursion reaches it with
+    //                      p ≈ 3e-7, so the opened gate stays quiet);
+    //   noisy spectrum → 3σ rises but the RAW user Mar CAPS it, so Sens
+    //                      mode is never stricter than the user asked
+    //                      (A-5: the old cap, effective_spectrum_margin()
+    //                      = Mar − 2, collapsed the clamp to the single
+    //                      point [8, 8] at the default Mar 10 and killed
+    //                      the measurement — see the A-5 note below);
+    //   Mar < floor (user tightened below 8) → Mar wins — explicit
+    //                      tightening is always respected.
+    // CELL SOURCE (P0/O3): the caller passes its Step-1 scratch buffer —
+    // the SAME usable-bin cell set select_shape_floors() consumed, already
+    // permuted by that quickselect. Quickselect partitions in place but
+    // preserves the multiset, so p75 over `cells` is byte-identical to the
+    // p75 the old refill-from-spectrum.db computed; the redundant 236-bin
+    // refill + re-extraction is gone (SENS frames only). The buffer's ORDER
+    // is dead after this call — both callers re-fill from scratch later
+    // (Step 12 kurtosis / next frame's Step 1), contract documented in
+    // scanner.hpp.
+    // @pre Called right after Step 1 extracted noise_floor, before any
+    //      shape_gate_margin() read of this frame (DB: analyze at the top;
+    //      sweep: before cfg_margin below). `cells` non-null when count > 0.
+    // Stack: ~20 bytes (counters + uint16 temps, registers). SRAM: 1 byte
+    //        (auto_gate_, class member). Flash: ~40 bytes here + ~48 in
+    //        auto_gate_from_iqr(). No FP, no locks.
+    if (!config_.sensitive_mode) {
+        auto_gate_ = 0;  // keep the sentinel exact while the mode is off
+        return;
+    }
+    if (cells == nullptr || count == 0) {
+        auto_gate_ = 0;
+        return;
+    }
+    const uint8_t p75 = quickselect_percentile(cells, count, 75);
+    const uint8_t iqr = (p75 > noise_floor)
+        ? static_cast<uint8_t>(p75 - noise_floor)
+        : static_cast<uint8_t>(0);
+    // 3σ ≈ IQR × 3/1.349 ≈ IQR × 2.22 → (IQR × 22 + 5) / 10 (round-half),
+    // then the A-5 CAP = RAW user Mar (2026-10): capping at
+    // effective_spectrum_margin() (Mar − 2 in Sens) collapsed the clamp to
+    // the single point [8, 8] at the default Mar 10 — FLOOR == Mar − 2 — so
+    // the 3σ measurement was DEAD at defaults: the gate sat constant at 8 in
+    // both clean and noisy spectra and SHAPE_ADAPT_* contract #1 ("the gate
+    // follows the noise") could never fire. The raw Mar widens the clamp to
+    // [FLOOR, Mar]: it OPENs to the Sens-relaxed floor in clean noise (the
+    // first-frame fallback base stays Mar − 2, so a clean frame's measured
+    // gate is never STRICTER than the placeholder), tracks 3σ upward in
+    // noise, and is capped at exactly what the user asked — never stricter
+    // than the user asked, and never stricter than Sens OFF (whose gate is
+    // Mar + rssi_sens/2 ≥ Mar). Explicit tightening (Mar < FLOOR) still
+    // wins verbatim.
+    // SINGLE AUTHOR: the formula + clamp live in shape_gate_logic.hpp
+    // auto_gate_from_iqr() — this call and the host-side A-5 tests consume
+    // the same body (the test's mirror of this clamp was deleted, audit F4
+    // pattern). uint16 holds 255 × 22 + 5 = 5615 — no overflow; the value
+    // is clamped BEFORE any uint8 narrowing.
+    auto_gate_ = auto_gate_from_iqr(iqr, config_.spectrum_margin);
+}
+
+bool DroneScanner::apply_shape_filters(
+    const uint8_t* data,
+    size_t peak_idx,
+    uint8_t raw_peak,
+    uint8_t noise_floor,
+    uint8_t width_floor,
+    int32_t& out_rssi,
+    size_t edge_skip,
+    bool has_dc_gap,
+    int32_t total_gain,
+    SignalExtent* out_extent,
+    bool reject_edge_clipped,
+    ShapeVerdict* out_verdict
+) const noexcept {
+    // Buffer length derived from the buffer type — hoisted above the guards:
+    // the Step 4 walk and emission_extent() index bins against it.
+    // Upper bound: FFT_BIN_COUNT for raw spectrum, COMPOSITE_SIZE for LG buffer.
+    const size_t data_size = has_dc_gap ? FFT_BIN_COUNT : COMPOSITE_SIZE;
+
+    // FAIL-CLOSED GUARD: raw_peak <= noise_floor would underflow the uint8
+    // peak_margin below (wraps to ~250, silently passing the Step 3 gate).
+    // Every current call site pre-validates (CFAR peaks sit above noise; the
+    // non-CFAR fallback collects only bins with margin >= shape_gate_margin()
+    // and margin > 0; the sweep fixed-threshold gate admits only bins >=
+    // noise_floor + margin) — this guard makes the contract explicit instead
+    // of relying on caller discipline.
+    if (raw_peak <= noise_floor) return false;
+
+    // FAIL-CLOSED GUARD: same validation contract as tbd_peak_is_narrowband.
+    // peak_idx >= data_size reads out of bounds in the Step 4 width walk;
+    // edge_skip >= data_size/2 would underflow upper_limit (data_size -
+    // edge_skip). Legit constants: FFT_EDGE_SKIP=10, FFT_EDGE_SKIP_NARROW=6 —
+    // all far below FFT_BIN_COUNT/2=128 and COMPOSITE_SIZE/2=120.
+    if (peak_idx >= data_size || edge_skip >= data_size / 2) return false;
+
+    // FAIL-CLOSED GUARD (choke point): a DC-spike peak carries ADC offset
+    // energy, not signal. Every current caller already excludes DC bins
+    // (CFARDetector::find_peaks hard-codes the skip; both fixed-threshold
+    // loops skip it; process_spectrum_sweep skips defensively) — enforcing
+    // it HERE gives ONE defense instead of per-caller discipline. Without
+    // it, the Step-4 walk from a DC peak degenerates (both flanks walled by
+    // the gap → width 1) and Steps 7-11 would measure "shape" inside the
+    // DC hole. Stack: 0 bytes. Flash: ~16 bytes.
+    if (has_dc_gap && peak_idx >= FFT_DC_SPIKE_START && peak_idx < FFT_DC_SPIKE_END) {
+        return false;
+    }
+
+    // Step 6b/6c + extreme-bypass accumulate into this LOCAL extent; it is
+    // published to out_extent ONLY at the success exit (audit LOW-4 / F3),
+    // so a false return can never leave an "accepted" emission behind for a
+    // future consumer. Default = degenerate peak-only (width()==1).
+    // Stack: +8 bytes (SignalExtent, register-allocatable). SRAM: 0.
+    SignalExtent final_extent{peak_idx, peak_idx};
+
+    // SINGLE-SNAPSHOT GATE (dependency audit D3): shape_gate_margin() was
+    // derived TWICE per chain run — Step 3 below and again inside Step 6c
+    // (sweep edge-clip). It is lock-free but reads config_ fields the UI
+    // thread may rewrite live, so a mid-chain settings edit could make ONE
+    // run gate on margin A and edge-clip on margin B (a torn-config frame).
+    // One snapshot at the top makes the whole 13-step chain consume a
+    // single consistent view and drops one redundant derivation.
+    // Verdict-identical: both old call sites consumed the same pure
+    // expression. Stack: +1 byte (register). SRAM: 0. Flash: ~8 bytes.
+    const uint8_t gate_snapshot = shape_gate_margin();
+
+    const uint8_t peak_margin = static_cast<uint8_t>(raw_peak - noise_floor);
+
+    // VERY STRONG SIGNAL BYPASS (opt-in via config_.shape_bypass_enabled):
+    // When enabled AND peak_margin > 80 (~16 dB above noise, e.g. drone
+    // within ~50m), three effects activate:
+    //   1) Switch elevated_threshold from margin/3 to margin/2, narrowing the
+    //      width measurement to prevent inflation from elevated flanking bins.
+    //   2) Skip valley depth, symmetry, and kurtosis checks (unreliable when
+    //      all bins in the signal band are elevated).
+    //   3) At peak_margin > 96 (~19 dB), also skip max_width check because
+    //      even the narrowed threshold may still capture the full bandwidth.
+    // Default (shape_bypass_enabled == false): very_strong is always false —
+    // max_width, valley, symmetry and kurtosis are enforced on EVERY signal
+    // regardless of strength, so a powerful flat WiFi/BT carrier can never
+    // bypass MaxW (bypass used to be implicit and always-on, which let
+    // close-range wideband signals through even with MaxW=5).
+    // Stack: 1 byte (local bool). Flash: 0 (inline).
+    const bool very_strong = config_.shape_bypass_enabled
+        && (peak_margin > VERY_STRONG_SIGNAL_MARGIN);
+
+    // Sensitivity-adaptive filter scaling:
+    // At high sensitivity (low threshold), the RSSI gate is wide open and shape
+    // filters must work harder to reject noise. We derive a sensitivity factor
+    // from the RSSI threshold: 0 at the -95 dBm anchor
+    // (RSSI_DETECTION_THRESHOLD_DBM, Sens 75), positive when the threshold
+    // sits below it (Sens > 75, higher sensitivity).
+    // At low sensitivity (strict threshold), the RSSI gate does most of the work
+    // so shape filters stay at defaults (no loosening).
+    const int32_t rssi_sens = rssi_sens_units(config_);
+
+    // Step 3: Peak must be significantly above noise floor
+    // Gate value is the SINGLE-SNAPSHOT taken above (shape_gate_margin() —
+    // the single source of truth combining the sensitive-mode relaxation
+    // (Mar-2, via effective_spectrum_margin()) with the high-sensitivity
+    // scaling below; snapshotted once so Step 6c cannot observe a different
+    // value — dependency audit D3).
+    // The SAME full gate is applied by the sweep fixed-threshold candidate
+    // gate, the normal-mode secondary candidate gate, and the TBD narrowband
+    // guard's width elevation anchor. Previously the sensitive reduction was
+    // nullified here (this step re-checked the full config margin), so peaks
+    // with margin 3-4 passed CFAR and were then rejected — the sensitive
+    // relaxation was dead code.
+    // At sens=75: gate = spectrum_margin (no change).
+    // At sens=87 (rssi_sens=12): gate = spectrum_margin + 6.
+    // In sensitive mode the scaling is NOT applied — and the gate itself is
+    // the NOISE-ADAPTIVE measurement (auto_gate_, SHAPE_ADAPT_*): the user
+    // explicitly opts for maximum weak-signal sensitivity, and the scaling
+    // would partially cancel the relaxation.
+    const uint8_t effective_margin = gate_snapshot;
+    if (peak_margin < effective_margin) return false;
+
+    // SENS ADAPTIVE STRINGENCY WEIGHT (SHAPE_ADAPT_* contract #2) — the
+    // heart of "Sens = self-tuning shape": w = how far the peak sits above
+    // the entry gate, 0..100 with full stringency at gate + SLACK (+4 dB).
+    // sensitive_mode OFF forces w = 100 → w2 = 10000 → every eased formula
+    // in Steps 5-12 collapses to the exact user value (legacy byte-identity
+    // by construction). All steps stay ACTIVE in Sens mode; thresholds ease
+    // QUADRATICALLY (w2/10000) so a marginal peak is judged gently while a
+    // strong one still faces the full user thresholds. At w == 0 (peak
+    // exactly at the gate) every EASED step abstains — the peak only just
+    // cleared the minimum bar and its geometry is noise-dominated — but that
+    // is NOT an unjudged window: the A-1 raw fallback (raw_sim_armed block
+    // below) re-admits the exact Sens-OFF ladder for this peak, so with
+    // default gates the w ∈ {0, 5, 10} band is judged at FULL stringency;
+    // only an all-gates-OFF config keeps the documented empty-group pass.
+    // Stack: +4 bytes (two register locals). SRAM: 0. Flash: ~60 bytes.
+    const uint8_t adapt_w = config_.sensitive_mode
+        ? shape_adapt_weight(peak_margin, effective_margin)
+        : 100;
+    const uint16_t w2 =
+        static_cast<uint16_t>(adapt_w) * static_cast<uint16_t>(adapt_w);
+
+    // Step 4: Count elevated bins around peak (signal width)
+    // /3 instead of /4: for weak signals (peak_margin=20), /4 gives 5 units above
+    // noise (~1 dB) where 1-bin quantization noise dominates width measurement.
+    // /3 gives 7 units (~1.4 dB), providing more stable width for marginal signals.
+    // Very strong signals use /2 instead: at close range, ALL bins in the signal
+    // band are elevated, so /3 captures too many bins and inflates width beyond
+    // max_width, causing false rejection. /2 narrows the threshold to the actual
+    // peak region, producing a reliable width measurement.
+    // WIDTH-ANCHOR FLOOR (audit fix W1): the bar is anchored at width_floor,
+    // NOT noise_floor. In a clean frame the two are identical
+    // (select_shape_floors keeps p25 until p25 - p10 reaches
+    // WIDTH_FLOOR_CONTAM_DELTA_UNITS), so this is a no-op there. In an
+    // OCCUPIED frame (WiFi/BT filling >= ~75% of usable bins) p25 is the
+    // emission itself: anchoring at p25 put the bar ~1-2 dB under the crest,
+    // MaxW measured the crest's curvature (1-3 bins) instead of the
+    // bandwidth, and a 20-40 MHz flat top passed MaxW=2. Anchoring at p10
+    // (the quiet minority's shelf) drops the bar back under the plateau, the
+    // walk spans the real emission and Step 6/6b reject it. Documented cost:
+    // in such a frame a narrowband target adjacent to the wideband band can
+    // bridge into its plateau (every connecting bin is >= the lower bar) and
+    // inherit the rejection — accepted, the alternative trusts a shelf that
+    // IS the signal.
+    const uint8_t elevated_divisor = very_strong ? 2 : 3;
+    // Saturate to 255: width_floor (0-255) + margin/2 (0-127) can exceed
+    // uint8 without this (e.g. floor 200 + 50 = 250 ok, but 255 + 60
+    // would wrap to 59 and corrupt the width measurement). uint16 holds
+    // the sum, clamp keeps the threshold in-range.
+    const uint16_t elevated_sum =
+        static_cast<uint16_t>(width_floor) +
+        static_cast<uint16_t>(peak_margin / elevated_divisor);
+    const uint8_t elevated_threshold = (elevated_sum > 255) ? 255 : static_cast<uint8_t>(elevated_sum);
+
+    const size_t upper_limit = data_size - edge_skip;
+
+    // Width expansion: extend left/right while bins are above elevated_threshold.
+    // DC spike (bins 120-135) is a hard boundary — expansion stops, never bridges.
+    // The DC spike contains ADC offset energy (not real signal), so including it
+    // inflates width by up to 16 bins (1.25 MHz), causing false rejects (max_width)
+    // or false accepts (min_width) for signals near DC.
+    size_t left = peak_idx;
+    while (left > edge_skip) {
+        const size_t prev = left - 1;
+        if (has_dc_gap && prev >= FFT_DC_SPIKE_START && prev < FFT_DC_SPIKE_END) {
+            break;
+        }
+        if (data[prev] < elevated_threshold) break;
+        --left;
+    }
+
+    size_t right = peak_idx;
+    while (right < upper_limit - 1) {
+        const size_t next = right + 1;
+        if (has_dc_gap && next >= FFT_DC_SPIKE_START && next < FFT_DC_SPIKE_END) {
+            break;
+        }
+        if (data[next] < elevated_threshold) break;
+        ++right;
+    }
+
+    const size_t signal_width = right - left + 1;
+
+    // Walk-stop classification (audit fix D8): distinguish a THRESHOLD stop
+    // (a real, measurable flank) from a MEASUREMENT BOUNDARY stop (window edge
+    // or DC wall — the shape beyond the boundary was never observed). Steps
+    // 9/11 must not read boundary artifacts as shape evidence: symmetry used
+    // to count a clipped flank as width 0, collapse sym_pct to 0% and reject
+    // ANY signal parked at a window/DC boundary for "asymmetry" that was
+    // actually an observation gap. Valley already treats an unavailable flank
+    // as margin 0 (no veto) — see its comment at Step 9.
+    // Stack: 2 bytes (bools, typically register-allocated). Flash: ~24 bytes.
+    const bool left_clipped =
+        (left <= edge_skip)
+        || (has_dc_gap && peak_idx >= FFT_DC_SPIKE_END && left == FFT_DC_SPIKE_END);
+    const bool right_clipped =
+        (right >= upper_limit - 1)
+        || (has_dc_gap && peak_idx < FFT_DC_SPIKE_START && right == FFT_DC_SPIKE_START - 1);
+
+    // Step 5: Minimum width
+    // NO SENS EASING (dependency audit, 2026-10): MinW is a USER band edge,
+    // not a noise-adaptive threshold. The old SHAPE_ADAPT_MIN_WIDTH_RELAX
+    // eased MinW down toward (MinW - 10) bins inside gate..gate+4dB, so a
+    // user who set MinW = 25 was silently served ~15 bins near the gate —
+    // the setting appeared not to work. MinW is now enforced at the exact
+    // config value at EVERY peak_margin. Sens OFF was already byte-identical
+    // (w = 100 => relax = 0); the only behavior change is Sens ON near the
+    // gate, and stricter there is exactly the requested direction. At the
+    // then-shipped default (MinW = 2) the old relaxation already clamped to
+    // the then-spike-floor (DEFAULT_SPECTRUM_MIN_WIDTH, later raised to 20,
+    // then 60, now 40),
+    // so the default path stayed byte-identical (dependency audit: no test,
+    // no arming predicate and no
+    // sweep-specific site consumes minw_relax — Step 13 effective-arming
+    // reads only the raw MaxW plus eased_sharpness_limit /
+    // eased_flatness_limit, never MinW).
+    // Stack: ~0 bytes (one register local; the relaxation temps are gone).
+    // Flash: ~-40 bytes.
+    const uint8_t minw_eff = config_.spectrum_min_width;
+    if (signal_width < minw_eff) return false;
+
+    // Step 6: Maximum width
+    // Opt-in bypass only (shape_bypass_enabled): at peak_margin > 96 (~19 dB),
+    // ALL bins in the signal band are elevated, making width measurement
+    // unreliable even with the narrowed /2 threshold. Skip max_width check.
+    // At peak_margin 81-96: use config max_width with the narrowed /2
+    // threshold — width is now reliable enough to enforce.
+    // Default (bypass disabled): max_width is ALWAYS enforced — the MaxW
+    // value from Settings is authoritative at any signal strength.
+    // AUDIT B1: the old condition `!very_strong || peak_margin <=
+    // EXTREME_SIGNAL_MARGIN` silently disabled the WHOLE MaxW pair
+    // (fragment + emission extent) for every peak_margin > 96 even when the
+    // bypass flag was OFF — extreme WiFi/BT flat-tops then had NO
+    // width-domain filter at all (Flat, now armed at defaults, is a SHAPE
+    // gate, not a width gate). Below MaxW is
+    // enforced whenever the bypass flag is OFF, regardless of strength
+    // (the /2 elevated threshold keeps the measurement trustworthy).
+    // SENS ADAPTIVE (SHAPE_ADAPT_*): the MEASURED width inflates near the
+    // gate (walk bar inside the noise band) — ease MaxW up to ×1.5 at w = 0,
+    // exact user MaxW at w = 100 (OFF path byte-identical). The DC-gap cap
+    // (≤110/114 measurable bins) and Step 6c (sweep) still bound the result,
+    // so the relaxation cannot open a wideband hole beyond the window.
+    if (config_.shape_bypass_enabled && peak_margin > EXTREME_SIGNAL_MARGIN) {
+        // Extreme-signal bypass: width checks skipped by explicit user opt-in.
+        // Degenerate peak-only extent — dedup consumers must not
+        // over-suppress bypassed signals. Published at the success exit (F3).
+        final_extent = SignalExtent{peak_idx, peak_idx};
+    } else {
+        // MaxW is the user's EXACT config value (eased_maxw_bins removed —
+        // see its tombstone above). Inert at the shipped default in DB
+        // (110 = the sideband extent cap); in sweep the same 110 rejects
+        // 111-114-bin wall-to-wall extents (A-2 — intended tightening);
+        // stricter near the gate
+        // only when the
+        // user lowered MaxW below the sideband cap. The same raw value feeds
+        // the Step-13 EFFECTIVE-ARMING test and tbd_peak_is_narrowband, so
+        // all three MaxW consumers agree by construction.
+        const uint16_t maxw_eff = config_.spectrum_max_width;
+        if (signal_width > maxw_eff) return false;
+
+        // Step 6b: EMISSION EXTENT (the real MaxW semantics).
+        // signal_width (Step 4) is the FRAGMENT above the peak-relative /3
+        // threshold; emission_extent() measures the WHOLE emission the
+        // fragment belongs to: the walk runs at the QUARTER-POWER level
+        // (noise + max(margin/4, gate/3)) so shallow dips the fragment stopped
+        // at now bridge (audit fix D2 — with the old half-power anchor the
+        // extent was a strict subset of the fragment and this check could
+        // never fire after Step 6), and the HALF-POWER trim removes noise-
+        // shelf shoulders, so for smooth skirts the extent still ends at the
+        // -6 dB point: MaxW keeps mapping to real bandwidth — analog FM video
+        // (8-18 MHz) measures ~100-140 bins per DC-gap sideband and passes
+        // MaxW=110 at ANY range (A-2: 110 bins ≈ 8.6 MHz, at the DB extent
+        // cap; the widest single-sideband skirts measured 111-114 bins in
+        // sweep are now rejected by MaxW itself — intended tightening, see
+        // DEFAULT_SPECTRUM_MAX_WIDTH); WiFi rejection is owned by the
+        // sharpness gate (flat OFDM tops ≈ 100-115: the 111-115 tail is now
+        // rejected by MaxW itself, the rest by sharpness) + valley depth.
+        // Interior dips deeper than
+        // quarter-power still split (legit video+audio nulls).
+        // WIDTH-ANCHOR FLOOR (audit fix W1): fed with width_floor, same
+        // contaminated-frame demotion as the Step-4 bar above — a plateau
+        // invisible to the p25-anchored quarter/half-power levels must stay
+        // invisible to neither, or Step 6b would silently keep measuring the
+        // crest curvature. Clean frames: width_floor == noise_floor, call is
+        // byte-identical.
+        const SignalExtent emission = emission_extent(
+            [data](size_t i) noexcept { return data[i]; },
+            peak_idx, data_size, width_floor, peak_margin, edge_skip, has_dc_gap);
+        if (emission.width() > maxw_eff) return false;
+
+        // Step 6c: EDGE-CLIP GUARD (sweep-only; reject_edge_clipped=true).
+        // BOTH-EDGES RULE (FPV-relaxed): an emission is a clipped fragment
+        // ONLY when it spans the ENTIRE usable slice window (>= ~17.8 MHz
+        // wall-to-wall at the half-power level), which no FPV channel does
+        // (analog video at −6 dB: 8-14 MHz) but WiFi/BT-wide OFDM (20-40+
+        // MHz) does at EVERY sweep position.
+        // FIX (audit D1 — WAS DEAD CODE): the Step-4/emission walks are
+        // DC-gap bounded (has_dc_gap=true), so a single extent can touch at
+        // most ONE window wall (left sideband caps at bin 119, right starts
+        // at 136) — the old `clip_left && clip_right` on one extent was
+        // structurally false for EVERY peak and rejected nothing while the
+        // docs called this "the primary sweep WiFi gate". The rule now
+        // BRIDGES the DC gap: the emission must reach its FAR window wall at
+        // half power, its DC-adjacent bin must hold half power, the opposite
+        // DC-adjacent bin must hold half power, and the whole opposite
+        // sideband must hold half power up to its own wall — one continuous
+        // wall-to-wall emission across the window.
+        // Why not single-edge: the retune grid (f_min + k*step) is FIXED
+        // across passes, so a fat FPV peak (~10-15 MHz) sits at a fixed
+        // phase inside the slice — if that phase puts one skirt on the
+        // boundary, the old single-edge rule rejected it on EVERY pass
+        // (the "wide FPV sails past the scanner almost always" failure).
+        // One-edge touches never satisfy the bridge (the opposite sideband is
+        // not full) → the FPV relaxation survives; two adjacent emitters
+        // filling the window wall-to-wall are indistinguishable from one
+        // 17.8 MHz emission across the DC hole and are rejected as such.
+        // clip_level = half-power (peak − 6 dB floored at gate/3), as
+        // documented — it is >= emission_extent()'s quarter-power walk level,
+        // so wall tests are strictly stronger than the walk that found the
+        // boundary. DB scan passes false: VTX drift may sit at the DB window
+        // edge BY DESIGN and must not be rejected.
+        // Stack: ~20 bytes (levels, flags, counters). Flash: ~200 bytes.
+        // Worst case ~228 byte-compares, only when the emission already
+        // touches its far wall (rare) — no division, no float.
+        if (reject_edge_clipped) {
+            // Gate from the SAME top-of-function snapshot as Step 3
+            // (SINGLE-SNAPSHOT GATE, dependency audit D3): one consistent
+            // view of config_ for the whole chain run.
+            const uint8_t gate_6c = gate_snapshot;
+            const uint8_t half_power_6c = static_cast<uint8_t>(peak_margin / 2);
+            const uint8_t gate_floor_6c =
+                (gate_6c >= 3) ? static_cast<uint8_t>(gate_6c / 3) : 1;
+            const uint8_t clip_elevation =
+                (half_power_6c > gate_floor_6c) ? half_power_6c : gate_floor_6c;
+            const uint16_t clip_level =
+                static_cast<uint16_t>(noise_floor) + clip_elevation;
+
+            bool spans_window = false;
+            if (!has_dc_gap) {
+                // Generic (DC-free) buffer: ONE walk can touch both walls —
+                // original both-edges semantics apply directly.
+                spans_window = (emission.left <= edge_skip)
+                    && (emission.right >= upper_limit - 1)
+                    && (data[edge_skip] >= clip_level)
+                    && (data[upper_limit - 1] >= clip_level);
+            } else if (peak_idx < FFT_DC_SPIKE_START) {
+                // Peak in the LEFT sideband [edge_skip..119]. Far wall = left
+                // window edge; DC crossing = emission reached bin 119 at
+                // continuation level (re-tested here at half power), and then
+                // the whole right sideband must hold half power to its wall.
+                // PATCH 2 (audit D1 follow-up): the O(width) sideband scan is
+                // now gated on BOTH the near (DC) and the FAR wall —
+                // spans_window requires wall_left anyway, so evaluating it
+                // first is behavior-identical (spans_window = wall_left &&
+                // wall_right unchanged) and makes the header comment ("~228
+                // byte-compares only when the emission already touches its far
+                // wall") literally true: emissions that reach the DC bridge
+                // but leave through ONE wall never run the scan.
+                // Stack: ~0 bytes (reuses existing locals).
+                const bool wall_left = (emission.left <= edge_skip)
+                    && (data[edge_skip] >= clip_level);
+                const bool dc_bridge = (emission.right >= FFT_DC_SPIKE_START - 1)
+                    && (data[FFT_DC_SPIKE_START - 1] >= clip_level);
+                bool wall_right = dc_bridge && wall_left;
+                for (size_t i = FFT_DC_SPIKE_END; wall_right && i < upper_limit; ++i) {
+                    if (data[i] < clip_level) wall_right = false;
+                }
+                spans_window = wall_left && wall_right;
+            } else {
+                // Peak in the RIGHT sideband [136..upper-1]: mirrored.
+                const bool wall_right = (emission.right >= upper_limit - 1)
+                    && (data[upper_limit - 1] >= clip_level);
+                const bool dc_bridge = (emission.left <= FFT_DC_SPIKE_END)
+                    && (data[FFT_DC_SPIKE_END] >= clip_level);
+                bool wall_left = dc_bridge && wall_right;
+                for (size_t i = FFT_DC_SPIKE_START - 1; wall_left && i >= edge_skip;) {
+                    if (data[i] < clip_level) wall_left = false;
+                    else if (i == edge_skip) break;
+                    else --i;
+                }
+                spans_window = wall_right && wall_left;
+            }
+            if (spans_window) {
+                return false;  // spans the whole window — wider than any FPV
+            }
+        }
+
+        // F3: staged for publication at the success exit — Steps 7-12 below
+        // may still reject, and a rejected verdict must not leave a written
+        // extent behind (contract: out_extent is valid iff return == true).
+        // UNION (dedup fix): publish fragment ∪ emission, NOT the trimmed
+        // emission alone. The half-power trim can cut INSIDE the Step-4
+        // fragment — start_level = noise + max(gate, margin/2) sits ABOVE
+        // the fragment bar (noise + margin/3) whenever margin > 2·gate — so
+        // a shoulder crest that Step 4 measured as part of THIS emission
+        // could fall outside the published extent, escape dedup, and spawn
+        // a duplicate detection of the same emitter. The union is a
+        // superset of BOTH width measurements (each already checked ≤
+        // MaxW by Steps 6/6b before this line) and restores the dedup
+        // contract: "bin inside extent ⇒ same emission".
+        // Stack: +8 bytes (two register min/max). Flash: ~32 bytes.
+        final_extent = SignalExtent{
+            (emission.left < left) ? emission.left : left,
+            (emission.right > right) ? emission.right : right};
+    }
+
+    // ========================================================================
+    // PARALLEL SHAPE BODY — Steps 7..12.
+    //
+    // MEASURE ONCE, JUDGE ALL. Steps 7/9/10 historically each walked the
+    // Step-4 fragment [left..right] (up to ~236 bins) with their own
+    // threshold — three passes over the same bytes. They are fused into ONE
+    // loop whose per-accumulator guards are loop-invariant booleans, so at
+    // the default config (Sharp strict, Flat ARMED, Valley OFF) the cost is
+    // exactly
+    // legacy Step 7's loop plus two predictable branches.
+    //
+    // COMBINATION:
+    //   Sens OFF — legacy fail-fast order 7 -> 8 -> 9 -> 10 -> 11 -> 12,
+    //              each `if (!sens_parallel && armed && !ok) return false`.
+    //              Verdict-identical to AND: every predicate is pure in
+    //              {data, config, Step-4 band}, so evaluation order cannot
+    //              change the accept/reject result.
+    //   Sens ON  — no similarity early return; the HARD envelope (Steps 3/5/
+    //              6/6b/6c/8) has already returned above, and the similarity
+    //              group decides via ShapeVerdict::similarity_ok() below.
+    //              A-1 RAW FALLBACK (see the raw_sim_armed block below): when
+    //              w-easing silences the WHOLE similarity group, the run_*
+    //              arming and w2_eff switch to the raw Sens-OFF-equivalent
+    //              set so the group can never auto-pass on an empty score.
+    //
+    // DC-GAP PARITY (audit-critical): legacy Step 7 and Step 10 do
+    // `if (is_dc) continue;` while legacy Step 9 CLOSES the current run
+    // first. Fusing with `{ close_run(); continue; }` is exact: close_run()
+    // touches only Step-9 state, which Steps 7/10 never read, and the
+    // `continue` reproduces their skip. Order WITHIN an iteration is
+    // irrelevant (no shared mutable state besides the local `v`).
+    //
+    // AUDIT D3 (stack — the pre-audit "Net ~ +4 bytes" claim was wrong and
+    // is replaced by a counted bound plus a measurement instruction):
+    //
+    //   NEW function-scope locals, ALL simultaneously live from the arming
+    //   block to the combine (this is what a stack-usage measurement sees):
+    //     ShapeVerdict verdict .................  4 B
+    //     effective_width ......................  4 B
+    //     margin_sum ...........................  4 B
+    //     margin_count/high_power_count/
+    //       extra_runs/extra_widest/cur_run .... 20 B  (5 x size_t)
+    //     6 arming bools + sens_parallel
+    //       + need_fuse .........................  8 B
+    //     ridge_seen/in_run/cur_has_peak .......  3 B
+    //     secondary_threshold/required_dip/
+    //       high_power_threshold/deepest_dip ...  4 B
+    //     effective_flatness_min/
+    //       sim_min_pct_raw/sim_min_pct ........  3 B
+    //     A-1 raw set: 5 raw bools + flat_structural + raw_fallback
+    //       + 5 run_* + raw_sim_armed + w2_eff ... 17 B
+    //                                    total .. 67 B
+    //
+    //   LEGACY peak-simultaneous for the same section: the Step 7/9/10/11
+    //   temps were in DISJOINT scopes, so the compiler could (and with -Os
+    //   did) overlap them — the largest single block was Step 9 at ~22 B,
+    //   and Step 11's 18 B reused those slots. Peak ≈ 22 B.
+    //
+    //   => realistic worst-case delta ≈ +28 B of stack in
+    //   apply_shape_filters, NOT +4. Not a violation (the 4 KB process
+    //   stack has ample headroom and most of the scalars above are
+    //   register-allocatable on M4), but the number is a BOUND, not a
+    //   measurement. Before shipping a change that grows this frame again,
+    //   measure it for real:
+    //       arm-none-eabi-g++ ... -fstack-usage
+    //   and read scanner.cpp.su for apply_shape_filters. The 16 B of
+    //   Step-11 geometry was already pulled out of the arming block for
+    //   exactly this reason (see the sim_armed_sym comment above).
+    // SRAM: 0 (no new members). Flash: ~420 bytes.
+    // No FP, no allocation, no locks, no recursion.
+    // ========================================================================
+    constexpr uint8_t KURTOSIS_MIN_SEGMENT_BINS = 4;
+    // Named `sens_parallel`, not `parallel` — a bare `parallel` reads as
+    // "concurrently" in a file that is about to gain a fused pass, and
+    // invites a false conclusion about threads. Loop-invariant.
+    const bool sens_parallel = config_.sensitive_mode;
+    // Loop-invariant user threshold for the similarity group ("Shape score").
+    // 50 = majority-or-tie, so the group can never be STRICTER than the
+    // legacy ladder it replaces; 100 = legacy AND verdict. Clamped
+    // defensively: a stale or corrupt in-RAM config must never be able to
+    // make the score impossible to reach (> 100) or to silence it (< 50).
+    // Stack: +1 byte.
+    const uint8_t sim_min_pct_raw = config_.shape_sim_threshold_pct;
+    const uint8_t sim_min_pct =
+        (sim_min_pct_raw < SHAPE_SIM_THRESHOLD_MIN_PCT)
+            ? SHAPE_SIM_THRESHOLD_MIN_PCT
+            : (sim_min_pct_raw > SHAPE_SIM_THRESHOLD_MAX_PCT
+                   ? SHAPE_SIM_THRESHOLD_MAX_PCT
+                   : sim_min_pct_raw);
+
+    // ---- ARMING: which similarity steps produce a verdict for THIS peak ----
+    // Hoisted ABOVE the measurement so the fused loop can guard each
+    // accumulator with a loop-invariant branch. An unarmed step neither
+    // votes nor dilutes the score, and — for the legacy branch — an unarmed
+    // step simply passes, exactly as its old `if` never executed.
+    // Stack: 15 B here (6 arming bools + effective_flatness_min +
+    //        effective_width 4 B + 2 x sim_min_pct), all register-
+    //        allocatable. The Step-11 geometry (16 B) is deliberately NOT
+    //        here — it lives inside the Step 11 block (audit D3).
+    //        See the PARALLEL SHAPE BODY banner above for the counted total.
+    // SRAM: 0.
+    // Shared author (flatness_min_peak_margin): the Step-13
+    // EFFECTIVE-ARMING flat term consumes the SAME run guard (audit M3
+    // rev. 2) — an armed Flat verdict may only be granted when this step
+    // would actually RUN for this peak. A-3 waiver: a fragment >=
+    // FLATNESS_WIDE_WAIVER_BINS (40 bins ≈ 3.1 MHz) bypasses this floor
+    // entirely (wideband evidence); the mirror at Step 13 stays
+    // conservative (no width term) to never skip a post-filter the chain
+    // didn't run.
+    // At Sens <= 75 (rssi_sens <= 0): guard = FLATNESS_MIN_PEAK_MARGIN (40, ~8 dB).
+    // At sens=87 (rssi_sens=12): guard = max(15, 40-12) = 28 (~5.6 dB).
+    // At sens=95 (rssi_sens=20): guard = max(15, 40-20) = 20 (~4 dB).
+    const uint8_t effective_flatness_min = flatness_min_peak_margin(rssi_sens);
+
+    // Step 7 arming — INFORMATIVE-ARMING (audit D-ARM, 2026-10). A similarity
+    // step is armed ONLY when its verdict is structurally capable of
+    // REJECTING: an abstaining config must not occupy a score seat, in
+    // either the numerator or the denominator (an unarmed step votes for
+    // nobody — exactly as its legacy `if` never executed).
+    // The old predicate (`> 50`) armed the whole D5 dead-band 51..100 — a
+    // range that can NEVER reject (avg includes the peak ⇒ sharpness >= 100
+    // every frame, see SHARPNESS_NOOP_CEILING) yet cast an ALWAYS-PASS vote.
+    // Under "Shape score" (Sens ON) that phantom vote diluted every REAL
+    // dissent to a tie: {Sharp(pass, inert), Flat(fail)} = 50/50, and a tie
+    // PASSES at the then-default threshold 50 — enabling Flat could never reject
+    // a WiFi flat-top while Sharp sat at its 100 default. NOW: armed iff
+    //     eased_sharpness_limit(user, w2) > SHARPNESS_NOOP_CEILING
+    // — the SAME informative predicate the Step-13 EFFECTIVE-ARMING test
+    // consumes (audit M3 rev. 2), so the score denominator and the
+    // wideband-ownership test can no longer disagree. The explicit
+    // `adapt_w > 0` term is subsumed: w = 0 ⇒ eased limit = 100 ⇒ abstain
+    // (matches every other Sens step's w = 0 abstention).
+    // Sens OFF VERDICT-IDENTITY PROOF: at w2 = 10000 the eased limit is the
+    // raw user value; for user <= 100 Step 7's early-return could never
+    // fire (ok was unconditionally true — peak bin guarantees margin_count
+    // >= 1 and avg <= peak), so skipping the step changes no accept/reject
+    // — it only removes the phantom score vote and skips the fused-loop
+    // work (a small CPU win at defaults). user > 100: armed, unchanged.
+    // Field floor 50 stays the UI OFF sentinel (50..100 all abstain).
+    // A-1 CROSS-REF (raw fallback below): abstention here is SAFE only
+    // because the fallback re-admits the raw gate set whenever easing
+    // silences the WHOLE similarity group — an abstaining no-op step must
+    // never turn a configured rejection into an auto-pass.
+    const bool sim_armed_sharp =
+        (eased_sharpness_limit(config_.spectrum_peak_sharpness, w2) >
+         SHARPNESS_NOOP_CEILING);
+
+    // Step 9 arming — legacy outer condition (verbatim) plus the D-ARM
+    // rejection-capability term below.
+    const bool valley_outer =
+        (config_.spectrum_valley_depth > 0) && !very_strong &&
+        (!config_.sensitive_mode || adapt_w > 0);
+    // INFORMATIVE-ARMING CAPABILITY (audit D-ARM ext. 2026-10 — regime (3)
+    // of constants.hpp): the probe margins are data[i] − noise_floor over
+    // data[i] <= 255 (uint8 bins), so max_valley can NEVER exceed
+    // 255 − noise_floor. When noise_floor + eased_valley_limit() > 255 not
+    // even a bin at the top of the dB scale can reach the limit: ok ≡
+    // (max_valley < limit) ≡ true for EVERY possible flank terrain, and
+    // the step would take a permanent ALWAYS-PASS score seat (the exact
+    // dilution D-ARM exists to remove). High-noise + deep-D regime
+    // (e.g. D = 70, noise > 185 at w = 100; broader under w-easing).
+    // Sens OFF VERDICT-IDENTITY: when the check fires,
+    // max_valley <= 255 − noise_floor < D = limit, so the legacy fail-fast
+    // early-return could never have fired either — skipping the step
+    // changes no accept/reject, it only removes the phantom vote and the
+    // probe/fused-loop work (a CPU win). The dual-peak skip
+    // (has_secondary_peak) still lives INSIDE the armed verdict but,
+    // since audit M2, registers as a NEUTRAL abstention (seat removed
+    // from both sim_armed and sim_pass) instead of the old always-pass
+    // agreement vote.
+    const bool sim_armed_valley = valley_outer &&
+        ((static_cast<uint16_t>(noise_floor) +
+          eased_valley_limit(config_.spectrum_valley_depth, peak_margin, w2))
+         <= 255u);
+
+    // Step 10 denominator — measured exactly as legacy did (DC-range
+    // subtraction over [left..right]; no size_t underflow is possible
+    // because the walk never enters the gap). signal_width == right-left+1
+    // by construction (Step 4). Computed for EVERY F > 0 peak now: A-3's
+    // wide-fragment waiver reads it BEFORE the margin floor, so the old
+    // flat_structural gate can no longer precede it.
+    size_t effective_width = signal_width;
+    if ((config_.spectrum_flatness > 0) && has_dc_gap &&
+        left < FFT_DC_SPIKE_END && right >= FFT_DC_SPIKE_START) {
+        const size_t dc_start = (left > FFT_DC_SPIKE_START) ? left : FFT_DC_SPIKE_START;
+        const size_t dc_end = (right < FFT_DC_SPIKE_END) ? right : (FFT_DC_SPIKE_END - 1);
+        effective_width -= (dc_end - dc_start + 1);
+    }
+
+    // Step 10 arming: the OUTER run guard (Flat + peak-margin floor [A-3
+    // waived for wide fragments] + adapt_w). The narrowband guard is
+    // folded in below as sim_armed_flat.
+    // A-1 RAW FALLBACK (below): the w-independent head (user F > 0 +
+    // margin floor/waiver) is factored out as flat_structural — the raw
+    // set needs the SAME structural guards Sens OFF applies, without the
+    // w > 0 term. SINGLE AUTHOR: shape_gate_logic.hpp flatness_structural()
+    // (this call and the host-side A-3 tests share one body — the test's
+    // mirror of the predicate was deleted, audit F4 pattern).
+    // A-3 WIDE-FRAGMENT FLOOR WAIVER (2026-10): the margin floor protects
+    // the flatness STATISTIC on narrow low-SNR fragments; a fragment that
+    // already spans >= FLATNESS_WIDE_WAIVER_BINS (~3.1 MHz) is wideband
+    // evidence by itself, so a WiFi/BT plateau parked in the gate..floor
+    // band no longer escapes Flat (it was owned only by MaxW/sharpness
+    // there). Applies in BOTH modes. DOCUMENTED COST: weak wide BLUNT-TOP
+    // analog FPV in that band now dies on the default Flat = 25 — see
+    // constants.hpp FLATNESS_WIDE_WAIVER_BINS.
+    const bool flat_structural =
+        flatness_structural(config_.spectrum_flatness, peak_margin,
+                            effective_flatness_min, effective_width);
+    const bool flat_outer =
+        flat_structural && (!config_.sensitive_mode || adapt_w > 0);
+    // Narrowband guard: flatness is meaningless for very narrow signals.
+    // A 2-4 bin burst (ELRS/FrSky in sweep mode) is inherently "flat"
+    // (1-2 high-power bins out of 2-4 = 50-100%) and was previously
+    // rejected whenever peak_margin >= FLATNESS_MIN_PEAK_MARGIN — making
+    // spectrum_min_width=2 unreachable at moderate+ SNR. WiFi/BT
+    // flat-tops span dozens of bins and are unaffected by this guard.
+    //
+    // INFORMATIVE-ARMING (audit D-ARM, 2026-10 — symmetric with Step 7):
+    // the abstention band is now 99..100 (FLATNESS_EFFECTIVE_CEILING, F1
+    // fix 2026-10). A limit of 100 could never reject (pct > 100 is
+    // unreachable); a limit of 99 rejects ONLY the synthetic pct == 100
+    // (every bin within 10% of the 90% bar) — a real WiFi/BT plateau
+    // (40-90%) or blunt-top FPV (45-70%) sails over it, so 99 is an
+    // ABSTENTION, not a verdict. Both used to take a permanent
+    // ALWAYS-PASS score seat: {Sharp(100, inert), Flat(99, inert)} = 2
+    // seats, 100% — and any REAL dissent added later was diluted 1-vs-1
+    // to a passing tie at the then-default threshold 50. Worse, the eased
+    // default F = 25 lands exactly on 99 throughout the w <= 10 band
+    // (25 + 75·(10000−w²)/10000 = 99 ⇔ w² <= 133): at w = 0 the group was
+    // silenced and the A-1 raw fallback caught it, but at w = 5/10 the
+    // phantom Flat(99) seat kept the group NON-EMPTY, so the fallback
+    // never engaged and a wideband plateau AUTO-PASSED 100%-scored while
+    // w = 0 and w >= 15 both rejected it — stringency was NON-MONOTONIC
+    // in SNR (audit F1). Armed iff the eased limit can actually reject a
+    // real flat top:
+    //     eased_flatness_limit(F, w2) < FLATNESS_EFFECTIVE_CEILING
+    // — the SAME predicate the Step-13 EFFECTIVE-ARMING flat term consumes
+    // (audit M3 rev. 2). Reachable regime: flat_outer already excludes
+    // F = 0 and w = 0; at F = 99/100 the step now abstains in BOTH modes
+    // (Sens OFF VERDICT-IDENTITY: the old step ran but could never reject
+    // a real top — pct <= 99 <= limit ⇒ ok unconditionally true except at
+    // the synthetic pct == 100 — so skipping it changes no meaningful
+    // accept/reject — it only removes the phantom vote and the
+    // high_power_threshold accumulation, a small CPU win). At defaults
+    // (F = 25) the step arms from w >= 15 (limit 98) up; below that the
+    // A-1 raw fallback runs the exact user ladder instead.
+    // UNCAPPED BY DESIGN: arming reads the EXACT eased value — the
+    // FLAT_WIDE_BAR_PCT (85) cap applies only to the Step-10 PASS/FAIL
+    // comparison (flatness_judgment_limit below). Capping THIS predicate
+    // would arm the w = 5/10 seat (capped 85 < 99) that the F1 fix
+    // deliberately closed, keeping the group non-empty, killing the raw
+    // fallback and letting plateaus <= 85% auto-pass exactly where the
+    // ladder must rule (see constants.hpp FLAT_WIDE_BAR_PCT).
+    const bool sim_armed_flat =
+        flat_outer && (effective_width > FLATNESS_MIN_SIGNAL_WIDTH) &&
+        (eased_flatness_limit(config_.spectrum_flatness, w2) <
+         FLATNESS_EFFECTIVE_CEILING);
+
+    // Step 11 arming. left/right start at peak_idx and only expand (Step 4),
+    // so left <= peak_idx <= right always holds.
+    //
+    // AUDIT D3 (stack): the pre-audit arming also carried `(max_side > 0)`
+    // and therefore had to materialise left/right/max/min_side (4 x size_t
+    // = 16 B) up here, in scope for the WHOLE fused tail. That term was
+    // provably vacuous — signal_width > 1 (already in this conjunction)
+    // => right >= left+1 => left_width + right_width >= 1 => max_side >= 1
+    // — so it filtered nothing while costing 16 B of simultaneous liveness
+    // in the deepest frame of the DB path. Dropped; the geometry now lives
+    // inside the Step 11 block where it is read, and the /0 proof travels
+    // with the division. Verdict-identical: the term was always true.
+    //
+    // INFORMATIVE-ARMING CAPABILITY (audit D-ARM ext. 2026-10 — regime (4)
+    // of constants.hpp): sym_limit = user·w²/10000 TRUNCATES TO 0 in the
+    // user·w² < 10000 band (e.g. Y = 50 & w <= 14), and ok = (sym_pct >=
+    // 0) is then vacuously true for every geometry — an always-pass
+    // dilution seat exactly like the Sharp/Flat no-op ceilings. Armed only
+    // when the bar is >= 1 (a real reject exists: sym_pct == 0, i.e. the
+    // peak sits on one fragment edge — width > 1 guarantees max_side >= 1,
+    // so sym_pct is well-defined). Sens OFF VERDICT-IDENTITY: at w2 =
+    // 10000 the limit is the raw user Y > 0 (Y = 0 never armed), so the
+    // new term is vacuously true there — no Sens-OFF behavior change.
+    const bool sim_armed_sym =
+        (config_.spectrum_symmetry > 0) && (signal_width > 1) && !very_strong &&
+        (!config_.sensitive_mode || adapt_w > 0) && !left_clipped && !right_clipped &&
+        (eased_sym_limit(config_.spectrum_symmetry, w2) > 0);
+
+    // Step 12 arming. MIN-SAMPLE ABSTAIN: SpectralKurtosis::compute early-outs
+    // below 4 samples with a zeroed result (kurtosis_x10 = 0) — running it on
+    // a narrow burst would REJECT on an undefined statistic.
+    // Same 4-bin floor FLATNESS_MIN_SIGNAL_WIDTH uses for the same reason.
+    // NO CAPABILITY TERM (audit D-ARM ext. 2026-10 — proof of ABSENCE):
+    // unlike Sharp/Flat/Valley/Sym, Step 12 has NO always-pass regime, so
+    // adding one would be a bug, not a fix. kurtosis_x10 = excess kurtosis
+    // × 10 (spectral_kurtosis.hpp) ranges DOWN to ≈ −30 — platykurtic
+    // flat-tops are NEGATIVE, Gaussian noise ≈ 0 — while the settings
+    // clamp (settings_manager.cpp: 0..200) and the w-easing keep
+    // kurt_limit >= 0 in EVERY armed configuration, including the
+    // truncated-to-0 band user·w² < 10000 where ok = (kurtosis_x10 >= 0)
+    // is a REAL "reject the flat/platykurtic" verdict, not a vacuous pass.
+    // Every reachable limit is therefore structurally violable; the arming
+    // is already rejection-capable. A `kurt_limit > 0` disarm would
+    // LOOSEN Step 12 (kurt < 0 would no longer reject) and break Sens-OFF
+    // verdict identity at kurtosis_min_x10 = 0.
+    const bool sim_armed_kurt =
+        config_.kurtosis_enabled && (peak_margin >= FLATNESS_MIN_PEAK_MARGIN) &&
+        !very_strong && (!config_.sensitive_mode || adapt_w > 0) &&
+        (signal_width >= KURTOSIS_MIN_SEGMENT_BINS);
+
+    // ---- A-1 RAW SET: "would Sens OFF run (and reject with) this step?" ----
+    // Same structural guards as the eased arming minus the w-easing terms,
+    // limits at w2 = 10000 via the SAME shared helpers (single author — no
+    // formula copies). raw_armed_* is a superset of its eased twin for every
+    // gate (eased limits sit between the raw limit and its no-op ceiling),
+    // so the pair (eased, raw) cleanly separates "user-OFF / structurally
+    // skipped" (raw empty) from "silenced by easing" (raw non-empty).
+    const bool raw_armed_sharp =
+        (eased_sharpness_limit(config_.spectrum_peak_sharpness, 10000u) >
+         SHARPNESS_NOOP_CEILING);
+    const bool raw_armed_valley = (config_.spectrum_valley_depth > 0) && !very_strong &&
+        ((static_cast<uint16_t>(noise_floor) +
+          eased_valley_limit(config_.spectrum_valley_depth, peak_margin, 10000u))
+         <= 255u);
+    const bool raw_armed_flat = flat_structural &&
+        (effective_width > FLATNESS_MIN_SIGNAL_WIDTH) &&
+        (eased_flatness_limit(config_.spectrum_flatness, 10000u) <
+         FLATNESS_EFFECTIVE_CEILING);
+    const bool raw_armed_sym = (config_.spectrum_symmetry > 0) && (signal_width > 1) &&
+        !very_strong && !left_clipped && !right_clipped;
+    const bool raw_armed_kurt = config_.kurtosis_enabled &&
+        (peak_margin >= FLATNESS_MIN_PEAK_MARGIN) && !very_strong &&
+        (signal_width >= KURTOSIS_MIN_SEGMENT_BINS);
+
+    ShapeVerdict verdict{};
+    verdict.sim_armed = static_cast<uint16_t>(
+        (sim_armed_sharp ? SHAPE_BIT_SHARPNESS : uint16_t{0}) |
+        (sim_armed_valley ? SHAPE_BIT_VALLEY : uint16_t{0}) |
+        (sim_armed_flat ? SHAPE_BIT_FLATNESS : uint16_t{0}) |
+        (sim_armed_sym ? SHAPE_BIT_SYMMETRY : uint16_t{0}) |
+        (sim_armed_kurt ? SHAPE_BIT_KURTOSIS : uint16_t{0}));
+
+    // ---- A-1 RAW FALLBACK (fail-closed, 2026-10; band-true after F1) ----
+    // The informative arming above ABSTAINS whenever easing drops a
+    // configured gate into its no-op/abstention regime (Sharp eased to 100,
+    // Flat eased to 99 — the F1 fix, Sym truncated to 0, Valley ceiling
+    // widened past 255...). At the shipped defaults (Sharp 165, Flat 25,
+    // Sym 25, Vly 0, Kurt off) that silences the WHOLE group exactly for
+    // w ∈ {0, 5, 10} (peak_margin − gate ≤ 2 units ≈ 0.4 dB — Sharp's
+    // w² <= 153 dead-band AND Flat's new w² <= 133 abstention band overlap
+    // there); at w = 15 Sharp(101)/Flat(98) re-arm and the normal path
+    // resumes. BEFORE the F1 fix the w = 5/10 seats kept a phantom
+    // Flat(99) seat: the group was non-empty, the fallback below never
+    // engaged, and a wideband flat-top AUTO-PASSED 100%-scored while
+    // w = 0 and w ≥ 15 both rejected it (stringency non-monotonic in SNR).
+    // The combine below saw an EMPTY armed set, similarity_pct()
+    // returned its documented "empty = full = 100" and the candidate
+    // AUTO-PASSED the entire similarity group: a wideband flat-top the
+    // same user gates reject at full weight (and that Sens OFF rejects via
+    // the identical ladder) slipped through with "Shape score" ON and
+    // bypass OFF. FIX: when (and only when) the eased set is empty while
+    // the RAW set — the exact gate set Sens OFF runs on THIS peak — is
+    // not, the verdict switches to the raw set and w2 to 10000: every step
+    // Sens OFF would run now votes at the exact user limit (the Sens-OFF
+    // ladder, byte-identical), so a real narrowband target still passes on
+    // its merits while the flat-top is rejected. IDENTITY CASES:
+    //   - user gates OFF (Sharp <= 100, Vly = 0, Flat = 0/99/100 [99 newly
+    //     abstains under F1], Sym = 0, Kurt off): raw set empty too ->
+    //     fallback stays off -> the empty score keeps passing (documented
+    //     Sens-OFF identity);
+    //   - gates structurally skipped for THIS peak (Flat margin floor,
+    //     narrow width, very_strong): the same guards sit in the raw set
+    //     -> empty -> pass, because Sens OFF skips them as well;
+    //   - Sens OFF: sens_parallel is false -> fallback never engages.
+    // Threshold semantics unchanged: the SAME clamped score (50..100,
+    // DEFAULT 100 = strict AND — every armed step must pass on BOTH sets,
+    // so the fallback can never be LOOSER than the eased path; on the
+    // 3-seat raw set even a lowered 75 still reads as AND) applies to the
+    // raw set exactly as it does to the eased set —
+    // lowering shape_sim_threshold_pct stays a permissive opt-in in both
+    // regimes. DOCUMENTED RESIDUAL (audit D2, fail-closed BY DESIGN): the
+    // fallback band w ∈ {0, 5, 10} judges at FULL Sens-OFF stringency, so
+    // targets that only pass UNDER easing are rejected exactly there and
+    // re-enter at w >= 15 —
+    //   (a) wide blunt-top video (flatness 45-70% > raw Flat = 25), and
+    //   (b) asymmetric narrow bursts (sym_pct < raw Sym = 25, while the
+    //       eased Sym bar is 0 until w >= 20);
+    // both classes have a per-gate user remedy (raise Flat/Sym, lower the
+    // score threshold) — loosening the raw ladder for everyone would trade
+    // the documented WiFi/noise FP rejection this band exists for, so the
+    // band stays fail-closed. The FLAT_WIDE_BAR_PCT judgment cap is INERT
+    // under the fallback (w2_eff = 10000 ⇒ limit = eased = clamp(F), raw F
+    // for in-domain F) — the ladder is
+    // byte-identical with or without the cap.
+    // Stack: +7 bools + uint16 (register-allocatable). Flash: ~120 bytes.
+    const uint16_t raw_sim_armed = static_cast<uint16_t>(
+        (raw_armed_sharp ? SHAPE_BIT_SHARPNESS : uint16_t{0}) |
+        (raw_armed_valley ? SHAPE_BIT_VALLEY : uint16_t{0}) |
+        (raw_armed_flat ? SHAPE_BIT_FLATNESS : uint16_t{0}) |
+        (raw_armed_sym ? SHAPE_BIT_SYMMETRY : uint16_t{0}) |
+        (raw_armed_kurt ? SHAPE_BIT_KURTOSIS : uint16_t{0}));
+    // SINGLE AUTHOR: shape_gate_logic.hpp raw_fallback_engages() — this
+    // site and the host-side A-1 tests share one boolean (the test's
+    // mirror of the decision was deleted, audit F4 pattern).
+    const bool raw_fallback = raw_fallback_engages(
+        sens_parallel, verdict.sim_armed, raw_sim_armed);
+    if (raw_fallback) verdict.sim_armed = raw_sim_armed;
+    // EFFECTIVE per-step arming consumed by the fused loop and the Step
+    // 7..12 bodies below: the eased gate normally, the raw gate under the
+    // fallback (eased bits are all false in that regime by construction).
+    const bool run_sharp = raw_fallback ? raw_armed_sharp : sim_armed_sharp;
+    const bool run_valley = raw_fallback ? raw_armed_valley : sim_armed_valley;
+    const bool run_flat = raw_fallback ? raw_armed_flat : sim_armed_flat;
+    const bool run_sym = raw_fallback ? raw_armed_sym : sim_armed_sym;
+    const bool run_kurt = raw_fallback ? raw_armed_kurt : sim_armed_kurt;
+    // w2 switch: 10000 collapses EVERY eased formula in Steps 7-12 (and the
+    // HARD Step 8 ratio) to the raw user limit — the Sens-OFF ladder.
+    const uint16_t w2_eff = raw_fallback ? uint16_t{10000} : w2;
+
+    // ---- Thresholds needed INSIDE the fused loop (loop-invariant) ----
+    uint8_t secondary_threshold = 0;  // Step 9 ridge bar  = noise + margin/2
+    uint8_t required_dip = 0;         // Step 9 dual-peak dip = max(margin/6, 2)
+    if (run_valley) {
+        // Saturate to 255: peak_margin/2 (0-127) added to noise_floor
+        // (0-255) can overflow uint8 (e.g. 255 + 60 -> 59 without this),
+        // which would lower the dual-peak bypass bar and misroute wideband
+        // signals into the valley filter.
+        const uint16_t secondary_sum =
+            static_cast<uint16_t>(noise_floor) +
+            static_cast<uint16_t>(peak_margin / 2);
+        secondary_threshold =
+            (secondary_sum > 255) ? 255 : static_cast<uint8_t>(secondary_sum);
+        // Integer-only dip floor — REACHABILITY FIX (audit D-1): every bin
+        // inside [left..right] is >= noise_floor + peak_margin/3 by the Step-4
+        // walk invariant, so a dip measured from secondary_threshold
+        // (= noise + peak_margin/2) can never exceed
+        // floor(m/2) - floor(m/3) ~= m/6. The old margin/4 floor was therefore
+        // UNSATISFIABLE for peak_margin >= 15 — the dual-peak skip was inert in
+        // every normal configuration, including the margin >= 213 regime where
+        // the README recommends arming Vly (70-80). margin/6 is the MAXIMALLY
+        // STRICT reachable threshold: it fires only when the inter-lobe null
+        // bottoms out at the walk bar (within 0..2 units of quantization slack,
+        // by m mod 6) — the deepest two-lobe evidence the fragment can carry —
+        // which minimizes false "dual peak" claims by rippled WiFi tops.
+        // Floor 2 (~1x the ~2-unit FFT noise sigma): below margin ~12 the
+        // criterion stays effectively disabled, so noise dither cannot claim
+        // dual-peak at ultra-low SNR. Reachable for every margin >= 10 (and
+        // 8); dead corners {5,6,7,9} cap the dip at 1 unit = noise anyway.
+        // (margin >= 5 here via Step 3, so no division by zero.) B5 guards
+        // unchanged: flat-top => extra_runs == 0, ripple-top =>
+        // extra_runs >= 2 — neither reaches this check. Default Vly = 0 =>
+        // the block never executes (byte-identical at defaults).
+        required_dip =
+            (peak_margin / 6u >= 2u) ? static_cast<uint8_t>(peak_margin / 6u) : 2u;
+    }
+
+    uint8_t high_power_threshold = 0;  // Step 10 bar = noise + 0.9 * margin
+    if (run_flat) {
+        // AUDIT MEDIUM-1 (fix F2): the old `raw_peak * 9 / 10` measured
+        // 90% of the ABSOLUTE dB-compressed value, so the effective
+        // elevation above the shelf shrank as the noise floor rose
+        // (share = 0.9 - 0.1 * noise / peak_margin: 65% of margin at
+        // noise=100 but only 50% at noise=160 for the SAME shape) —
+        // flatness verdicts drifted with gain while every other chain
+        // step is noise-relative. New threshold = noise_floor + 0.9 *
+        // peak_margin = a stable 90% of the peak-above-noise.
+        // Deliberate TIGHTENING vs. the old behavior (0.9 > 0.5..0.65) —
+        // documented in constants.hpp @ DEFAULT_SPECTRUM_FLATNESS.
+        // uint16 math: noise + 0.9*margin <= noise + 0.9*(255-noise)
+        // = 0.9*255 + 0.1*noise <= 255; saturate is defense-in-depth.
+        const uint16_t hp_sum =
+            static_cast<uint16_t>(noise_floor) +
+            static_cast<uint16_t>((static_cast<uint16_t>(peak_margin) * 9u) / 10u);
+        high_power_threshold = (hp_sum > 255) ? 255 : static_cast<uint8_t>(hp_sum);
+    }
+
+    // ---- FUSED MEASUREMENT PASS over [left..right] ----
+    // Accumulators: Step 7 (margin sum/count), Step 9 (ridge runs + dip),
+    // Step 10 (>=90% bin count). Guarded per-step so an unarmed step costs
+    // one predictable branch per bin instead of its whole loop.
+    // FIX MEDIUM-3: size_t counters — [left,right] spans up to ~236 bins;
+    // uint8_t counters were one refactor away from wraparound.
+    // Counting rule (Step 9): the peak bin is evaluated NORMALLY (raw_peak >=
+    // secondary_threshold by construction: threshold = noise+margin/2
+    // <= noise+margin = raw_peak, saturation-safe per above). Hence the
+    // main lobe is always exactly one run; the run CONTAINING peak_idx
+    // is the main lobe and is excluded, every other run is an extra
+    // ridge. Position-keyed exclusion (`i == peak_idx -> continue`)
+    // would instead SPLIT the main lobe into two counted ridges and a
+    // true dual-peak would score 3, never 1.
+    // Stack: ~28 bytes. SRAM: 0. No division, no FP, one read per bin.
+    int32_t margin_sum = 0;
+    size_t margin_count = 0;
+    size_t high_power_count = 0;
+    size_t extra_runs = 0;
+    size_t extra_widest = 0;
+    size_t cur_run = 0;
+    uint8_t deepest_dip = 0;
+    bool ridge_seen = false;  // a run opened at least once (gates dip)
+    bool in_run = false;
+    bool cur_has_peak = false;
+
+    const bool need_fuse = run_sharp || run_valley || run_flat;
+    if (need_fuse) {
+        for (size_t i = left; i <= right; ++i) {
+            // DC gap TERMINATES a run (hard measurement boundary, same as
+            // the Step 4 walk): two flanks must never glue across it.
+            // Steps 7/10 simply skip the bin; Step 9 closes its current run
+            // first. close_run() touches ONLY Step-9 state, which 7/10 never
+            // read — so the fused order is exact.
+            if (has_dc_gap && i >= FFT_DC_SPIKE_START && i < FFT_DC_SPIKE_END) {
+                if (run_valley && in_run) {
+                    in_run = false;
+                    if (!cur_has_peak) {
+                        ++extra_runs;
+                        if (cur_run > extra_widest) extra_widest = cur_run;
+                    }
+                }
+                continue;
+            }
+            const uint8_t v = data[i];
+
+            if (run_sharp && v > noise_floor) {
+                margin_sum += static_cast<int32_t>(v) - static_cast<int32_t>(noise_floor);
+                ++margin_count;
+            }
+
+            if (run_valley) {
+                if (v >= secondary_threshold) {
+                    if (!in_run) {
+                        in_run = true;
+                        cur_run = 0;
+                        cur_has_peak = false;
+                        ridge_seen = true;
+                    }
+                    ++cur_run;
+                    if (i == peak_idx) cur_has_peak = true;
+                } else {
+                    if (in_run) {
+                        in_run = false;
+                        if (!cur_has_peak) {
+                            ++extra_runs;
+                            if (cur_run > extra_widest) extra_widest = cur_run;
+                        }
+                    }
+                    // Valley floor: deepest below-threshold bin once ridges
+                    // exist. Leading edge-transition bins are excluded by
+                    // ridge_seen; trailing ones count only when they bottom out
+                    // near the walk bar (dip >= required_dip — the reachable
+                    // margin/6 criterion documented above).
+                    if (ridge_seen) {
+                        const uint8_t dip = static_cast<uint8_t>(secondary_threshold - v);
+                        if (dip > deepest_dip) deepest_dip = dip;
+                    }
+                }
+            }
+
+            // FIX (audit D7 -> D-D — COUNT vs RANGE): the numerator counts
+            // EVERY bin of the measured band [left..right] at/above the 90%
+            // bar — exactly the denominator's range (README/constants contract:
+            // "share of bins WITHIN the band that carry >= 90% of the
+            // peak-above-noise"). The previous pair of loops walked outward
+            // from the peak and BROKE at the first sub-threshold bin: a dip
+            // below 90% inside the band hid every bin beyond it, so a dual-lobe
+            // flat top under-scored and escaped Flat (implementation was more
+            // permissive than documented). The left loop also historically
+            // skipped bin `left`/peak entirely (audit D7 — up to 1/width soft).
+            if (run_flat && v >= high_power_threshold) ++high_power_count;
+        }
+        if (run_valley && in_run && !cur_has_peak) {
+            ++extra_runs;
+            if (cur_run > extra_widest) extra_widest = cur_run;
+        }
+    }
+
+    // ---- Step 7: Peak sharpness (enforce inverted-V shape) ----
+    // SENS ADAPTIVE (was: skipped in sensitive mode — now stays ACTIVE):
+    // at low SNR noise bins inflate avg_margin, so the LIMIT eases with w²
+    // toward the documented no-op (100) instead of switching the step off —
+    // marginal peaks keep a gentle shape check, strong peaks the full value.
+    // MATH DEAD-BAND (audit D5, documented in constants.hpp): avg_margin is
+    // computed over [left..right] which INCLUDES the peak bin, so
+    // avg_margin <= peak_margin and sharpness >= 100 for EVERY frame —
+    // thresholds 51..100 can never reject anything (100 is the documented
+    // no-op default); effective filtering starts at 101. No comparison
+    // change can fix this (the peak is the range maximum by construction).
+    // D-ARM (2026-10): because the dead-band is unfalsifiable, arming now
+    // treats it as ABSTENTION (run_sharp false ⇒ this block never
+    // runs, no sim_pass bit, no score seat) instead of a mandatory
+    // always-pass vote — see the Step 7 arming comment above. A-1 fallback
+    // may re-admit raw_armed_sharp when the whole eased group is empty.
+    if (run_sharp) {
+        const int32_t avg_margin =
+            (margin_count > 0) ? (margin_sum / static_cast<int32_t>(margin_count)) : 0;
+        // avg_margin <= 0 (count == 0) is a REJECT in legacy, not an abstain —
+        // preserved verbatim so the dead-band semantics cannot drift.
+        const bool ok = (avg_margin > 0) &&
+            ((static_cast<int32_t>(peak_margin) * 100) / avg_margin >=
+             eased_sharpness_limit(config_.spectrum_peak_sharpness, w2_eff));
+        // Shared author (eased_sharpness_limit): the Step-13
+        // EFFECTIVE-ARMING test consumes the SAME formula (audit M3 rev. 2).
+        if (ok) verdict.sim_pass |= SHAPE_BIT_SHARPNESS;
+        if (!sens_parallel && !ok) return false;
+    }
+
+    // ---- Step 8: Peak ratio (tall+narrow) — HARD, both modes ----
+    // SENS ADAPTIVE: limit = user·w²/10000 — w = 100 → exact user R,
+    // small w → 0 (abstain: a near-gate peak's ratio is noise-dominated).
+    // Kept at its legacy position (after 7, before 9) so the reject ORDER is
+    // unchanged for Sens OFF; as a HARD step it early-returns in Sens ON too
+    // (the envelope is a conjunction — no score applies to it).
+    if (config_.spectrum_peak_ratio > 0) {
+        const int32_t ratio_limit =
+            (static_cast<int32_t>(config_.spectrum_peak_ratio) *
+             static_cast<int32_t>(w2_eff)) / 10000;
+        if (ratio_limit > 0) {
+            const int32_t ratio =
+                (static_cast<int32_t>(peak_margin) * 10) / static_cast<int32_t>(signal_width);
+            if (ratio < ratio_limit) return false;
+        }
+    }
+
+    // ---- Step 9: Valley depth (deep valleys flanking peak = V-shape) ----
+    // Skip for dual-/multi-peak signals (FPV video + audio subcarrier): the
+    // valley between two legitimate peaks is NOT a rejection criterion.
+    // Detection counts ridges above the half-peak level (FIX B5 below) — the
+    // legacy "any bin above half-peak" test was satisfied by a WiFi flat-top
+    // by construction and was replaced.
+    // Very strong signal bypass: flanking bins ARE the signal at close range.
+    // SENS ADAPTIVE (was: skipped in sensitive mode — now stays ACTIVE):
+    // the allowed flank eases with w² toward the smooth-flank ceiling
+    // (margin/3 + 1) — near the gate valley effectively abstains, at full
+    // stringency it is exactly the user D — weak-signal geometry stays
+    // protected without a binary bypass.
+    // D-ARM ext. 2026-10: guarded by run_valley (outer conditions
+    // AND the noise+limit <= 255 capability term — see the arming block),
+    // so an unreachable-limit frame never enters this block, never takes
+    // a score seat and never pays the probe cost.
+    if (run_valley) {
+        // FIX B5 (narrow dual-peak skip): the old "any bin above half-peak"
+        // test was satisfied by dozens of bins of a WiFi flat-top, so valley
+        // NEVER rejected flat-tops while claiming to. Count ridges above the
+        // half-peak level instead: skip valley only for exactly ONE extra
+        // narrow ridge with a real dip beside it (FPV video + audio
+        // subcarrier). Stack: ~24 bytes (size_t counters stay in registers).
+        // Exactly ONE extra NARROW ridge with a real dip: FPV video+audio.
+        // Flat-top (0 extra), ripple-top (2+ extra), wide second lobe all
+        // fall through to the valley check below.
+        const bool has_secondary_peak =
+            (extra_runs == 1u) &&
+            (extra_widest <= DUAL_PEAK_MAX_RUN_BINS) &&
+            (deepest_dip >= required_dip);
+
+        bool ok = true;
+        if (!has_secondary_peak) {
+            // Boundary flanks (audit fix D8): a flank stopped by the window
+            // edge or the DC wall is an OBSERVATION GAP, not a measurement —
+            // the side contributes margin 0 (no veto) and is never read from
+            // rolloff/DC bins. Valley only REJECTS elevated flanks, so an
+            // unmeasurable side can never cause a false reject; both sides
+            // unmeasurable = filter has no evidence (wideband spanning the
+            // window is owned by Step 6c/MaxW, not by valley).
+            //
+            // WINDOWED PROBE (audit D-VALLEY-PROBE): each side reads up to
+            // VALLEY_PROBE_MAX_BINS usable bins OUTSIDE the fragment and
+            // takes the maximum margin. The old 1-bin probe read only the
+            // first bin below the walk bar, so a 1-bin notch at the fragment
+            // edge masked an elevated continuation (plateau/second lobe) one
+            // bin further out — valley under-measured and passed emissions
+            // with no valley at all. For a SMOOTH monotone flank the first
+            // bin is the maximum of the walk (it only descends past it), so
+            // the measured value — and the documented ceiling
+            // floor((margin-1)/3) — are IDENTICAL to the old behavior; only
+            // terrain that RISES beyond an edge dip now counts. Window (6) <
+            // NMS separation (10): a distinct neighbour respecting
+            // CFAR_MIN_PEAK_SEPARATION stays outside the window whenever
+            // this emission ends at a real null. Stops are guarded: window
+            // end, edge_skip rolloff zone, DC wall (never bridges, never
+            // underflows size_t).
+            // Stack: ~10 bytes (two margins + loop indices, registers).
+            // Flash: ~160 bytes. No FP, no division, worst case 12 compares.
+            uint8_t left_valley_margin = 0;
+            uint8_t right_valley_margin = 0;
+
+            if (left > edge_skip) {
+                const size_t lv = left - 1;
+                const bool dc_blocked =
+                    has_dc_gap && lv >= FFT_DC_SPIKE_START && lv < FFT_DC_SPIKE_END;
+                if (!dc_blocked) {
+                    size_t i = lv;
+                    for (uint8_t n = 0; n < VALLEY_PROBE_MAX_BINS; ++n) {
+                        if (has_dc_gap && i >= FFT_DC_SPIKE_START && i < FFT_DC_SPIKE_END) break;
+                        if (data[i] > noise_floor) {
+                            const uint8_t m = static_cast<uint8_t>(data[i] - noise_floor);
+                            if (m > left_valley_margin) left_valley_margin = m;
+                        }
+                        if (i <= edge_skip) break;
+                        --i;
+                    }
+                }
+            }
+            if (right < upper_limit - 1) {
+                const size_t rv = right + 1;
+                const bool dc_blocked =
+                    has_dc_gap && rv >= FFT_DC_SPIKE_START && rv < FFT_DC_SPIKE_END;
+                if (!dc_blocked) {
+                    size_t i = rv;
+                    for (uint8_t n = 0; n < VALLEY_PROBE_MAX_BINS; ++n) {
+                        if (has_dc_gap && i >= FFT_DC_SPIKE_START && i < FFT_DC_SPIKE_END) break;
+                        if (data[i] > noise_floor) {
+                            const uint8_t m = static_cast<uint8_t>(data[i] - noise_floor);
+                            if (m > right_valley_margin) right_valley_margin = m;
+                        }
+                        if (i + 1 >= upper_limit) break;
+                        ++i;
+                    }
+                }
+            }
+
+            const uint8_t max_valley = (left_valley_margin > right_valley_margin)
+                ? left_valley_margin : right_valley_margin;
+            // SENS eased limit (max-polarity): D + (margin/3 + 1)·
+            // (10000 − w²)/10000 — at w = 100 it is exactly the user D
+            // (OFF byte-identical). uint16: D ≤ 200 + ceiling ≤ 86 → 286.
+            // Shared author (eased_valley_limit): the Step-9
+            // INFORMATIVE-ARMING capability term consumes the SAME formula
+            // (audit D-ARM ext. 2026-10), so the arming test and the chain
+            // cannot drift. PRECISE REACH (audit D-W0): the "+ ceiling"
+            // term only bounds the FIRST probe bin (the Step-4 walk
+            // guarantees data[left−1] − noise ≤ margin/3 − 1). The
+            // remaining VALLEY_PROBE_MAX_BINS−1 bins sit OUTSIDE the walk
+            // and are NOT bounded by margin/3, so at w = 0 the limit is NOT
+            // "above every measurable flank": elevated terrain within the
+            // 6-bin window (a plateau or second lobe one notch beyond an
+            // edge dip) can still exceed it and reject. The
+            // `adapt_w > 0` guard above additionally makes the step abstain
+            // at exactly w == 0, so the reachable w=0 case is really
+            // 0 < w < 100 where the limit is already ≥ D.
+            const uint16_t valley_limit =
+                eased_valley_limit(config_.spectrum_valley_depth, peak_margin, w2_eff);
+            ok = (max_valley < valley_limit);
+        }
+        // ABSTENTION MODEL — THREE KINDS COEXIST BY DESIGN, and they must
+        // not be "unified" by a future auditor:
+        //
+        //  (a) very_strong => valley_outer == false => the step is UNARMED.
+        //      It contributes nothing to sim_armed (denominator) and nothing
+        //      to sim_pass (numerator): a fully NEUTRAL abstention.
+        //  (b) has_secondary_peak => the ridge scan RAN but the veto was
+        //      deliberately withheld. Audit M2: the seat is now REMOVED from
+        //      BOTH sim_armed and sim_pass (neutral abstention, same shape
+        //      as (a)) — previously it counted as AGREEMENT and pulled the
+        //      score UP. The legacy accept/reject path is unchanged (the
+        //      skip still never early-returns below), and at the default
+        //      shape_sim_threshold_pct = 100 the accept set is identical
+        //      (every remaining armed step must pass either way — removing
+        //      a 1/1 pass seat from both numerator and denominator cannot
+        //      flip a ==100 comparison). What changes is the LOWERED
+        //      threshold band: a WiFi/BT flat-top with one narrow side
+        //      lobe + dip (dual-peak geometry) no longer gets a free
+        //      forgiveness vote that could mask a dissenting Sharp/Flat
+        //      verdict at score >= 50 opt-in.
+        //  (c) noise_floor + eased_valley_limit() > 255 (D-ARM ext. 2026-10,
+        //      regime (3)) => sim_armed_valley == false even when
+        //      valley_outer is true: max_valley is structurally bounded by
+        //      255 − noise_floor, so ok ≡ true and the step would have been
+        //      a permanent always-pass seat. Kind (c) is a fully NEUTRAL
+        //      abstention, identical to (a) — the block above never runs.
+        if (has_secondary_peak) {
+            verdict.sim_armed &= ~SHAPE_BIT_VALLEY;
+        } else if (ok) {
+            verdict.sim_pass |= SHAPE_BIT_VALLEY;
+        }
+        if (!sens_parallel && !ok) return false;
+    }
+
+    // ---- Step 10: Flatness (reject flat-top signals like WiFi/BT) ----
+    // Guard: skip for weak signals where flatness measurement is unreliable.
+    // At high sensitivity, lower the guard so flatness activates earlier —
+    // this is critical because flatness is the primary WiFi/BT rejection filter.
+    // The run guard, the peak-margin floor and the narrowband guard are all
+    // folded into run_flat above, so entering this block means legacy
+    // would have entered BOTH of its nested `if`s — the `effective_width > 0`
+    // check of the draft is dead (arming requires > FLATNESS_MIN_SIGNAL_WIDTH
+    // = 4, so the denominator is statically >= 5).
+    // SENS ADAPTIVE (was: skipped flatness for WEAK peaks in sensitive mode
+    // — now stays ACTIVE): the limit eases with w² toward 100 but never
+    // above FLAT_WIDE_BAR_PCT (85 — flatness_judgment_limit below), so
+    // near-gate weak peaks pass on a gentle bar (the original intent)
+    // while strong peaks keep the full user Flat. The original protection
+    // goal survives: a close-range WiFi/BT flat-top has a large margin
+    // (w = 100) and still faces Flat unfiltered.
+    // NOTE (2026-10 default change): default spectrum_flatness is now 25
+    // (ARMED, strict) — a fat blunt-topped FPV peak measured 45-70% and is
+    // rejected here on strong peaks BY DESIGN (user-elected; this step
+    // normally engages above ~8 dB margin, i.e. exactly on strong visible
+    // peaks; A-3 waiver: also on wide fragments >= 40 bins even below the
+    // margin floor — wideband evidence by itself).
+    // Lower Flat toward 40-45 in Settings to recover blunt-top FPV (cost:
+    // WiFi/BT discrimination weakens; 0 disables the filter). Weak peaks
+    // (peak_margin < effective_flatness_min) are always skipped and, in
+    // sensitive mode, ALL non-very-strong peaks ease the limit — far-field
+    // FPV is unaffected either way.
+    if (run_flat) {
+        // effective_width > 4 by arming, high_power_count only accumulated
+        // when run_flat (and run_flat => need_fuse), so the
+        // counter is meaningful here by construction.
+        const uint8_t flatness_pct = static_cast<uint8_t>(
+            (high_power_count * 100) / effective_width);
+        // LIMIT (max-polarity, reject iff pct > limit):
+        // flatness_judgment_limit(F, w2_eff) =
+        //     min(eased_flatness_limit(F, w2_eff), max(F, FLAT_WIDE_BAR_PCT))
+        // — w-easing may relax the bar toward 100 for marginal peaks
+        // (near-gate weak peaks pass on a gentle bar — the original intent),
+        // but never ABOVE FLAT_WIDE_BAR_PCT (85): the reachable mid band
+        // w = 15..40 (adapt_w steps in 5s — SLACK 20) used to sit at eased
+        // limits 98..88 and passed WiFi/BT plateaus measured 86-98% exactly
+        // where the gates had just opened (audit mid-band FP hole). A user
+        // F >= 85 is never tightened below what was asked (for in-domain
+        // F in 85..100, max(F, bar) ⇒ limit ≡ F; out-of-domain F keeps the
+        // domain-guarded eased value). INERT at
+        // w2_eff = 10000 — Sens OFF AND the A-1 fallback both judge there,
+        // and eased = clamp(F) <= max(F, bar) ⇒ limit = eased for EVERY F
+        // 0..255 (byte-identity with the pre-cap Sens-OFF ladder: raw F for
+        // in-domain F <= 100, the guarded 100 for F > 100).
+        // The DOMAIN GUARD (audit D-CFG-RANGE: saturate F to 0..100 before
+        // the UNSIGNED `(100 − F)` term) lives inside eased_flatness_limit
+        // — see its @note for the underflow proof.
+        // ARMING/PARITY split: the arming predicate above and the Step-13
+        // EFFECTIVE-ARMING mirror both consume the UNCAPPED
+        // eased_flatness_limit (M3 rev. 2 parity) — the cap lowers a
+        // verdict limit only inside an ALREADY-ARMED seat, so it can only
+        // ADD rejection where the mirror already reads armed (safe
+        // direction; no mirror drift). Stack: ~4 B. Flash: ~40 B.
+        const bool ok =
+            flatness_pct <= flatness_judgment_limit(config_.spectrum_flatness, w2_eff);
+        if (ok) verdict.sim_pass |= SHAPE_BIT_FLATNESS;
+        if (!sens_parallel && !ok) return false;
+    }
+
+    // ---- Step 11: Symmetry (V-shape must have similar left/right width) ----
+    // Signal is real regardless of asymmetry at strong levels.
+    // SENS ADAPTIVE (was: skipped in sensitive mode — now stays ACTIVE):
+    // the required symmetry eases as user·w²/10000 — weak/multipath peaks
+    // face a near-zero bar (abstain-like), strong peaks the full user Y.
+    // Boundary skip (audit fix D8): a flank stopped by the window edge or the
+    // DC wall used to be counted as width 0 — sym_pct collapsed to 0% and ANY
+    // signal parked at a boundary (VTX drift, unlucky slice phase) was
+    // rejected for "asymmetry" that was actually a measurement artifact.
+    // No boundary → no verdict: BOTH flanks must be threshold-measured for
+    // symmetry to speak (left_clipped/right_clipped from the Step 4 walk).
+    if (run_sym) {
+        // Geometry lives HERE, not in the arming block (audit D3): it is
+        // read only below, so scoping it here keeps 16 B (4 x size_t) out
+        // of the simultaneous-live set of the fused tail.
+        // left <= peak_idx <= right by the Step-4 walk invariant, so both
+        // differences are non-negative; and signal_width > 1 (arming) =>
+        // left_width + right_width >= 1 => max_side >= 1, so the division
+        // below cannot divide by zero — no separate guard needed.
+        // Stack: 16 B (four size_t, register-allocatable), block-local.
+        const size_t left_width = peak_idx - left;
+        const size_t right_width = right - peak_idx;
+        const size_t max_side = (left_width > right_width) ? left_width : right_width;
+        const size_t min_side = (left_width < right_width) ? left_width : right_width;
+        const uint8_t sym_pct =
+            static_cast<uint8_t>((min_side * 100) / max_side);
+        // SENS eased limit (min-polarity): user·w²/10000 — small w eases
+        // the bar toward 0. A truncated-to-0 limit can never reject
+        // (sym_pct >= 0 is vacuous), so the arming already excludes it
+        // (D-ARM ext. regime (4)): entering this block implies limit >= 1.
+        // Shared author (eased_sym_limit): the Step-11 INFORMATIVE-ARMING
+        // capability term consumes the SAME formula (audit D-ARM ext.
+        // 2026-10), so the arming test and the chain cannot drift.
+        const uint8_t sym_limit = eased_sym_limit(config_.spectrum_symmetry, w2_eff);
+        const bool ok = (sym_pct >= sym_limit);
+        if (ok) verdict.sim_pass |= SHAPE_BIT_SYMMETRY;
+        if (!sens_parallel && !ok) return false;
+    }
+
+    // ---- Step 12: Spectral Kurtosis (higher-order statistics) ----
+    // Measured over the fragment [left..right], NOT the whole frame. Steps
+    // 7-11 all measure the same segment; the old whole-frame range let a
+    // SECOND emitter in the same 20 MHz frame (the exact multi-peak scenario
+    // this chain exists for) change peak A's verdict — a per-peak gate fed by
+    // a cross-emission measurement. [left..right] contains no DC-gap bins
+    // (the Step-4 walk breaks before the gap), so the dc_start/dc_end
+    // parameters below are defensive parity only.
+    // Deliberately NOT fused: SpectralKurtosis::compute() needs its own mean
+    // pass plus a destructive quickselect over spectrum_sort_buf_. Fusing its
+    // raw 4th-power sums would change the documented integer scaling (and
+    // therefore kurtosis_min_x10 semantics) — zero benefit for a default-OFF
+    // step. It still reads `data` only, so the scratch aliasing contract
+    // (Step 1 -> update_auto_gate -> Step 12 -> TBD, one thread) is intact.
+    // Stack: ~4 bytes (register locals). SRAM: 0 (spectrum_sort_buf_
+    // scratch, sequential use).
+    if (run_kurt) {
+        const auto kurt_result = SpectralKurtosis::compute(
+            data, left, right + 1,
+            spectrum_sort_buf_, SPECTRUM_SORT_BUF_SIZE,
+            has_dc_gap ? FFT_DC_SPIKE_START : 0,
+            has_dc_gap ? FFT_DC_SPIKE_END : 0);
+        // SENS eased limit: user·w²/10000 (int32 — min_x10 is int16 ≥ 0
+        // per settings clamp; w2 ≤ 10000 → no overflow). w = 100 → exact
+        // user K (OFF byte-identical).
+        const int32_t kurt_limit =
+            (static_cast<int32_t>(config_.kurtosis_min_x10) *
+             static_cast<int32_t>(w2_eff)) / 10000;
+        const bool ok = kurt_result.kurtosis_x10 >= kurt_limit;
+        if (ok) verdict.sim_pass |= SHAPE_BIT_KURTOSIS;
+        if (!sens_parallel && !ok) return false;
+    }
+
+    // ---- PARALLEL COMBINE (Sens ON only) ----
+    // The HARD envelope already returned above at its legacy positions, so
+    // reaching this line means every armed HARD step agreed. The similarity
+    // group is the only remaining voice.
+    if (sens_parallel && !verdict.similarity_ok(sim_min_pct)) return false;
+
+    // F3 (audit LOW-4): the ONLY publication point of final_extent —
+    // invariant "out_extent written iff returns true" now holds by
+    // construction for every caller (analyze_spectrum_shape_impl,
+    // the DB CFAR/fixed branches and the sweep loop all read it under
+    // `if (apply_shape_filters(...))`).
+    if (out_extent != nullptr) {
+        *out_extent = final_extent;
+    }
+    // PARALLEL SHAPE (F3 extension): out_verdict follows the SAME
+    // success-only contract as out_extent — written ONLY here, on the true
+    // return. A false return leaves the caller's loop-scoped instance
+    // untouched, which is why callers read it exclusively inside the
+    // `if (apply_shape_filters(..., &shape_verdict))` success branch and
+    // never after a failed call.
+    if (out_verdict != nullptr) {
+        *out_verdict = verdict;
+    }
+    out_rssi = spectrum_value_to_dbm(raw_peak, total_gain);
+    return true;
+}
+
+// ============================================================================
+// tbd_peak_is_narrowband — MaxW guard for Track-Before-Detect (TBD)
+// ============================================================================
+
+bool DroneScanner::tbd_peak_is_narrowband(
+    size_t peak_bin,
+    size_t data_size,
+    uint8_t noise_floor,
+    size_t edge_skip
+) const noexcept {
+    // TBD confirms signals purely by multi-frame power integration and NEVER
+    // runs apply_shape_filters(). Consequently a persistent WiFi/BT flat-top
+    // that MaxW rejected in the single-frame chain was re-confirmed after
+    // TBD_MIN_FRAMES frames and tracked as a drone — the MaxW setting was
+    // silently ignored (bypass OFF or ON made no difference). This guard
+    // re-applies the MaxW width semantics around the TBD-confirmed bin: if
+    // the emission's elevated extent exceeds spectrum_max_width, the target
+    // is wideband and must stay rejected.
+    //
+    // ENVELOPE, not current frame: width is measured over the OR-image of the
+    // whole WaterfallHistory window (get_max_across_frames — the union of all
+    // bin positions the emission occupied across frames). A bursty wideband
+    // emitter (WiFi beacons/packets) spans a wide union even when each frame
+    // catches a narrow slice; measuring the current frame only let it through
+    // on "narrow-looking" frames. TBD now looks at where the signal started
+    // and where subsequent peaks re-appeared across the window.
+    // Stack: ~20 bytes. Flash: ~80 bytes.
+    //
+    // A-4 ANALYSIS (2026-10): there is deliberately NO flatness guard in the
+    // TBD path — two candidates were evaluated and rejected as unsound:
+    // (a) envelope flatness (per-bin max over the waterfall window) — a
+    // slow-drifting narrow drone produces an OR-envelope plateau identical
+    // to a WiFi/BT flat-top, so any usable limit would false-reject
+    // legitimate slow drifters; (b) frame-domain flatness at the
+    // confirmation frame — at below-gate margins (2-7 units) the 90%-bar
+    // statistic cannot distinguish a WiFi plateau from a drone V-shape
+    // because the plateau's ripple is a large fraction of the margin and no
+    // bar separates them. The wideband holes are covered by this function
+    // (envelope width > MaxW + the BOTH-EDGES sideband rule); above-gate
+    // shape rejections are vetoed before TBD (shape_rejected_after_margin /
+    // shape_blocked_tbd). The mid-width (60-110 bins) below-gate flat-top
+    // that passes TBD is the documented cost of the weak-signal domain —
+    // see constants.hpp MinW-exempt note and EDA README TBD section.
+    if (peak_bin >= data_size || edge_skip >= data_size / 2) return false;
+    if (peak_bin < edge_skip || peak_bin >= data_size - edge_skip) return false;
+
+    const uint8_t envelope_peak = waterfall_history_.get_max_across_frames(peak_bin);
+    if (envelope_peak <= noise_floor) return false;
+
+    // MAR-anchored elevated threshold (Step 6b parity for the TBD domain).
+    // apply_shape_filters measures the emission extent at the HALF-POWER
+    // level (noise_floor + peak_margin/2 = peak − 6 dB), floored at gate/3
+    // for weak peaks. TBD sees peaks BELOW the gate (peak_margin < gate),
+    // where a bare peak_margin/2 sinks to 1-2 units (~0.2-0.4 dB) — inside
+    // the noise fluctuation band above the 25th-percentile shelf — so
+    // flanking noise bins would inflate the measured width and MaxW falsely
+    // reject exactly the weak targets TBD exists to find.
+    // AUDIT FIX W2: the old floor was max(peak_margin, gate)/2, i.e. gate/2
+    // (= 5 units at Mar=10) for EVERY below-gate peak. A weak flat-top
+    // (WiFi/BT crest whose ripple stayed within gate/2 of p25) then had its
+    // anchor ABOVE its own envelope: the walk measured width = 1 BY
+    // CONSTRUCTION and neither width gate could clip it — MaxW=2 looked
+    // honored while TBD confirmed and tracked the flat top. The floor is now
+    // gate/TBD_WIDTH_ANCHOR_GATE_DIV (gate/3 ≈ 3 units at the default
+    // Mar=10, ≈ 1.5σ at σ ≈ 2):
+    // still above the fluctuation band (an isolated noise bin extends the
+    // walk in ~0.1% of frames; the 8-frame OR envelope lifts that to a rare
+    // +1 bin), but BELOW a weak emission's plateau, so the walk measures the
+    // emission instead of its crest. In-frame targets (margin >= gate) are
+    // unchanged: the half-power term dominates and the anchor stays exactly
+    // Step-6b half power. Continuity at margin == gate holds (gate/2 > gate/3).
+    // uint16 arithmetic: noise_floor (<=255) + 255/2 cannot wrap.
+    const uint8_t peak_margin = envelope_peak - noise_floor;
+    const uint8_t eff_margin = shape_gate_margin();
+    // HALF-POWER parity with apply_shape_filters Step 6b: the width threshold
+    // is peak − 6 dB (peak_margin/2 above the shelf) once the peak reaches the
+    // gate, so MaxW bins mean the same bandwidth in the TBD domain as in the
+    // single-frame chain. Below the gate the floor is gate/3 (see W2 above).
+    const uint8_t half_power = static_cast<uint8_t>(peak_margin / 2u);
+    // Mirror of emission_extent's gate_floor guard (scanner.hpp): the
+    // clamps guarantee gate >= 3, so gate/3 >= 1 — the ternary is
+    // defense-in-depth parity with Step 6b, not a behavior change at any
+    // gate the settings can produce (parsed spectrum_margin >= 5 ->
+    // shape_gate_margin() >= 3 in both modes).
+    const uint8_t gate_floor = (eff_margin >= 3)
+        ? static_cast<uint8_t>(eff_margin / TBD_WIDTH_ANCHOR_GATE_DIV)
+        : 1;
+    const uint8_t anchor_elevation =
+        (half_power > gate_floor) ? half_power : gate_floor;
+    const uint16_t elevated_threshold =
+        static_cast<uint16_t>(noise_floor) + anchor_elevation;
+
+    const size_t upper_limit = data_size - edge_skip;
+
+    size_t left = peak_bin;
+    while (left > edge_skip) {
+        const size_t prev = left - 1;
+        if (prev >= FFT_DC_SPIKE_START && prev < FFT_DC_SPIKE_END) break;
+        if (waterfall_history_.get_max_across_frames(prev) < elevated_threshold) break;
+        --left;
+    }
+
+    size_t right = peak_bin;
+    while (right < upper_limit - 1) {
+        const size_t next = right + 1;
+        if (next >= FFT_DC_SPIKE_START && next < FFT_DC_SPIKE_END) break;
+        if (waterfall_history_.get_max_across_frames(next) < elevated_threshold) break;
+        ++right;
+    }
+
+    const size_t signal_width = right - left + 1;
+    // MinW in the TBD domain (dependency + sensitivity audit, 2026-10).
+    // LEGACY EXEMPT: MinW applied ONLY to in-frame targets
+    // (peak_margin >= gate); below-gate TBD targets kept the MaxW guard only,
+    // because a strict MinW at the noise-relative anchor (gate/3) cut exactly
+    // the weak flickery targets TBD exists to find (1-bin ELRS/FrSky bursts).
+    // The exempt is CONDITIONAL on MinW sitting at the default floor
+    // (DEFAULT_SPECTRUM_MIN_WIDTH); above it MinW is enforced for EVERY TBD
+    // target, in-frame or below-gate.
+    // FLOOR SEMANTICS (2026-10 default changes, MinW floor 2 → 60 → 40): at
+    // the default floor the exempt is no longer a no-op — below-gate targets
+    // with width < 40 bins pass the MinW guard BY DESIGN while the user
+    // stays at defaults (the below-gate path still owns MaxW + the TBD-owned
+    // BOTH-EDGES wideband rule + persistence). A user raising MinW ABOVE
+    // 40 gets the full below-gate enforcement (the original hole fix) —
+    // NOTE for upgraders: a saved file still carrying the OLD default 60
+    // now counts as "raised" and gets that enforcement. The in-frame path
+    // always enforces the exact config value.
+    // Stack: 0 B. Flash: ~24 bytes.
+    const bool minw_applies =
+        (peak_margin >= eff_margin)
+        || (config_.spectrum_min_width > DEFAULT_SPECTRUM_MIN_WIDTH);
+    if (minw_applies && signal_width < config_.spectrum_min_width) {
+        return false;
+    }
+
+    // TBD-OWNED WIDEBAND GUARD (Step 6c parity, NOT user-configurable).
+    // The MaxW check below is spectrum_max_width — a USER setting that is
+    // allowed to mean "no cap" (255) — and TBD is the ONLY detection path that
+    // never runs apply_shape_filters(), i.e. it gets no Step 6c at all. With a
+    // raised MaxW, TBD would have no wideband rejection whatsoever and a
+    // WiFi/BT flat-top could be confirmed after TBD_MIN_FRAMES frames, so the
+    // rule is owned here instead of delegated to a user setting.
+    // Rule (mirror of Step 6c BOTH-EDGES): the envelope is wider than any FPV
+    // channel when its walk reached BOTH walls of its OWN sideband — the
+    // slice-edge wall and the DC-gap wall (the walk is DC-gap bounded, so a
+    // sideband is the largest extent it can ever measure). Reaching a wall
+    // already proves the boundary bin stayed above the walk threshold — the
+    // walk only steps onto bins that passed it — so no extra level test is
+    // needed here. An 8-14 MHz analog FPV carrier touches only the DC-gap
+    // wall (its energy spans both sidebands), and below-gate envelopes reach
+    // neither wall: the weak-signal path is untouched by construction.
+    // Stack: 0 B extra. Flash: ~40 B.
+    const bool peak_in_upper_sideband = (peak_bin < FFT_DC_SPIKE_START);
+    const size_t sideband_lo =
+        peak_in_upper_sideband ? edge_skip : FFT_DC_SPIKE_END;
+    const size_t sideband_hi = peak_in_upper_sideband
+        ? (FFT_DC_SPIKE_START - 1)
+        : (upper_limit - 1);
+    if (left <= sideband_lo && right >= sideband_hi) return false;
+
+    return signal_width <= config_.spectrum_max_width;
+}
+
+// ============================================================================
+// apply_sweep_tracking — range check, detection-window gate, Mahalanobis gate,
+//                        and drone tracking
+// ============================================================================
+
+void DroneScanner::apply_sweep_tracking(
+    uint8_t win_idx,
+    FreqHz peak_freq,
+    int32_t peak_rssi,
+    FreqHz center_freq,
+    FreqHz f_min,
+    FreqHz f_max
+) noexcept {
+    const int32_t cfg_rssi_thresh = config_.rssi_threshold_dbm;
+    if (peak_rssi <= cfg_rssi_thresh) return;
+
+    // Range check — prevent false positives outside sweep boundaries
+    const FreqHz range_min = (f_min != 0) ? f_min : config_.sweep_start_freq;
+    const FreqHz range_max = (f_max != 0) ? f_max : config_.sweep_end_freq;
+    if (range_min != 0 && range_max != 0) {
+        if (peak_freq < range_min || peak_freq > range_max) return;
+    }
+
+    // Detection-window gate — sweep-only filter: when at least one detection
+    // window is active for this sweep window, a peak OUTSIDE every active
+    // range is dropped; when NO window is active, the full range is allowed.
+    if (!is_detection_window_allowed(win_idx, peak_freq)) return;
+
+    // SWEEP CONFIRM GATE (audit C1): DB scan requires config_.confirm_count
+    // sightings before creating a track; sweep previously created drones
+    // from a SINGLE shape-passing frame — a one-shot noise spike or
+    // transient burst became a tracked threat with an immediate alert.
+    // Semantics mirror the DB primary path:
+    //   - confirm_count_enabled == false → no gating (user opt-out);
+    //   - an EXISTING track within the merge radius is never gated (this
+    //     is the update path — updates must flow every revisit);
+    //   - only NEW-track creation counts up; sightings within
+    //     SWEEP_CONFIRM_TOL_HZ accumulate in the pending slots; a lone
+    //     sighting expires after SWEEP_CONFIRM_TIMEOUT_MS (restarts at 1)
+    //     instead of confirming minutes later.
+    // VISIT DEBOUNCE (audit C1-fix): a sighting is one ARRIVAL at a slice
+    // center, not one frame. The same-tick drain burst delivers up to
+    // 1 + SWEEP_MAX_DRAIN_PER_TICK frames at the identical center and the
+    // first-slice dwell adds more (both by design — the TBD/median warm-up
+    // path), so frame counting would satisfy confirm_count=3 within a
+    // single tick (~26 ms) and re-open the transient-burst hole this gate
+    // exists to close. The visit id bumps whenever the sweep arrives at a
+    // different center; each pending slot records the visit that produced
+    // its last count, so an arrival counts at most once per pass — DB
+    // parity: DB delivers one frame per channel dwell and therefore
+    // counts per-visit by construction. Multiple DISTINCT peaks of one
+    // frame share the visit id and each keep their own slot, so parallel
+    // candidates at the same center are unaffected.
+    // Covers BOTH callers of this function (shape-validated peaks and
+    // sweep TBD). Thread: UI drain thread, no mutex — same established
+    // _internal pattern as the Mahalanobis/tracker calls below (scanner
+    // thread is stopped in sweep mode).
+    // confirm_count == 1 skips the machinery entirely: one sighting
+    // confirms by definition (exact DB parity).
+    if (config_.confirm_count_enabled && config_.confirm_count > 1) {
+        const ErrorResult<size_t> existing = find_nearest_drone_internal(
+            peak_freq, static_cast<FreqHz>(config_.freq_match_radius_mhz) * 1'000'000ULL);
+        if (!existing.has_value()) {
+            if (center_freq != sweep_confirm_visit_freq_) {
+                sweep_confirm_visit_freq_ = center_freq;
+                ++sweep_confirm_visit_id_;  // wraps: equality compare only
+            }
+            const SystemTime now_sweep_confirm = chTimeNow();
+            size_t slot = SWEEP_CONFIRM_SLOTS;      // sentinel: no match
+            size_t free_slot = SWEEP_CONFIRM_SLOTS; // sentinel: no free slot
+            for (size_t s = 0; s < SWEEP_CONFIRM_SLOTS; ++s) {
+                if (sweep_pending_freq_[s] == 0) {
+                    if (free_slot >= SWEEP_CONFIRM_SLOTS) free_slot = s;
+                    continue;
+                }
+                const FreqHz diff = (peak_freq > sweep_pending_freq_[s])
+                    ? (peak_freq - sweep_pending_freq_[s])
+                    : (sweep_pending_freq_[s] - peak_freq);
+                if (diff <= SWEEP_CONFIRM_TOL_HZ) {
+                    slot = s;
+                    break;
+                }
+            }
+            if (slot >= SWEEP_CONFIRM_SLOTS) {
+                // No matching pending. Claim a free slot; when the table is
+                // full (flood of distinct candidates), recycle the OLDEST
+                // sighting — an expired/stale pending must never starve a
+                // real new candidate of its slot.
+                if (free_slot >= SWEEP_CONFIRM_SLOTS) {
+                    size_t oldest = 0;
+                    for (size_t s = 1; s < SWEEP_CONFIRM_SLOTS; ++s) {
+                        if (sweep_pending_time_[s] < sweep_pending_time_[oldest]) oldest = s;
+                    }
+                    free_slot = oldest;
+                }
+                sweep_pending_freq_[free_slot] = peak_freq;
+                sweep_pending_count_[free_slot] = 1;
+                sweep_pending_time_[free_slot] = now_sweep_confirm;
+                sweep_pending_visit_[free_slot] = sweep_confirm_visit_id_;
+                return;  // wait for more visits
+            } else {
+                // Matched pending: a stale sighting restarts the window at 1
+                // (same CONFIRM_TIMEOUT_MS semantics as the DB primary pair).
+                if ((now_sweep_confirm - sweep_pending_time_[slot]) >= SWEEP_CONFIRM_TIMEOUT_MS) {
+                    sweep_pending_count_[slot] = 1;
+                    sweep_pending_time_[slot] = now_sweep_confirm;
+                    sweep_pending_visit_[slot] = sweep_confirm_visit_id_;
+                    return;
+                }
+                // Same pending within the visit tolerance: only a NEW visit
+                // may add a confirmation — repeat frames of the current
+                // visit (drain burst / first-slice dwell at the identical
+                // center) already had their say.
+                if (sweep_pending_visit_[slot] == sweep_confirm_visit_id_) {
+                    return;  // same visit — already counted
+                }
+                sweep_pending_visit_[slot] = sweep_confirm_visit_id_;
+                if (sweep_pending_count_[slot] < config_.confirm_count) {
+                    ++sweep_pending_count_[slot];
+                }
+                if (sweep_pending_count_[slot] < config_.confirm_count) {
+                    return;  // still accumulating confirmations
+                }
+                // Confirmed — free the slot; the created track takes over
+                // (future sightings hit the existing-track fast path above).
+                sweep_pending_freq_[slot] = 0;
+                sweep_pending_count_[slot] = 0;
+                sweep_pending_time_[slot] = 0;
+                sweep_pending_visit_[slot] = 0;
+            }
+        }
+    }
+
+    // Detection-range label (SWP "Name" selector). Resolved on EVERY visit so
+    // a rename in the SWP tab applies live to already-tracked drones.
+    // 0 = no label → the drone list falls back to the type string ("Unknown").
+    const uint8_t det_label_idx = resolve_det_win_label_internal(win_idx, peak_freq);
+
+    // Mahalanobis gate
+    bool mahalanobis_rejected = false;
+    bool drone_created_here = false;
+    // Step 14 (README §14 chain): Mahalanobis tracking post-filter — SWEEP only.
+    if (config_.mahalanobis_enabled) {
+        size_t drone_idx = 0;
+        bool drone_found = false;
+        // Nearest-match lookup (same policy as update_tracked_drone_internal):
+        // bin-quantized peak frequencies drift by 1-3 bins between sweep
+        // cycles, so exact equality never accumulated per-drone statistics.
+        const ErrorResult<size_t> match = find_nearest_drone_internal(
+            peak_freq, static_cast<FreqHz>(config_.freq_match_radius_mhz) * 1'000'000ULL);
+        if (match.has_value()) {
+            drone_idx = match.value();
+            drone_found = true;
+        }
+
+        if (drone_found) {
+            MahalanobisStatistics& stats = tracked_drones_[drone_idx].get_mahalanobis_stats();
+            // Validate the PEAK frequency (peak-vs-previous-peak drift), not
+            // the slice center: center jumps up to 8.8 MHz per retune and
+            // would collapse the stability feature on every step.
+            if (!mahalanobis_detector_.validate(
+                peak_rssi, peak_freq, stats, config_.mahalanobis_threshold_x10
+            )) {
+                // ESCALATION BYPASS (bugfix: threat frozen at first-detection
+                // level — "detected as MEDIUM, never grows to CRITICAL over
+                // many passes while standing at the source"):
+                // validate() rejects a sample deviating from the stats
+                // accumulated SO FAR, and update_statistics() runs ONLY on
+                // pass — so a rejected sample could never move the model.
+                // A track first seen WEAK (stats anchored at MEDIUM-level
+                // RSSI) then re-observed STRONG stayed a permanent outlier
+                // vs the frozen weak model: update_rssi() never ran and
+                // threat/displayed RSSI were locked at the first-detection
+                // level forever (decay kept working — the asymmetry the
+                // user observed).
+                // K-CONSECUTIVE ESCALATION (audit fix): the staged one-shot
+                // bypass accepted ANY single rejected sample that classified
+                // higher — but the confirm gate above does NOT gate EXISTING
+                // tracks, so its "already cleared confirm" safety claim never
+                // applied here: a one-shot interferer spike could escalate
+                // threat in a single frame AND poison the model by folding
+                // the outlier into the statistics (subsequent REAL samples
+                // then validated as outliers against the dragged mean —
+                // track starvation, the mirror image of the frozen bug).
+                // Accept escalation only after
+                // MAHALANOBIS_ESCALATION_MIN_CONSECUTIVE CONSECUTIVE
+                // higher-classifying rejections (a one-shot spike leaves the
+                // counter at 1 and never fires; a genuine approach — user
+                // walks up to the source, source ramps up — repeats every
+                // revisit). On acceptance RE-SEED the model (reset + fold
+                // this sample) instead of blending into the stale mean: the
+                // frozen weak model is replaced wholesale, the outlier
+                // cannot drag it, and subsequent strong samples validate
+                // cleanly (the gate stays meaningful). Non-escalating
+                // outliers reset the counter and stay rejected as before.
+                // Stack: ~8 B. SRAM: 0 extra (count array declared with the
+                // detector). Flash: ~130 B.
+                uint8_t& esc_count = mahalanobis_escalation_count_[drone_idx];
+                const uint8_t cand_rank = classify_threat_rank(peak_rssi);
+                if (cand_rank > static_cast<uint8_t>(tracked_drones_[drone_idx].get_threat())) {
+                    if (esc_count < MAHALANOBIS_ESCALATION_MIN_CONSECUTIVE) {
+                        ++esc_count;
+                    }
+                    if (esc_count >= MAHALANOBIS_ESCALATION_MIN_CONSECUTIVE) {
+                        MahalanobisDetector::reset(stats);
+                        mahalanobis_detector_.update_statistics(
+                            stats, peak_rssi, center_freq, peak_freq);
+                    } else {
+                        mahalanobis_rejected = true;  // wait for a consecutive escalation
+                    }
+                } else {
+                    esc_count = 0;  // non-escalating outlier — not evidence
+                    mahalanobis_rejected = true;
+                }
+            } else {
+                mahalanobis_escalation_count_[drone_idx] = 0;  // healthy sample
+                mahalanobis_detector_.update_statistics(stats, peak_rssi, center_freq, peak_freq);
+            }
+        } else {
+            // Create the drone — or, when the tracker is full, EVICT the
+            // weakest resident for it (see add_tracked_drone_internal()).
+            const SystemTime now_sweep = chTimeNow();
+            size_t out_idx = SIZE_MAX;
+            const ErrorCode add_err = add_tracked_drone_internal(
+                peak_freq, peak_rssi, now_sweep, &out_idx,
+                /*init_sweep_mode=*/true, /*classify_drone_type=*/false);
+            if (add_err == ErrorCode::SUCCESS) {
+                TrackedDrone& drone = tracked_drones_[out_idx];
+                drone.label_idx_ = det_label_idx;
+                // First detection: always mark as increasing to prevent immediate decay
+                drone.rssi_increased_ = true;
+                drone.sweep_cycles_missed_ = 0;
+                drone.last_seen_time_ = now_sweep;
+                drone.update_cycle_peak(peak_rssi);
+                drone.get_mahalanobis_stats().last_tuned_frequency = peak_freq;
+                mahalanobis_escalation_count_[out_idx] = 0;  // fresh track (or reused slot)
+                if (drone.threat_level > ThreatLevel::NONE) {
+                    raise_alert(drone.threat_level);  // staged — drained at end of this function (D-ALERT-LOCK)
+                }
+                drone_created_here = true;
+            } else if (add_err == ErrorCode::BUFFER_FULL) {
+                // Tracker is full AND the candidate cannot legally displace the
+                // weakest resident (weak signal, or a protected victim — HIGH+
+                // or the currently-locked drone, see can_evict_internal()).
+                // Drop the peak WITHOUT falling through to
+                // update_tracked_drone_internal(): we already know no drone
+                // lies within the match radius, so that call would re-run the
+                // same O(n) scan and add attempt only to fail again.
+                return;
+            }
+        }
+    }
+
+    // Skip update_tracked_drone_internal when drone was just created above
+    // to avoid double update_rssi() + double trigger_alert()
+    if (!mahalanobis_rejected && !drone_created_here) {
+        size_t drone_idx = SIZE_MAX;
+        (void)update_tracked_drone_internal(peak_freq, peak_rssi, chTimeNow(), &drone_idx);
+
+        // Use returned index — avoids redundant find_nearest_drone_internal() O(n) search
+        if (drone_idx < tracked_count_) {
+            tracked_drones_[drone_idx].update_cycle_peak(peak_rssi);
+            tracked_drones_[drone_idx].mark_seen(chTimeNow(), peak_rssi);
+            tracked_drones_[drone_idx].label_idx_ = det_label_idx;
+        }
+    }
+
+    // ALERT DEFER drain (audit D-ALERT-LOCK): update_tracked_drone_internal()
+    // staged its threat alert above; sweep holds no mutex here, but the same
+    // staging keeps ONE alert path for both scan modes. Stack: 0 bytes.
+    deliver_pending_alert();
+}
+
+void DroneScanner::process_spectrum_sweep(
+    uint8_t win_idx,
+    const ChannelSpectrum& spectrum,
+    FreqHz center_freq,
+    FreqHz f_min,
+    FreqHz f_max
+) noexcept {
+    // C2 guard: out-of-range window index must never kill sweep detection, and
+    // the per-window integrator arrays below are indexed by win_idx.
+    if (win_idx >= MAX_SWEEP_WINDOWS) return;
+    current_frequency_ = center_freq;
+
+    // Per-frequency median filter and waterfall reset — PER SWEEP WINDOW.
+    // The old code compared center_freq against a SINGLE shared last_sweep_freq_.
+    // The UI round-robin alternates between up-to-4 windows, so with >1 window
+    // enabled EVERY step compared window A's frequency against window B's stale
+    // key (|diff| >> 4.4 MHz) and reset median + waterfall EVERY step:
+    //   - median (warm at 4 samples, window 7) could never warm → median_enabled
+    //     silently behaved as OFF in multi-window sweep;
+    //   - waterfall never accumulated more than 1 frame → is_warm(TBD_MIN_FRAMES)
+    //     was always false → TBD (the ~9 dB integration gain for weak signals)
+    //     NEVER fired in multi-window sweep.
+    // The per-window key fixes this with ZERO behavior change for single-window
+    // sweep (identical tolerance, identical reset policy, identical push order):
+    //   - Same window revisiting the same slice step (|diff| <= tolerance):
+    //     NO reset → waterfall accumulates across visits → TBD can fire;
+    //     median accumulates → warms after 4 revisits of the same step.
+    //   - Same window at a different slice step: RESET → prevents
+    //     cross-frequency contamination (unchanged safety property).
+    // last_sweep_freq_ (shared) is kept in sync for legacy readers and for
+    // clear_lock_state() semantics; it no longer drives the reset decision.
+    constexpr FreqHz SWEEP_FREQ_TOLERANCE_HZ = SWEEP_GAPLESS_STEP_MAX_HZ / 2;
+    FreqHz& last_win_freq = last_sweep_freq_per_win_[win_idx];
+    const FreqHz freq_diff = (center_freq > last_win_freq)
+        ? (center_freq - last_win_freq)
+        : (last_win_freq - center_freq);
+
+    // C3 WINDOW BARRIER — the shared integrators (rssi_median_filter_,
+    // waterfall_history_, sweep_signal_present_) are fed by EVERY window, but
+    // the reset decision above uses only THIS window's key. That key answers
+    // "has THIS window moved since ITS last frame?" — it says NOTHING about what
+    // is actually sitting in the shared buffer, which by then belongs to the
+    // OTHER window (the round-robin runs one full window pass at a time).
+    //
+    // The dangerous combination is therefore: window changed AND freq_diff <=
+    // tolerance. The per-window key then claims "unchanged" while the buffer
+    // really holds another window's frame, so the reset is silently skipped:
+    //   - two windows whose ranges abut/overlap and whose slice centers land
+    //     within SWEEP_FREQ_TOLERANCE_HZ (4.4 MHz) of each other — bin grids
+    //     offset by that amount, so a peak is accumulated into the wrong
+    //     history bin;
+    //   - a window with few slices, which returns to its own last key while the
+    //     other window's frames pushed in between.
+    // Feeding it is harmless only when freq_diff > tolerance: the reset above
+    // fires anyway.
+    //
+    // WHY THE BARRIER IS QUALIFIED (not "fire on any window change" and not
+    // "never fire on a window change") — the full condition below reduces to
+    // (window_changed || freq_diff > tolerance), and BOTH arms are load-bearing:
+    //  - freq_diff > tolerance: this window's OWN center moved — the pre-C2
+    //    reset, unchanged.
+    //  - window_changed (the barrier term): fires ONLY on the FIRST frame of a
+    //    new window when its center is still within tolerance of that window's
+    //    OWN key — the one case where the per-window key claims "unchanged"
+    //    while the shared buffer actually holds the OTHER window's frame
+    //    (round-robin switches at pass completion — on that first frame the
+    //    shared integrators' most recent writes all belong to the OTHER
+    //    window: feeding them mixes foreign content into this window's
+    //    history, and the shared presence bit may already be set — a
+    //    phantom "return" with zero frames of this window seen yet).
+    //  - It CANNOT fire mid-pass: last_sweep_win_idx_ is updated on that same
+    //    first frame (below), so every subsequent frame of this window's pass
+    //    has window_changed == false. The C2 accumulation the per-window key
+    //    exists for (drain bursts + first-slice dwell at identical center →
+    //    freq_diff == 0 → no reset) is therefore untouched — single-window
+    //    sweep never has window_changed at all, so its cross-pass history is
+    //    bit-identical to pre-C3.
+    // A barrier term that ALSO fired when freq_diff > tolerance would be
+    // provably redundant (the main arm already resets); it adds resets exactly
+    // and only in the close-center window-switch case, where skipping the
+    // reset is the false-spike bug. Stack: 0 B.
+    const bool window_changed = (win_idx != last_sweep_win_idx_);
+    const bool cross_window_stale =
+        window_changed && (freq_diff <= SWEEP_FREQ_TOLERANCE_HZ);
+    if (window_changed) last_sweep_win_idx_ = win_idx;
+
+    if (freq_diff > SWEEP_FREQ_TOLERANCE_HZ || cross_window_stale) {
+        rssi_median_filter_.reset();
+        // Reset temporal history on significant frequency change (median
+        // above resets with it). The slow integrators advance only BETWEEN
+        // resets:
+        //  - same-tick drain burst: up to 1 + SWEEP_MAX_DRAIN_PER_TICK = 4
+        //    feeds at one center per tick ≥ TBD_MIN_FRAMES (3) and median
+        //    warm (4) — the primary warm-up path;
+        //  - first-slice dwell frames (identical center across ticks);
+        //  - cross-pass revisits at the same step (|diff| ≤ tolerance),
+        //    valid only while the window's whole span from its first slice
+        //    fits in tolerance ((n−1)·step ≤ SWEEP_GAPLESS_STEP_MAX_HZ/2 =
+        //    4.41 MHz — true for EVERY 2-slice window: span = range/2 ≤
+        //    4.41): waterfall then accumulates → TBD fires after 3 passes
+        //    (~3-9 s). A wide window at the max gapless pitch (step 8.83 >
+        //    4.41) hops past tolerance on every slice move and re-clears
+        //    each pass — its warm-up is burst/dwell-only (one full burst
+        //    == warm).
+        // NOTE: per-frequency RSSI smoothing (median, window 7, warm at 4)
+        // likewise needs several revisit cycles per frequency, so both
+        // median_enabled and sweep TBD are slow integrators on wide windows.
+        waterfall_history_.reset();
+        clear_shape_veto();  // D5: veto lifetime == waterfall window lifetime
+        last_win_freq = center_freq;
+    }
+    last_sweep_freq_ = center_freq;
+
+    // Hysteresis reset — PER SWEEP WINDOW (same C2 reasoning as above): a
+    // shared key reset the presence state on every window alternation, so the
+    // sweep hysteresis state could never persist across revisits. The per-window
+    // key preserves the sweep presence bit when the SAME window revisits the
+    // same step. NOTE: this writes ONLY sweep_signal_present_ — the
+    // normal-mode signal_present_ is owned by process_spectrum_message() and
+    // must never be touched here (cross-mode state leak).
+    // The C3 barrier applies equally: sweep_signal_present_ is a SINGLE shared
+    // bit, so a stale cross-window feed must clear it too.
+    FreqHz& last_win_hyst = last_hyst_freq_per_win_[win_idx];
+    if (center_freq != last_win_hyst || cross_window_stale) {
+        sweep_signal_present_ = false;
+        last_win_hyst = center_freq;
+    }
+
+    // Feed waterfall history for sweep mode (runs without mutex — scanner thread stopped)
+    waterfall_history_.push(spectrum.db.data());
+
+    // Candidate gate uses the FULL Step 3 margin (shape_gate_margin): the
+    // sensitive-mode relaxation AND the high-sensitivity scaling, identical to
+    // apply_shape_filters Step 3 in BOTH scan modes when the chain RUNS.
+    // Single source of truth — no candidate is collected that Step 3 would
+    // only reject, and every peak the gate admits is guaranteed the same
+    // Step 4 width threshold.
+    // Default margin=20 (~4 dB above noise); SENS mode: the NOISE-ADAPTIVE
+    // gate clamp(3σ_IQR, 8, Mar) measured in update_auto_gate() below
+    // (SHAPE_ADAPT_*; A-5: cap = raw Mar), never stricter than Mar.
+    // RSSI-ONLY EXCEPTION (audit M2): with spectrum_detection_enabled OFF
+    // the margin is shape-domain — sweep_fast_prefilter bypasses it
+    // (!shape_detect_on ⇒ true) and the DB path applies a pure RSSI gate —
+    // so the fixed-threshold collector below must not gate on it either;
+    // tracking is then owned by apply_sweep_tracking()'s RSSI threshold
+    // alone, exactly like DB (README §14 bypass contract). See collect_gate
+    // below.
+    // Step 1: Compute noise floor (25th percentile of usable bins).
+    // Shared for all peaks in this frame — computed once.
+    // FRAME-LEVEL MEDIAN FEED (FIX): track the raw frame peak in the SAME
+    // pass (zero extra bin scans) and feed the median filter once per frame —
+    // DB-scan semantics (extract_rssi → add, process_spectrum_message).
+    // Previously the sweep path fed only ACCEPTED primary peaks, so Md+ could
+    // never influence anything and the window rarely warmed.
+    uint8_t* usable = sweep_usable_buf_;
+    size_t idx = 0;
+    uint8_t frame_peak_power = 0;
+    for (size_t i = FFT_EDGE_SKIP_NARROW; i < FFT_DC_SPIKE_START; ++i) {
+        const uint8_t bin_power = spectrum.db[i];
+        usable[idx++] = bin_power;
+        if (bin_power > frame_peak_power) frame_peak_power = bin_power;
+    }
+    for (size_t i = FFT_DC_SPIKE_END; i < (FFT_BIN_COUNT - FFT_EDGE_SKIP_NARROW); ++i) {
+        const uint8_t bin_power = spectrum.db[i];
+        usable[idx++] = bin_power;
+        if (bin_power > frame_peak_power) frame_peak_power = bin_power;
+    }
+    if (idx == 0) return;
+    // p25 shelf + width-anchor shelf (select_shape_floors, audit fix W1).
+    const ShapeFloors sweep_floors =
+        select_shape_floors(usable, idx, config_.robust_width_floor_enabled);
+
+    // USER SHELF OFFSET (display/detector coupling, SWEEP_SHELF_OFFSET_*):
+    // bias BOTH shelves by the same user dial value so the detector's relative
+    // gates move with the displayed shelf (the display subtracts
+    // composite_floor + offset). Both floors shift by the same delta on
+    // purpose:
+    //   - the width-anchor kill switch (p25 - p10 >= CONTAM_DELTA) already
+    //     decided inside select_shape_floors — a common delta preserves the
+    //     p25-p10 difference, so the W1 decision is offset-invariant;
+    //   - every downstream RELATIVE gate (cfg_margin Step-3 subtraction,
+    //     sweep_fast_prefilter, collect gate, sweep_tbd_pass elevation, the
+    //     shape chain's noise-relative margins) sees ONE consistent shelf,
+    //     so "what the user reveals is what the gates admit" holds by
+    //     exactly `offset` units in both directions.
+    // NOT biased — RAW shelf (raw_noise_floor / raw p25-p10, below), by design:
+    //   - update_auto_gate(): its contract is IQR = p75 - p25 (SHAPE_ADAPT_*
+    //     #1) and the DB path already feeds it the RAW p25. Feeding the biased
+    //     shelf would inflate the measured IQR by |offset| — at the default
+    //     SENS config that cancels ~9 units of a -9 dial position down to ~1
+    //     (the adaptive gate re-absorbs what the shelf gave away) while a +9
+    //     position passes through untouched: an asymmetric, near-dead control.
+    //   - the dBm-domain path: adaptive_threshold_'s floor_dBm (must stay in
+    //     the SAME domain as the raw peak rssi it is compared against),
+    //     the median feed and apply_sweep_tracking RSSI;
+    //   - the absolute Sens gate (sweep_tbd_threshold_units from
+    //     rssi_threshold_dbm) — the offset moves the relative shelf only,
+    //     never the user's dBm contract.
+    // CFAR's local reference-cell adaptivity is inherently shelf-independent;
+    // its peaks still clear the shifted Step-3/shape gates below.
+    // Clamp: floor is uint8; -9 floors at 0 (max sensitivity), +9 caps at 255
+    // (everything suppressed — the intentional "raise the shelf" direction;
+    // the uint8 power - noise_floor guards downstream already test
+    // power > noise_floor before subtracting, so no underflow).
+    const uint8_t raw_noise_floor = sweep_floors.noise;  // RAW p25: σ/IQR + dBm only
+    const int8_t shelf_off = config_.sweep_shelf_offset;
+    const int16_t nf_adj = static_cast<int16_t>(sweep_floors.noise) + shelf_off;
+    const int16_t wf_adj = static_cast<int16_t>(sweep_floors.width) + shelf_off;
+    const uint8_t noise_floor = static_cast<uint8_t>(
+        (nf_adj < 0) ? 0 : (nf_adj > 255) ? 255 : nf_adj);
+    const uint8_t width_floor = static_cast<uint8_t>(
+        (wf_adj < 0) ? 0 : (wf_adj > 255) ? 255 : wf_adj);
+
+    // SENS ADAPTIVE GATE (SHAPE_ADAPT_*): measure this frame's noise-driven
+    // Step-3 gate NOW — cfg_margin below and every later shape_gate_margin()
+    // read of this frame must see the fresh value (reading it before Step 1
+    // would return the previous frame's measurement / the 0 sentinel).
+    // RAW shelf on purpose (see the NOT-biased list above): the σ estimate
+    // must stay p75 - p25 and must match the DB path byte-for-byte.
+    // P0/O3: pass sweep_usable_buf_ directly — select_shape_floors permuted
+    // it (multiset preserved), so p75 is byte-identical to the old refill
+    // from spectrum.db, minus the redundant 236-bin re-extraction. The
+    // buffer's order is dead after this call (nothing else reads it this
+    // frame; it is re-filled at Step 1 of the next frame).
+    update_auto_gate(usable, idx, raw_noise_floor);
+
+    // P0-2: hoist the gain read out of the per-peak loop — the LNA/VGA/RF
+    // state is stable inside one frame, so one cached total_gain replaces
+    // the repeated get_current_total_gain() calls below (each of which
+    // re-reads receiver_model). Defined after Step 1 on purpose: cfg_margin
+    // depends on the fresh SENS gate measurement above.
+    const uint8_t cfg_margin = shape_gate_margin();
+    const int32_t frame_total_gain = get_current_total_gain();
+    // RSSI-ONLY COLLECT GATE (audit M2, see the candidate-gate comment above):
+    // shape OFF ⇒ 0 — every at/above-shelf crest reaches the RSSI gate in
+    // apply_sweep_tracking(), mirroring the DB RSSI-only path; shape ON ⇒
+    // cfg_margin unchanged (byte-identical). Sub-shelf bins stay excluded
+    // (margin >= 0), so the crest scan never reads below the noise shelf.
+    // Stack: 0 (register slot). SRAM: 0. Flash: ~16 B.
+    const uint8_t collect_gate =
+        config_.spectrum_detection_enabled ? cfg_margin : uint8_t{0};
+
+    // SPATIAL ENVELOPE (config_.spectrum_envelope_enabled, default ON) — SWEEP
+    // parity with the DB path (analyze_spectrum_shape_multi). Computed ONCE
+    // per frame over the two narrow-edge sidebands (DC gap never bridged).
+    // shape_data below feeds the crest TOPOLOGY test and the shape chain via
+    // analyze_spectrum_shape_impl's shape_data parameter. Monotone-RAISING
+    // (env[i] >= raw[i]) ⇒ the collect_gate margin (still measured on RAW
+    // spectrum.db) can only admit more candidates, never fewer; RSSI /
+    // raw_peak / frequency stay on the RAW peak the collector measured.
+    // When the flag is OFF this is a no-op and shape_data == nullptr → the
+    // legacy raw path, byte-for-byte.
+    // Stack: ~8 bytes (pointer). SRAM: envelope_buf_ = 256 B (class member).
+    if (config_.spectrum_envelope_enabled) {
+        compute_envelope_frame(spectrum.db.data(), envelope_buf_,
+                               FFT_EDGE_SKIP_NARROW,
+                               FFT_DC_SPIKE_START, FFT_DC_SPIKE_END);
+    }
+    const uint8_t* shape_data = config_.spectrum_envelope_enabled
+        ? static_cast<const uint8_t*>(envelope_buf_)
+        : nullptr;
+
+    // Frame-level median feed (Md+): once per frame, BEFORE any accept/reject
+    // decision. Reset-per-step semantics unchanged (frequency-change gate at
+    // the top of this function); the filter warms within one revisit dwell
+    // and its output smooths the tracked primary-peak RSSI below.
+    rssi_median_filter_.add(spectrum_value_to_dbm(frame_peak_power, frame_total_gain));
+
+    // SWEEP FAST PREFILTER (sensitivity/CPU) — SINGLE SOURCE OF TRUTH:
+    // sweep_sensitivity.hpp::sweep_fast_prefilter — the SAME helper the UI
+    // drain loop calls, so the bypass rule and half-gate semantics exist
+    // exactly once (no byte-for-byte copy to keep in sync).
+    // Pure-noise slices skip the ~2000+ cycles of CFAR + 12-step shape chain,
+    // BUT the gate no longer decides alone. The multi-frame TBD integrator is
+    // the weak-signal path, and its reach is set by ITS OWN criterion (RSSI
+    // threshold floored at the noise shelf + TBD_MIN_ELEVATION_UNITS) — not by
+    // half of the Step-3 shape gate. That half-gate (2.0-3.2 dB and RISING with
+    // the Sensitivity knob, so the control responded INVERTED for weak
+    // targets) discarded every frame below it, making TBD structurally blind
+    // exactly where it must work.
+    // The frame is dropped only when BOTH hold:
+    //   1) the heavy single-frame chain would find nothing (half-gate), AND
+    //   2) the frame cannot contribute a TBD present-now vote — proven by
+    //      sweep_tbd_frame_reachable() (peak below the effective threshold).
+    //      That test is an equivalence, not a heuristic: no bin of such a frame
+    //      can satisfy spectrum.db[bin] >= threshold, so neither a present-now
+    //      vote nor a count_above_threshold() vote is lost by skipping it.
+    // A TBD-reachable frame takes the cheap integrator path and returns without
+    // touching the heavy chain — the CPU win of the prefilter is preserved.
+    // Waterfall push + median feed above already ran, so TBD/median warm-up is
+    // unaffected. RSSI-only mode (spectrum_detection_enabled=false) bypasses
+    // both tests inside the helpers — threshold tracking owns every frame.
+    // Stack: ~12 B. No heap, no FP, no locks.
+    if (!sweep_fast_prefilter(
+            config_.spectrum_detection_enabled,
+            frame_peak_power, noise_floor, cfg_margin)) {
+        const uint8_t tbd_threshold_units = sweep_tbd_threshold_units(
+            config_.rssi_threshold_dbm, frame_total_gain);
+        if (!sweep_tbd_frame_reachable(
+                config_.spectrum_detection_enabled,
+                frame_peak_power, noise_floor, tbd_threshold_units)) {
+            return;  // neither heavy-detectable nor TBD-reachable
+        }
+        // Weak-signal path only: no CFAR, no shape chain, no tracking — the
+        // integrator gets its vote. HONEST COST: sweep_tbd_pass() returns
+        // early until the waterfall is warm, then walks the 228-bin envelope
+        // over <= HISTORY_DEPTH (8) frames — ~1.8k indexed loads, order of
+        // 10^4 cycles warm. This branch is NOT ~200 cycles: what the
+        // prefilter saves here is only the SKIPPED heavy chain (CFAR + the
+        // 12-step shape); the envelope scan is the price of weak-signal
+        // reach and the pre-prefilter TBD tail paid it too. Frames below
+        // noise_floor + TBD_MIN_ELEVATION_UNITS still die in the two
+        // compares above (~30 cycles).
+        sweep_tbd_pass(win_idx, spectrum, center_freq, f_min, f_max,
+                       noise_floor, frame_total_gain,
+                       /*any_peak_passed_shape=*/false,
+                       /*shape_blocked_tbd=*/false);
+        return;
+    }
+
+    // Step 2: Find ALL candidate peaks (CFAR multi-peak or fixed-threshold).
+    // Stack: CFARPeak × 8 = 16 bytes. Well within 512B limit.
+    static constexpr size_t MAX_SWEEP_PEAKS = CFAR_MAX_CONCURRENT_PEAKS;
+    CFARPeak cfar_peaks[MAX_SWEEP_PEAKS]{};
+    size_t peak_count = 0;
+
+    if (config_.cfar_mode != CFARMode::OFF) {
+        // Multi-peak CFAR: finds ALL peaks passing the adaptive threshold.
+        // Critical for detecting dual-peak FPV (video + audio subcarrier)
+        // or multiple drones in the same 20 MHz window.
+        // FIX (audit D-C — ADAPTIVE PARITY with DB): the DB path
+        // (analyze_spectrum_shape_multi) substitutes the self-tuning
+        // AdaptiveThreshold when adaptive_cfar_enabled — sweep previously
+        // ignored it, making the file-only setting silently mode-dependent.
+        // Adaptive takes precedence (DB parity: no sensitive delta on top).
+        // Sensitive mode: reduce CFAR threshold by 1.0 unit (~0.2 dB) for max sensitivity.
+        uint8_t effective_cfar_threshold = config_.cfar_threshold_x10;
+        if (config_.adaptive_cfar_enabled) {
+            effective_cfar_threshold = adaptive_threshold_.get_optimal_threshold();
+        } else if (config_.sensitive_mode) {
+            effective_cfar_threshold = (config_.cfar_threshold_x10 > CFAR_THRESHOLD_MIN_X10 + 10)
+                ? static_cast<uint8_t>(config_.cfar_threshold_x10 - 10)
+                : static_cast<uint8_t>(CFAR_THRESHOLD_MIN_X10);
+        }
+        peak_count = CFARDetector::find_peaks(
+            spectrum.db.data(),
+            FFT_BIN_COUNT,
+            cfar_peaks, MAX_SWEEP_PEAKS,
+            config_.cfar_mode,
+            config_.cfar_ref_cells,
+            config_.cfar_guard_cells,
+            effective_cfar_threshold,
+            FFT_EDGE_SKIP_NARROW,
+            FFT_EDGE_SKIP_NARROW,
+            config_.cfar_hybrid_alpha,
+            config_.cfar_hybrid_beta,
+            config_.cfar_hybrid_gamma,
+            config_.os_cfar_k_percent,
+            config_.vi_cfar_threshold_x10,
+            // OS-CFAR sliding-histogram scratch (256 B class member);
+            // nullptr here would keep the slower legacy insertion-sort path.
+            cfar_hist_buf_
+        );
+        // Feed the adaptive loop (DB parity, audit D-C): same dBm domain as
+        // process_spectrum_message's calls; noise_floor / frame_total_gain are
+        // frame-cached above this branch. Unlike the DB path there is NO
+        // early-return on peak_count == 0 (TBD below still needs its vote),
+        // so both feed branches run here. Thread: UI drain thread — the same
+        // thread that runs process_spectrum_message; scanner thread never
+        // touches adaptive_threshold_.
+        if (config_.adaptive_cfar_enabled) {
+            // RAW shelf (dBm domain, see the NOT-biased list at Step 1):
+            // AdaptiveThreshold (audit C2) now classifies by MARGIN —
+            // `margin = rssi - floor_dBm <= 2x (threshold + 1) dB` — so the
+            // rssi argument (RAW peak in dBm) and the floor MUST share the
+            // same offset-independent domain, or the difference would bake
+            // the user's dial skew into the false-alarm rate
+            // (±0.2 dB * offset, ±1.8 dB at ±9).
+            const int32_t floor_dBm = spectrum_value_to_dbm(raw_noise_floor, frame_total_gain);
+            if (peak_count > 0) {
+                adaptive_threshold_.update(
+                    true,
+                    spectrum_value_to_dbm(cfar_peaks[0].power, frame_total_gain),
+                    floor_dBm,
+                    config_.cfar_threshold_x10);
+            } else {
+                adaptive_threshold_.update(
+                    false, RSSI_MIN_DBM,
+                    floor_dBm,
+                    config_.cfar_threshold_x10);
+            }
+        }
+    } else {
+        // Fixed-threshold: collect CREST bins at/above the effective gate
+        // (margin >= collect_gate: cfg_margin with shape ON, shelf-only in
+        // RSSI-only mode — audit M2), keep the strongest MAX_SWEEP_PEAKS*2
+        // (top-K — audit fix D4: the old
+        // `cand_count < CAP` truncation kept the FIRST 16 bins by ascending
+        // index, so a busy left sideband with 16+ passing bins starved the
+        // right sideband entirely), sort by power descending, take top N.
+        // Audit HIGH-1 / F1: is_crest_bin() pre-filter (parity with the DB
+        // path) — each plateau/slope run costs ONE top-K slot, so the
+        // remaining slots stay free for distinct weaker emitters.
+        struct SimplePeak { size_t bin; uint8_t power; };
+        SimplePeak candidates[MAX_SWEEP_PEAKS * 2]{};
+        size_t cand_count = 0;
+
+        // GATE DOMAIN (envelope audit fix A) + ATRIBUTION (envelope audit
+        // fix B) — sweep parity with the DB fixed-threshold collection: when
+        // the opt-in envelope is active (shape_data != nullptr) the gate is
+        // measured on the ENVELOPE value (env[i] >= raw[i] ⇒ superset of
+        // raw-gated candidates at envelope crests — the "never fewer"
+        // invariant holds end-to-end) and the stored candidate is refined to
+        // the RAW apex of the envelope plateau (exact frequency + power).
+        // Envelope OFF (shape_data == nullptr): gate and apex are the legacy
+        // raw values — byte-identical.
+        const uint8_t* raw_sp = spectrum.db.data();
+        for (size_t i = FFT_EDGE_SKIP_NARROW; i < FFT_DC_SPIKE_START; ++i) {
+            constexpr size_t LO = FFT_EDGE_SKIP_NARROW;
+            constexpr size_t HI = FFT_DC_SPIKE_START - 1;
+            const int32_t gate_power = (shape_data != nullptr)
+                ? static_cast<int32_t>(shape_data[i])
+                : static_cast<int32_t>(raw_sp[i]);
+            const int32_t margin = gate_power - static_cast<int32_t>(noise_floor);
+            if (margin >= static_cast<int32_t>(collect_gate)) {
+                if (!is_crest_bin(shape_data != nullptr ? shape_data : raw_sp,
+                                  i, LO, HI)) {
+                    continue;
+                }
+                const size_t apex = (shape_data != nullptr)
+                    ? refine_crest_to_raw_apex(raw_sp, shape_data, i, LO, HI)
+                    : i;
+                keep_strongest(candidates, cand_count,
+                               SimplePeak{apex, raw_sp[apex]});
+            }
+        }
+        for (size_t i = FFT_DC_SPIKE_END; i < (FFT_BIN_COUNT - FFT_EDGE_SKIP_NARROW); ++i) {
+            constexpr size_t LO = FFT_DC_SPIKE_END;
+            constexpr size_t HI = FFT_BIN_COUNT - FFT_EDGE_SKIP_NARROW - 1;
+            const int32_t gate_power = (shape_data != nullptr)
+                ? static_cast<int32_t>(shape_data[i])
+                : static_cast<int32_t>(raw_sp[i]);
+            const int32_t margin = gate_power - static_cast<int32_t>(noise_floor);
+            if (margin >= static_cast<int32_t>(collect_gate)) {
+                if (!is_crest_bin(shape_data != nullptr ? shape_data : raw_sp,
+                                  i, LO, HI)) {
+                    continue;
+                }
+                const size_t apex = (shape_data != nullptr)
+                    ? refine_crest_to_raw_apex(raw_sp, shape_data, i, LO, HI)
+                    : i;
+                keep_strongest(candidates, cand_count,
+                               SimplePeak{apex, raw_sp[apex]});
+            }
+        }
+
+        // Sort by power descending (insertion sort — small array)
+        for (size_t i = 1; i < cand_count; ++i) {
+            const SimplePeak key = candidates[i];
+            size_t j = i;
+            while (j > 0 && candidates[j - 1].power < key.power) {
+                candidates[j] = candidates[j - 1];
+                --j;
+            }
+            candidates[j] = key;
+        }
+
+        // Non-maximum suppression: reject peaks within CFAR_MIN_PEAK_SEPARATION
+        peak_count = 0;
+        for (size_t i = 0; i < cand_count && peak_count < MAX_SWEEP_PEAKS; ++i) {
+            bool suppressed = false;
+            for (size_t j = 0; j < peak_count; ++j) {
+                const size_t peak_bin_j = static_cast<size_t>(cfar_peaks[j].bin);
+                const size_t bin_diff = (candidates[i].bin > peak_bin_j)
+                    ? (candidates[i].bin - peak_bin_j)
+                    : (peak_bin_j - candidates[i].bin);
+                if (bin_diff < CFAR_MIN_PEAK_SEPARATION) {
+                    suppressed = true;
+                    break;
+                }
+            }
+            if (!suppressed) {
+                // uint8_t bin: candidates[] bins < FFT_BIN_COUNT (256) by
+                // construction (loop bounds above) — cast never truncates.
+                cfar_peaks[peak_count++] = {
+                    static_cast<uint8_t>(candidates[i].bin),
+                    candidates[i].power};
+            }
+        }
+    }
+
+    // Update peak power for timeline display (strongest peak)
+    // Do NOT early-return on peak_count == 0: multi-frame TBD below must still
+    // run when single-frame detection found no peaks (documented at :2256).
+    if (peak_count > 0) {
+        last_peak_power_ = cfar_peaks[0].power;
+    }
+
+    // P0-2: reuse the frame-level cached gain (frame_total_gain, read once
+    // near the candidate gate). receiver_model state is stable inside one
+    // frame; the old per-peak get_current_total_gain() re-read LNA/VGA/RF
+    // on every peak for an identical value.
+    const int32_t total_gain = frame_total_gain;
+
+    // Tracks whether any peak survived shape analysis this frame. TBD below must
+    // be gated on this: once single-frame detection tracked a signal, the
+    // multi-frame integration must NOT run (documented at :2256).
+    bool any_peak_passed_shape = false;
+
+    // TBD-RESURRECTION GUARD (FIX): set when a peak cleared the Step 3 margin
+    // gate but failed the shape chain. Blocks the sweep TBD pass below so a
+    // signal the 12-step chain explicitly rejected (valley/sharpness/flatness/
+    // symmetry/widths) cannot be re-confirmed by multi-frame integration
+    // TBD_MIN_FRAMES later — TBD honors widths only and would silently void
+    // those settings. Below-margin peaks do NOT set this flag: TBD stays the
+    // weak-signal integrator.
+    bool shape_blocked_tbd = false;
+
+    // Step 3: Process each CFAR peak through shape analysis + tracking.
+    // Only the strongest peak feeds the median filter (prevents cross-frequency
+    // contamination of the per-frequency smoothing accumulator).
+    // SPECTRUM-DETECTION BYPASS: when the user disables spectrum shape
+    // detection (spectrum_detection_enabled=false), skip apply_shape_filters()
+    // here and track purely by RSSI threshold (enforced inside
+    // apply_sweep_tracking()). Previously the 12-step shape chain always ran
+    // in sweep, so OFF behaved identically to ON — the checkbox was dead in
+    // sweep while working in DB scan (process_spectrum_message gates there).
+    const bool bypass_shape = !config_.spectrum_detection_enabled;
+
+    // EMISSION DEDUP (parity with the DB-scan path in
+    // analyze_spectrum_shape_multi()): peaks are strongest-first; the first
+    // crest that passes the shape chain records its whole SignalExtent
+    // (Step 6b) and every later peak INSIDE an accepted extent is a ripple
+    // crest of the SAME emission — skipped instead of spawning a duplicate
+    // detection. Previously sweep ran the shape chain on all 8 candidates
+    // independently with no shared extent, so one rippled WiFi/BT top
+    // spawned up to 8 records per frame and dozens per sweep pass.
+    // Stack: accepted_sweep[] = MAX_SWEEP_PEAKS × sizeof(SignalExtent)
+    // = 8 × 8 = 64 bytes (ARM32 size_t). Well within the 512B frame budget.
+    SignalExtent accepted_sweep[MAX_SWEEP_PEAKS]{};
+    size_t accepted_sweep_count = 0;
+
+    for (size_t p = 0; p < peak_count; ++p) {
+        const size_t peak_index = cfar_peaks[p].bin;
+
+        // Skip peaks on DC spike (bins 120-135) — no real signal energy.
+        // Defensive: both candidate sources already exclude DC bins.
+        if (peak_index >= FFT_DC_SPIKE_START && peak_index < FFT_DC_SPIKE_END) {
+            continue;
+        }
+
+        // Same-emission fast path: run BEFORE the filter chain. Only active
+        // when the shape chain runs — in bypass mode there are no extents,
+        // tracking is RSSI-only (unchanged legacy behavior).
+        if (!bypass_shape) {
+            bool duplicate = false;
+            for (size_t e = 0; e < accepted_sweep_count; ++e) {
+                if (peak_index >= accepted_sweep[e].left
+                    && peak_index <= accepted_sweep[e].right) {
+                    duplicate = true;
+                    break;
+                }
+            }
+            if (duplicate) continue;
+        }
+
+        FreqHz peak_freq = fft_bin_to_freq(center_freq, peak_index);
+
+        // Shape analysis on RAW FFT bins (RF-monotonic axis, DC gap as a hard
+        // measurement boundary). Formerly ran on the LG-reordered 240-px line,
+        // whose wrap seam mapped the two band edges ADJACENT — two emitters at
+        // opposite band edges merged into one "wide" peak, and edge-adjacent
+        // signals got distorted width/valley/flatness/symmetry. Raw bins use
+        // the SAME filter chain as DB scan (analyze_spectrum_shape_impl ->
+        // apply_shape_filters, has_dc_gap=true), so MaxW semantics are
+        // identical in both modes by construction. Edge skip matches the
+        // candidate-collection region (FFT_EDGE_SKIP_NARROW = 6 bins).
+        // reject_edge_clipped=true: sweep-only Step 6c, BOTH-EDGES rule —
+        // only an emission spanning the ENTIRE usable window (WiFi 20-40+
+        // MHz at every sweep position) is a clipped fragment; a single-edge
+        // touch (fat FPV at an unlucky fixed slice phase) passes. The rule
+        // bridges the DC gap wall-to-wall (audit fix D1 — a DC-bounded single
+        // extent could never touch both walls). DB scan keeps false (VTX
+        // drift to the DB window edge is by design).
+        int32_t shape_rssi = RSSI_MIN_DBM;
+        if (bypass_shape) {
+            // RSSI-only path: same dBm conversion as the shape path's RSSI
+            // output, no width/sharpness/valley gates. Stack: 0B extra.
+            shape_rssi = spectrum_value_to_dbm(cfar_peaks[p].power, total_gain);
+        } else {
+            SignalExtent det_extent{};
+            if (!analyze_spectrum_shape_impl(
+                    spectrum, peak_index, cfar_peaks[p].power,
+                    noise_floor, width_floor, shape_rssi, FFT_EDGE_SKIP_NARROW,
+                    total_gain,
+                    &det_extent, /*reject_edge_clipped=*/true,
+                    /*out_verdict=*/nullptr, shape_data)) {
+                // TBD-RESURRECTION GUARD (FIX): only peaks that cleared the
+                // Step 3 margin gate (cfg_margin == shape_gate_margin(),
+                // hoisted above) block TBD. Short-circuit order guards the
+                // uint8 subtraction. Below-margin peaks leave TBD free —
+                // multi-frame integration remains the weak-signal path.
+                if ((cfar_peaks[p].power > noise_floor)
+                    && (cfar_peaks[p].power - noise_floor) >= cfg_margin) {
+                    shape_blocked_tbd = true;
+                    note_shape_veto(cfar_peaks[p].bin);  // D5: persist across frames until sweep-step reset
+                }
+                continue;  // This peak rejected by shape filter — try next peak
+            }
+            if (accepted_sweep_count < MAX_SWEEP_PEAKS) {
+                accepted_sweep[accepted_sweep_count++] = det_extent;
+            }
+        }
+        any_peak_passed_shape = true;
+
+        // Median filter: only for primary peak (p==0) to avoid cross-frequency
+        // contamination. The WINDOW FEED moved to frame level (noise-floor
+        // collection above): the filter now sees EVERY frame at this slice —
+        // accepted or rejected — so it warms within one revisit dwell and
+        // represents the true per-slice RSSI history instead of re-feeding
+        // only already-accepted values (old behavior: Md+ was a no-op for
+        // pass/reject in sweep).
+        int32_t peak_rssi = shape_rssi;
+        // Audit M1 (FP gate): the user RSSI threshold must judge the LIVE
+        // shape measurement. The clamped median below exists only to smooth
+        // fast fading for statistics/threat — it may never carry a
+        // sub-threshold peak through the gate (a decaying emitter whose
+        // warm history sits above the threshold would otherwise stay
+        // tracked; DB gates on the live shape peak, so this restores
+        // sweep/DB parity). apply_sweep_tracking()'s internal gate on the
+        // clamped value remains as the stricter history-side check.
+        if (shape_rssi <= config_.rssi_threshold_dbm) continue;
+        if (p == 0 && median_filter_enabled_ && rssi_median_filter_.is_warm()) {
+            // Audit M1 clamp: the median smooths fast fading, but a stale
+            // window (strong emitter occupied this slice earlier in the
+            // pass, then vanished) must not substitute its history for the
+            // CURRENT frame's validated shape RSSI — that inflated
+            // peak_rssi fed threat classification and the > threshold gate,
+            // keeping dead emitters tracked and escalating threat levels.
+            // Clamp the median to ±SWEEP_MEDIAN_CLAMP_DB around this
+            // frame's shape_rssi: normal fading (≤6 dB) is still smoothed,
+            // a vanished emitter's stale median collapses onto the live
+            // measurement. Stack: 0 (reuses registers). Flash: ~24 B.
+            int32_t median_rssi = rssi_median_filter_.get_median();
+            if (median_rssi > shape_rssi + SWEEP_MEDIAN_CLAMP_DB) {
+                median_rssi = shape_rssi + SWEEP_MEDIAN_CLAMP_DB;
+            } else if (median_rssi < shape_rssi - SWEEP_MEDIAN_CLAMP_DB) {
+                median_rssi = shape_rssi - SWEEP_MEDIAN_CLAMP_DB;
+            }
+            peak_rssi = median_rssi;
+        }
+
+        apply_sweep_tracking(
+            win_idx,
+            peak_freq,
+            peak_rssi, center_freq, f_min, f_max
+        );
+    }
+
+    // ---- Sweep-mode Track-Before-Detect (TBD) ----
+    // Single-frame detection tracked nothing in this frame: offer the frame to
+    // the multi-frame integrator (~9 dB SNR gain; the only path that can
+    // confirm a target which never clears the Step-3 shape gate). The complete
+    // TBD decision lives in sweep_tbd_pass() below, so the prefilter-cut path
+    // (cheap integrator-only branch near the top of this function) and this
+    // path can never diverge in semantics.
+    sweep_tbd_pass(win_idx, spectrum, center_freq, f_min, f_max, noise_floor,
+                   frame_total_gain, any_peak_passed_shape,
+                   shape_blocked_tbd);
+}
+
+void DroneScanner::sweep_tbd_pass(
+    uint8_t win_idx,
+    const ChannelSpectrum& spectrum,
+    FreqHz center_freq,
+    FreqHz f_min,
+    FreqHz f_max,
+    uint8_t noise_floor,
+    int32_t frame_total_gain,
+    bool any_peak_passed_shape,
+    bool shape_blocked_tbd
+) noexcept {
+    // GUARD (caller verdict): a shape-validated detection, or an explicit
+    // shape rejection, in this frame outranks the integrator — TBD honours
+    // widths only and would resurrect the rejected signal TBD_MIN_FRAMES
+    // later, silently voiding the user's Valley/Sharpness/Flatness/Symmetry
+    // settings. Below-gate peaks never reach this guard, so the weak-signal
+    // purpose of TBD is preserved.
+    if (any_peak_passed_shape || shape_blocked_tbd) return;
+    if (!config_.spectrum_detection_enabled) return;
+    if (!waterfall_history_.is_warm(TBD_MIN_FRAMES)) return;
+
+    // The ENVELOPE (per-bin max over the window) is where a multi-frame target
+    // has to show up, so the candidate bin is searched there rather than in
+    // this frame alone.
+    size_t tbd_peak_bin = FFT_EDGE_SKIP_NARROW;
+    uint8_t tbd_peak_power = 0;
+    for (size_t i = FFT_EDGE_SKIP_NARROW; i < FFT_BIN_COUNT - FFT_EDGE_SKIP_NARROW; ++i) {
+        if (i >= FFT_DC_SPIKE_START && i < FFT_DC_SPIKE_END) continue;
+        const uint8_t max_power = waterfall_history_.get_max_across_frames(i);
+        if (max_power > tbd_peak_power) {
+            tbd_peak_power = max_power;
+            tbd_peak_bin = i;
+        }
+    }
+
+    // Confirm threshold: RSSI term (Sens) FLOORED at this frame's noise shelf +
+    // TBD_MIN_ELEVATION_UNITS — the SAME single derivation the DB confirm gate
+    // and the sweep frame-reachability gate use, so all three agree by
+    // construction. Frame-level gain is cached (P0-2: it cannot change
+    // mid-frame).
+    const uint8_t threshold = sweep_tbd_effective_threshold(
+        sweep_tbd_threshold_units(config_.rssi_threshold_dbm, frame_total_gain),
+        noise_floor);
+    const uint8_t active_frames =
+        waterfall_history_.count_above_threshold(tbd_peak_bin, threshold);
+
+    // PRESENT-NOW requirement (FIX): frame age 0 in the waterfall IS the current
+    // frame (pushed before this pass), so stale history alone can never confirm
+    // — closes the "rejected frames 1..3, clean frame 4 confirms" resurrection
+    // path. Sensitivity-neutral: a marginal target just waits for an "up"
+    // flicker frame instead of confirming during a fade.
+    // SHAPE-VETO (D5 cross-frame fix): bins the shape chain rejected while
+    // above the gate earlier in THIS waterfall window stay vetoed — a peak
+    // flickering below the gate no longer slips past shape_blocked_tbd and gets
+    // resurrected with width-only validation.
+    if (active_frames < TBD_MIN_FRAMES) return;
+    if (spectrum.db[tbd_peak_bin] < threshold) return;
+    if (shape_vetoed(tbd_peak_bin)) return;
+
+    // Multi-frame confirmed — integrated RSSI over the envelope window.
+    const uint16_t integrated = waterfall_history_.get_integrated_power(tbd_peak_bin);
+    const uint8_t avg_power = static_cast<uint8_t>(integrated / waterfall_history_.size());
+    const int32_t tbd_rssi = spectrum_value_to_dbm(avg_power, frame_total_gain);
+
+    // NARROWBAND GUARD: TBD must never resurrect a wideband flat-top (WiFi/BT)
+    // that the single-frame shape chain rejected — it re-applies the width
+    // semantics on the multi-frame ENVELOPE (the union of bin positions the
+    // emission occupied across the window). RAW BIN space, not LG pixels: bin
+    // size is identical in both scan modes (DB_CAPTURE_RATE_HZ ==
+    // SWEEP_SLICE_BW) and noise_floor is the same 25th-percentile shelf this
+    // pass used as the confirm reference. The guard additionally owns a
+    // TBD-internal sideband-span rule, so it stays effective even when the user
+    // raises spectrum_max_width to "no cap" — see tbd_peak_is_narrowband().
+    if (tbd_rssi <= config_.rssi_threshold_dbm) return;
+    if (!tbd_peak_is_narrowband(tbd_peak_bin, FFT_BIN_COUNT,
+                                noise_floor, FFT_EDGE_SKIP_NARROW)) {
+        return;
+    }
+
+    const FreqHz tbd_freq = fft_bin_to_freq(center_freq, tbd_peak_bin);
+    apply_sweep_tracking(win_idx, tbd_freq, tbd_rssi, center_freq, f_min, f_max);
+}
+
+} // namespace drone_analyzer

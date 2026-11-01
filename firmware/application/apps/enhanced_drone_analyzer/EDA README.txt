@@ -1,0 +1,1908 @@
+================================================================================
+  ENHANCED DRONE ANALYZER (EDA) — COMPREHENSENSIVE DOCUMENTATION
+  Firmware Application for HackRF One / PortaPack Mayhem
+  Author: Kuznetsov Maxim (Orenburg)
+  Version: Current codebase (49 source files)
+================================================================================
+
+TABLE OF CONTENTS
+-----------------
+  1. Overview
+  2. Architecture & Layer Diagram
+  3. File Inventory (42 files)
+  4. Hardware Constraints & Memory Budget
+  5. Core Data Types
+  6. Detection Pipeline
+  7. Sweep Mode (Looking Glass Pattern)
+  8. Normal Mode (DB Sequential Scan)
+  9. UI Framework
+  10. Settings & Persistence
+  11. Thread Model & Synchronization
+  12. Audio Alert System
+  13. Pattern Matching (REMOVED)
+  14. Detection Filter Chain
+  15. CFAR Detection (All 7 Modes)
+  16. Mahalanobis Gate Filter
+  17. Auto Gain Control (AGC)
+  18. Memory Map & Stack Budgets
+  19. Error Handling Strategy
+  20. SD Card File Layout
+  21. Build & Test Instructions
+  22. Known Limitations
+  23. Configuration Reference
+  24. Как отсечь WiFi — практическое руководство (сценарии)
+
+================================================================================
+1. OVERVIEW
+================================================================================
+
+The Enhanced Drone Analyzer (EDA) is a comprehensive RF drone detection application
+for the HackRF One hardware platform running PortaPack Mayhem firmware. It detects
+and classifies radio-frequency signals from consumer and FPV drones by analyzing
+spectrum shape, signal strength, movement trends, and statistical properties.
+
+Key Capabilities:
+  - Wideband spectrum analysis across 1 MHz - 7.2 GHz
+  - 4-window sweep mode: 5.8 GHz FPV, 2.4 GHz, 1.2 GHz FPV, 433-928 MHz
+  - Real-time drone tracking with threat classification (NONE/LOW/MEDIUM/HIGH/CRITICAL)
+  - CFAR (Constant False Alarm Rate) detection with 7 algorithm variants
+  - Mahalanobis gate filter for statistical outlier rejection
+  - Spectrum shape analysis (V-shape, sharpness, valley depth, flatness, symmetry)
+  - Automatic RF frontend gain control
+  - Audio alerts with SOS patterns for critical threats
+  - RSSI history with movement trend detection (approaching/receding/static)
+  - Persistent settings on SD card (/EDA/SETTINGS.TXT)
+  - Database scanning from freqman-format files (/FREQMAN/*.TXT)
+
+Target Platform:
+  - MCU: STM32F405RG (ARM Cortex-M4F, 168 MHz)
+  - RAM: 128 KB SRAM (usable ~64 KB contiguous for application)
+  - Flash: 1 MB
+  - RTOS: ChibiOS (cooperative + preemptive threads)
+  - Display: 240x320 pixels, 16-bit RGB565
+  - RF: HackRF One (Si5351, MAX2837, RFFC5072)
+
+================================================================================
+2. ARCHITECTURE & LAYER DIAGRAM
+================================================================================
+
+  ┌─────────────────────────────────────────────────────────────┐
+  │                    UI LAYER (M4 Core)                       │
+  │  DroneScannerUI  │  DroneDisplay  │  DroneSettingsView     │
+  │  DroneSweepView  │                                         │
+  │  SpectrumPreviewWidget │ MiniWaterfall                      │
+  ├─────────────────────────────────────────────────────────────┤
+  │                   LOGIC LAYER (M4 Core)                     │
+  │  DroneScanner (core logic) │ ScannerThread                  │
+  │  CFARDetector │ MedianFilter<T,N> │ SweepProcessor          │
+  │  MahalanobisDetector │ RSSIDetector                         │
+  │  AdaptiveThreshold │ SpectralKurtosis                       │
+  │  AutoGainControl │ NeighborMarginChecker                    │
+  ├─────────────────────────────────────────────────────────────┤
+  │                   DATA LAYER (M4 Core)                      │
+  │  DatabaseManager                    SettingsFileManager     │
+  │  TrackedDrone[16] │ DisplayDroneEntry[16]                   │
+  │  ScanConfig │ SettingsStruct │ WaterfallHistory              │
+  ├─────────────────────────────────────────────────────────────┤
+  │                   HAL LAYER                                 │
+  │  HardwareController │ portapack::spi │ baseband::api        │
+  │  radio::set_tuning_frequency │ audio::*                     │
+  ├─────────────────────────────────────────────────────────────┤
+  │                   HARDWARE                                  │
+  │  Si5351 (PLL) │ MAX2837 (LNA/VGA) │ RFFC5072 (Mixer)     │
+  │  CPLD (ADC/DAC) │ WM8731/AK4951 (Audio Codec)             │
+  └─────────────────────────────────────────────────────────────┘
+
+Thread Architecture:
+  ┌──────────────────────────────────────┐
+  │  UI Thread (Main, Priority 5)        │
+  │  - All widget callbacks              │
+  │  - Message handlers                  │
+  │  - Sweep frequency stepping          │
+  │  - Display rendering                 │
+  │  Stack: 4096 bytes                   │
+  ├──────────────────────────────────────┤
+  │  Scanner Thread (Priority 10)        │
+  │  - perform_scan_cycle()              │
+  │  - DB frequency hopping              │
+  │  - Dwell timer management            │
+  │  Stack: 2048 bytes                   │
+  ├──────────────────────────────────────┤
+  │  Baseband (M0 Core, separate binary) │
+  │  - FFT computation                   │
+  │  - Spectrum streaming                │
+  │  - Channel statistics                │
+  └──────────────────────────────────────┘
+
+Lock Ordering (deadlock prevention):
+  PATTERN_MUTEX(0) → DATA_MUTEX(1) → DATABASE_MUTEX(2) → STATE_MUTEX(3)
+  MUST be acquired in ascending order only.
+
+================================================================================
+3. FILE INVENTORY (43 files)
+================================================================================
+
+  File                          Lines   Purpose
+  ───────────────────────────── ─────── ──────────────────────────────────────
+  constants.hpp                 ~1500   All compile-time constants, thresholds
+  drone_types.hpp               ~820    Core types, enums, TrackedDrone struct
+  drone_types.cpp               ~615    TrackedDrone methods, DisplayDroneEntry
+  drone_scanner_ui.hpp          ~287    Main EDA view (entry point)
+  drone_scanner_ui.cpp          ~1250+  Main view implementation, sweep logic
+  drone_display.hpp             ~706    Display widget (spectrum, drone list)
+  drone_display.cpp             ~1000+  Rendering implementation
+  drone_settings.hpp            ~133    Settings view declaration
+  drone_settings.cpp            ~711    Settings view with all callbacks
+  drone_sweep_view.hpp          ~161    Sweep settings view
+  drone_sweep_view.cpp          ~378    Sweep settings implementation
+  sweep_presets.hpp             ~273    Sweep band-plan presets + validators
+  range_names.hpp               ~113    Detection-range label table (SWP)
+  scanner.hpp                   ~1400+  DroneScanner class, CFAR detector
+  scanner.cpp                   ~1000+  Scanner logic, spectrum processing
+  scanner_thread.hpp            ~52     ScannerThread declaration
+  scanner_thread.cpp            ~50+    Thread implementation
+  database.hpp                  ~84     DatabaseManager declaration
+  database.cpp                  ~200+   Database file loading
+  hardware_controller.hpp       ~304    HardwareController declaration
+  hardware_controller.cpp       ~200+   Hardware abstraction implementation
+  settings_manager.hpp          ~179    SettingsStruct + SettingsFileManager
+  settings_manager.cpp          ~400+   SD card load/save/apply
+  locking.hpp                   ~119    RAII mutex wrappers, AtomicFlag
+  audio_alerts.hpp              ~131    Audio alert system declaration
+  audio_alerts.cpp              ~200+   Beep generation, SOS patterns
+  rssi_detector.hpp             ~120    RSSIDetector declaration
+  rssi_detector.cpp             ~200+   RSSI processing
+  mahalanobis_gate.hpp          ~150    Mahalanobis gate declaration
+  mahalanobis_gate.cpp          ~200+   Q8.8 fixed-point statistics
+  median_filter.hpp             ~146    Stack-based median filter (template)
+  adaptive_threshold.hpp        ~124    Self-tuning CFAR threshold
+  auto_gain_control.hpp         ~170    AGC for HackRF RF frontend
+  spectral_kurtosis.hpp         ~202    Higher-order statistics computation
+  sweep_processor.hpp           ~89     FFT bin → composite pixel mapping
+  sweep_processor.cpp           ~200+   Process frame, reorder frame
+  spectrum_envelope.hpp         ~114    3-tap FFT envelope helper
+  sweep_sensitivity.hpp         ~247    Sweep prefilter + TBD-reachability helpers
+  mini_waterfall.hpp            ~166    Compact scrolling waterfall
+  waterfall_history.hpp         ~174    Multi-frame FFT ring buffer
+  spectrum_preview_widget.hpp   ~44     Settings preview widget
+  spectrum_preview_widget.cpp   ~100+   Preview rendering
+  freqman_types.hpp             ~23     freqman_type enum
+
+Total: 43 files, ~26,000 lines of C++ code.
+
+================================================================================
+4. HARDWARE CONSTRAINTS & MEMORY BUDGET
+================================================================================
+
+Memory Budget (from constants.hpp):
+  ─────────────────────────────────────────────
+  Component                    Bytes     Location
+  ─────────────────────────────────────────────
+  Database entries[100]        1,152     BSS (12B each)
+  Tracked drones[16]           2,560     BSS (~160B each)
+  Display drones[16]           1,024     BSS (~64B each)
+  Spectrum buffer              256       BSS (ChannelSpectrum)
+  Signal timeline              62        BSS
+  RSSI detector                ~108      BSS
+  Scanner thread stack         2,048     BSS (THD_WA_SIZE)
+  Mini waterfalls[5]           2,250     BSS (450B each)
+  Sweep windows[4]             ~1,200    BSS (300B each)
+  LG frame buffer              240       BSS
+  Workspace buffers            ~728      BSS (cfg + settings)
+  Other structures             ~200      BSS
+  ─────────────────────────────────────────────
+  TOTAL STATIC RAM             ~8,550    bytes
+  STACK BUDGET                 4,096     bytes (UI thread)
+  SCANNER THREAD STACK         2,048     bytes
+  TOTAL MEMORY BUDGET          ~12,646   bytes
+  ─────────────────────────────────────────────
+
+Forbidden (will cause HardFault or OOM):
+  ✗ std::vector, std::string, std::map, std::unordered_map
+  ✗ std::atomic (no SMP, single-core M4F)
+  ✗ new, delete, malloc, free, calloc, realloc
+  ✗ std::thread, std::mutex, std::future
+  ✗ Dynamic memory allocation of ANY kind
+  ✗ Stack frames > 512 bytes per function
+  ✗ Recursion deeper than 2 levels
+  ✗ VLA (Variable Length Arrays)
+  ✗ Exceptions, RTTI, dynamic_cast
+
+Permitted:
+  ✓ std::array<T, N> — compile-time fixed size
+  ✓ std::string_view — non-owning reference
+  ✓ C-style arrays with constexpr size
+  ✓ Memory Pools (pre-allocated blocks)
+  ✓ Stack allocation for primitives and small structs (<64 bytes)
+  ✓ static const/constexpr for flash placement
+  ✓ Placement new ONLY for memory pool initialization
+
+================================================================================
+5. CORE DATA TYPES
+================================================================================
+
+Type Aliases (drone_types.hpp):
+  FreqHz        = uint64_t    // Frequency in Hz
+  RssiValue     = int32_t     // Signal strength in dBm
+  SystemTime    = uint32_t    // ChibiOS tick count (ms)
+
+Enums:
+  DroneType     : DJI, Parrot, Yuneec, 3DR, Autel, Hobby, FPV, Custom, Other
+  ThreatLevel   : NONE, LOW, MEDIUM, HIGH, CRITICAL
+  ScanningMode  : SEQUENTIAL
+  ScannerState  : IDLE, SCANNING, LOCKING, TRACKING, PAUSED, ERROR
+  MovementTrend : UNKNOWN, STATIC, APPROACHING, RECEIVING
+  ErrorCode     : SUCCESS + 25 error codes (HW, DB, buffer, sync, init)
+  CFARMode      : OFF, CA, GO, SO, HYBRID, OS, VI
+
+Key Structures:
+
+  TrackedDrone (~160 bytes, 16 instances = 2,560B BSS):
+    FreqHz frequency                      // 8B - tracking identity
+    FreqHz measured_frequency_            // 8B - bin-corrected display freq
+    DroneType drone_type                  // 1B
+    ThreatLevel threat_level              // 1B
+    uint8_t update_count                  // 1B
+    SystemTime last_seen                  // 4B
+    RssiValue rssi                        // 4B - current RSSI
+    int16_t rssi_history_[6]              // 12B - circular buffer
+    SystemTime timestamp_history_[6]      // 24B
+    uint16_t history_index_               // 2B - monotonic write cursor
+    uint8_t missed_cycles_                // 1B
+    int16_t last_rssi_                    // 2B
+    uint8_t rssi_decrease_counter_        // 1B
+    bool rssi_increased_                  // 1B
+    SystemTime last_increase_time_        // 4B
+    SystemTime created_time_              // 4B
+    SystemTime last_seen_time_            // 4B
+    uint8_t sweep_cycles_missed_          // 1B
+    bool sweep_mode_active_               // 1B
+    int16_t last_cycle_peak_rssi_         // 2B - sentinel if invalid
+    int16_t prev_cycle_peak_rssi_         // 2B
+    bool has_prev_cycle_peak_             // 1B
+    mutable MovementTrend cached_trend_   // 1B - hysteresis state
+    mutable uint8_t trend_hold_count_     // 1B
+    MahalanobisStatistics mahalanobis_    // 48B - Q8.8 fixed-point
+
+  DisplayDroneEntry (~48 bytes, 16 instances = 768B BSS):
+    FreqHz frequency                      // 8B
+    DroneType type                        // 1B
+    ThreatLevel threat                    // 1B
+    RssiValue rssi                        // 4B
+    SystemTime last_seen                  // 4B
+    char type_name[16]                    // 16B
+    uint32_t display_color                // 4B (RGBA)
+    MovementTrend trend                   // 1B
+
+  ScanConfig (~367 bytes):
+    (-1B SRAM: uint32 sweep_det_win_start/end_mhz[4][5] = 160B
+     replaces FreqHz sweep_exceptions[4][5] + radius = 161B; a FreqRangeHz
+     (2×u64) array would be 320B and break the 512B static_assert)
+    ScanningMode mode
+    FreqHz start_frequency, end_frequency
+    uint32_t scan_interval_ms
+    int32_t rssi_threshold_dbm
+    int32_t threat_low/medium/high/critical_dbm
+    uint32_t stale_timeout_ms
+    FreqHz sweep_start/end/step_freq (×4 windows)
+    bool sweep2/3/4_enabled
+    uint32 sweep_det_win_start/end_mhz[4][5]  // detection windows (From/To, MHz mirror)
+    bool dwell_enabled, confirm_count_enabled, noise_blacklist_enabled
+    bool spectrum_detection_enabled, median_enabled
+    uint8_t spectrum_margin/min_width/max_width/sharpness/ratio/valley/flatness/symmetry
+    bool mahalanobis_enabled
+    uint8_t mahalanobis_threshold_x10
+    int32_t neighbor_margin_db
+    bool rssi_variance_enabled
+    uint8_t confirm_count, miss_tolerance
+    CFARMode cfar_mode
+    uint8_t cfar_ref_cells/guard_cells/threshold_x10
+    uint8_t cfar_hybrid_alpha/beta/gamma, os_cfar_k_percent, vi_cfar_threshold_x10
+    bool shape_bypass_enabled, robust_width_floor_enabled, sensitive_mode
+    uint8_t shape_sim_threshold_pct (50..100, default 100 = strict AND
+        (every armed similarity step must agree), only read when
+        sensitive_mode ON; files stamped <= 1.3 migrate a stored 50 to
+        the current default on load — audit D-FULL-PASS)
+    bool kurtosis_enabled, adaptive_cfar_enabled
+    uint8_t rssi_decrease_cycles, freq_match_radius_mhz
+
+  SettingsStruct (~360 bytes):
+    Mirrors ScanConfig fields + display-only settings (spectrum_visible, etc.)
+    + SD card persistence metadata
+
+================================================================================
+6. DETECTION PIPELINE
+================================================================================
+
+The detection pipeline processes each FFT frame through multiple stages:
+
+  Spectrum Frame (256 bins, from baseband M0)
+       │
+       ▼
+  ┌─────────────────────────┐
+  │ Stage 1: DC Spike Blank │ Skip bins 120-135 (FFT center)
+  └─────────────────────────┘
+       │
+       ▼
+  ┌─────────────────────────┐
+  │ Stage 2: Edge Skip      │ Skip bins 0-9 and 246-255 (filter rolloff)
+  └─────────────────────────┘
+       │
+       ▼
+  ┌─────────────────────────┐
+  │ Stage 3: CFAR Detection │ Adaptive threshold detection (7 modes)
+  │   OFF/CA/GO/SO/HYBRID/OS/VI │
+  └─────────────────────────┘
+       │
+       ▼
+  ┌─────────────────────────┐
+  │ Stage 4: Peak Detection │ Find strongest peak, compute margin/width
+  └─────────────────────────┘
+       │
+       ▼
+  ┌─────────────────────────┐
+  │ Stage 5: Shape Filters  │ 12-step filter chain:
+  │   1. Peak margin (SNR)  │
+  │   2. Min width          │
+  │   3. Max width          │
+  │   4. Peak sharpness     │
+  │   5. Peak-to-width ratio│
+  │   6. Valley depth       │
+  │   7. Flatness           │
+  │   8. Symmetry           │
+  │   9. Neighbor margin    │
+  │  10. RSSI variance      │
+  │  11. Mahalanobis gate   │
+  │  12. Spectral kurtosis  │
+  └─────────────────────────┘
+       │
+       ▼
+  ┌─────────────────────────┐
+  │ Stage 6: Drone Tracking │ Match to existing or create new TrackedDrone
+  │   - Frequency proximity │ (DRONE_FREQ_MATCH_RADIUS_HZ = 1 MHz)
+  │   - Duplicate consolidation (absorb_from)
+  │   - Threat classification from RSSI thresholds
+  │   - Movement trend calculation (cycle-peak or split-buffer)
+  └─────────────────────────┘
+       │
+       ▼
+  ┌─────────────────────────┐
+  │ Stage 7: UI Update      │ DisplayDroneEntry copy + sort + render
+  └─────────────────────────┘
+
+================================================================================
+7. SWEEP MODE (Looking Glass Pattern)
+================================================================================
+
+Sweep mode scans wide frequency ranges (4 windows; the factory band plan
+totals 1118 MHz — 300 + 83 + 240 + 495, every span user-editable) by
+stepping the radio through 20 MHz slices, similar to the Looking Glass app.
+
+Preset band plans (SWEEP_PRESETS, sweep_presets.hpp):
+  The SWP tab's Demo preset button applies a factory band plan to all four
+  windows at once: the window span, the Enabled flag, and the detection
+  ranges — each labelled from RANGE_NAMES, unused slots left 0/0 (off).
+  Since 2026-10-22 the Enabled flag is staged by the table: only W1 ships
+  enabled, W2/W3/W4 come up OFF with their spans and slots pre-filled —
+  re-enable them individually and the full band plan is restored with no
+  re-entry. Like DEFAULTS it is a UI-side edit: nothing is written until
+  SAVE. The table lives in Flash and is validated at compile time (name
+  fits the button SSO, spans inside the hardware range, every slot inside
+  its own window, no two slots overlapping beyond their shared boundary),
+  so an invalid preset fails the build instead of shipping.
+  The Demo preset totals 2100 MHz (700 + 300 + 500 + 600), all spans
+  user-editable (2026-10 user-elected plan): W1 5300..6000 with detection
+  in 5 gapless priority zones 5645..5950 (slot 0 first; the guard slices
+  5300..5645 / 5950..6000 are swept but allow-list-gated), W2 2300..2600,
+  W3 900..1400, W4 400..1000 — W2/W3/W4 carry a single full-span slot
+  each (no narrow channel splits: vendor grids differ and the detector
+  classifies by SHAPE, not by grid).
+
+Sweep Architecture:
+  ┌──────────────────────────────────────────────────────┐
+  │  SweepWindow[0..3] — each window has:                │
+  │    composite[240]     — pixel buffer (one pass)       │
+  │    f_min, f_max       — frequency range               │
+  │    f_center           — current tune frequency        │
+  │    pixel_index        — current pixel position        │
+  │    pixel_step_hz      — Hz per pixel                  │
+  │    step_hz            — Hz per FFT step               │
+  │    det_windows[5]     — detection windows (From/To)   │
+  │    (render never masks pixels; detection gating only) │
+  └──────────────────────────────────────────────────────┘
+
+  ┌──────────────────────────────────────────────────────┐
+  │  Shape Analysis (RAW FFT bins, both modes):          │
+  │    RF-monotonic 256-bin axis; DC spike (120-135) is  │
+  │    a hard measurement boundary. MaxW/valley/         │
+  │    flatness/symmetry identical to DB scan.           │
+  │    Former LG 240-px reorder removed: its wrap seam   │
+  │    merged band-edge emissions into one "wide" peak.  │
+  └──────────────────────────────────────────────────────┘
+
+  ┌──────────────────────────────────────────────────────┐
+  │  Sweep Cycle:                                         │
+  │    1. Tune to f_center                                │
+  │    2. Arm stale-frame budget = FIFO len() + 1         │
+  │    3. Drop exactly that many stale frames             │
+  │    4. Process FFT → composite[240] via SweepProcessor │
+  │    5. Feed scanner (≤ SWEEP_MAX_DETECTOR_LOOKS per    │
+  │       window+slice center per pass)                   │
+  │    6. Push to per-window MiniWaterfall                │
+  │    7. Advance f_center by step_hz                     │
+  │    8. When pixel_index >= 240: pass complete          │
+  │    9. Round-robin to next enabled window              │
+  │   10. On full cycle: finalize_sweep_cycle()           │
+  └──────────────────────────────────────────────────────┘
+
+Key Constants:
+  SWEEP_SLICE_BW          = 20 MHz (bandwidth per slice)
+  FFT_BIN_COUNT           = 256 bins
+  SWEEP_BIN_SIZE          = 78,125 Hz/bin (20 MHz / 256)
+  SWEEP_PIXELS_PER_SLICE  = 240 (= DISPLAY_WIDTH)
+  SWEEP_BINS_PER_STEP     = 228 (= FFT_USABLE_BINS_NARROW)
+  SWEEP_GAPLESS_STEP_MAX  = ~8.8 MHz (max step for zero blind frequencies)
+  SWEEP_FFT_TRIGGER       = 63 (phase decimation, ~6.5ms integration)
+
+DB Capture (normal scan mode):
+  DB_CAPTURE_RATE_HZ      = 20 MHz (±10 MHz window, = SWEEP_SLICE_BW →
+                            identical 78.125 kHz bin size in both modes)
+  DB_FFT_TRIGGER          = 160 (161 × 102.4 µs ≈ 16.5 ms → ~60.6 fps,
+                            matched to the 60 Hz DisplayFrameSync consumer;
+                            higher rates saturate the 4-slot FIFO and drop
+                            frames → wrong frequency attribution)
+  Retune-straddle guard   = first frame after a frequency change is
+                            discarded (blends old+new frequency)
+  CALIBRATION             = absolute levels +~10 dB vs legacy 2 MHz capture
+                            (10·log10(20/2)); re-tune rssi_threshold_dbm and
+                            threat ladder once. Shape filters are relative
+                            (per-frame noise percentile) — no re-tuning.
+  SWEEP_PERSISTENCE_DECAY = 224/256 = 0.875 (EMA decay factor)
+  SWEEP_RETUNE_MIN_PENDING_FRAMES = 1 (floor when FIFO not observable)
+  SWEEP_MAX_DETECTOR_LOOKS_PER_SLICE = 4 (detector cap per window+center/pass)
+  MAX_SWEEP_WINDOWS       = 4
+
+Composite Persistence (EMA):
+  new_val = max(raw_val, (persist_val * DECAY) >> 8)
+  Signal decays to ~59% after 4 passes (~3s at 1.6s/pass)
+
+Noise Floor Subtraction:
+  Auto-computed from 15th percentile of EMA persistence buffer
+  Display only bins above noise_floor + SWEEP_DISPLAY_NOISE_MARGIN (8)
+
+================================================================================
+8. NORMAL MODE (DB Sequential Scan)
+================================================================================
+
+Normal mode scans a database of known drone frequencies.
+
+  ┌──────────────────────────────────────────────────────┐
+  │  Database (freqman format):                           │
+  │    /FREQMAN/DRONES.TXT (default)                      │
+  │    Format: f=frequency,d=description                  │
+  │    Max entries: 100 (1,152 bytes BSS)                 │
+  │    Entry: frequency_a (int64) + description[32]       │
+  └──────────────────────────────────────────────────────┘
+
+  ┌──────────────────────────────────────────────────────┐
+  │  Scan Cycle:                                          │
+  │    1. Scanner thread calls perform_scan_cycle()       │
+  │    2. Get next frequency from database                │
+  │    3. Tune radio via baseband API                     │
+  │    4. Wait for scan_interval_ms (default 50ms)        │
+  │    5. Repeat from step 2                              │
+  │                                                       │
+  │  Detection (UI thread):                               │
+  │    1. Receive ChannelSpectrum via FIFO                │
+  │    2. Call process_spectrum_message(spectrum, freq)   │
+  │    3. Run detection pipeline (Section 6)              │
+  │    4. Update tracked drones                           │
+  │    5. After DB_SCANS_PER_SWEEP=50 cycles:             │
+  │       auto-enter sweep mode                           │
+  └──────────────────────────────────────────────────────┘
+
+Dwell Behavior:
+  - When signal detected: dwell_enabled=true holds frequency
+  - max_dwell_cycles derived from confirm_count + miss_tolerance
+  - After max dwell: force_resume_scanning() breaks out
+  - Noise blacklist: 3+ consecutive noise events → skip frequency
+
+================================================================================
+9. UI FRAMEWORK
+================================================================================
+
+The EDA follows the standard Mayhem UI pattern:
+
+  DroneScannerUI (main view, inherits ui::View)
+    ├── BigFrequency big_display_        — large 7-segment frequency
+    ├── DroneDisplay drone_display_      — spectrum + drone list + waterfall
+    ├── Labels labels_                   — LNA/VGA/AMP labels
+    ├── LNAGainField field_lna_          — LNA gain control
+    ├── VGAGainField field_vga_          — VGA gain control
+    ├── RFAmpField field_rf_amp_         — RF amplifier toggle
+    ├── AudioVolumeField field_volume_   — headphone volume
+    ├── NumberField field_rssi_dec_cyc_  — RSSI decrease cycles
+    ├── Button button_start_stop_        — Start/Stop SWEEP (primary mode; from idle always
+    │                                      enters sweep mode; Stop also halts DB scan)
+    ├── Button button_mode_ ("DB")       — Start/Stop normal DB scan; from sweep mode exits
+    │                                      sweep and resumes the DB position saved at entry
+    ├── Button button_load_              — Load database file
+    ├── Button button_settings_          — Open settings view
+    └── Button button_swp_               — Open sweep settings
+
+  DroneDisplay (custom view, inherits ui::View)
+    ├── Spectrum/Composite rendering     — 240px wide
+    ├── Per-window sweep waterfalls      — MiniWaterfall[4]
+    ├── Drone list                       — sorted by threat level
+    ├── Signal timeline                  — MiniWaterfall (realtime)
+    └── Status bar                       — state + DB count
+
+  DroneSettingsView (inherits ui::View)
+    ├── ~40 UI widgets (NumberField, Checkbox, CfarModeSelector)
+    ├── SpectrumPreviewWidget            — live filter preview
+    ├── Threat threshold ladder          — normalize_threat_ladder()
+    └── Save/Defaults/About buttons
+
+  DroneSweepView (inherits ui::View)
+    ├── SweepWindowView (reusable, 1 instance)
+    │   ├── Start/End NumberFields
+    │   ├── Enabled Checkbox
+    │   ├── 5×2 Det-Win NumberFields (From/To, MHz)
+    │   ├── RangeNameSelector field_label_name_ — per-slot label
+    │   └── button_preset_ — applies Demo preset (see section 7)
+    ├── OptionsField window_select_ — switch window 1-4
+    └── Save/Defaults buttons
+
+Widget Update Pattern:
+  void on_tick() {  // Called by DisplayFrameSync message
+      const auto result = logic_layer_.get_detection();
+      if (result.is_valid) {
+          drone_list_.add_entry(result);
+          set_dirty();  // Mark for repaint
+      }
+      // NEVER call paint() directly!
+  }
+
+Message Handler Registration:
+  MessageHandlerRegistration message_handler_{
+      Message::ID::ChannelSpectrum,
+      [this](const Message* const p) {
+          this->on_spectrum(static_cast<const ChannelSpectrumMessage*>(p));
+      }
+  };
+
+================================================================================
+10. SETTINGS & PERSISTENCE
+================================================================================
+
+Settings File: /EDA/SETTINGS.TXT
+Settings Version: 1
+
+SettingsStruct fields (all persisted):
+  // Scanning
+  scanning_mode, scan_interval_ms, scan_sensitivity
+  alert_rssi_threshold_dbm
+  threat_low_dbm, threat_medium_dbm, threat_high_dbm, threat_critical_dbm
+
+  // Display
+  spectrum_visible, timeline_visible
+
+  // Alerts
+  audio_alerts_enabled, volume
+
+  // Detection
+  dwell_enabled, confirm_count_enabled, noise_blacklist_enabled
+  spectrum_detection_enabled, median_enabled
+  spectrum_margin, spectrum_min_width, spectrum_max_width
+  spectrum_peak_sharpness, spectrum_peak_ratio
+  spectrum_valley_depth, spectrum_flatness, spectrum_symmetry
+
+  // CFAR
+  cfar_mode, cfar_ref_cells, cfar_guard_cells, cfar_threshold_x10
+  cfar_hybrid_alpha/beta/gamma, os_cfar_k_percent, vi_cfar_threshold_x10
+
+  // Anti-false-positive
+  neighbor_margin_db, rssi_variance_enabled
+  confirm_count, miss_tolerance
+
+  // Mahalanobis
+  mahalanobis_enabled, mahalanobis_threshold_x10
+
+  // Advanced
+  sensitive_mode, shape_sim_threshold_pct
+  shape_bypass_enabled, robust_width_floor_enabled
+  kurtosis_enabled, kurtosis_min_x10, adaptive_cfar_enabled
+
+  // Sweep Window 1
+  sweep_start_freq, sweep_end_freq, sweep_step_freq
+
+  // Sweep Window 2-4
+  sweep2/3/4_start/end/step_freq, sweep2/3/4_enabled
+
+  // Sweep Detection Windows
+  sweep_det_win_start_mhz[4][5], sweep_det_win_end_mhz[4][5]
+
+  // Misc
+  rssi_decrease_cycles, freq_match_radius_mhz
+  sweep_shelf_offset (int8, -9..+9, default 0; same key in the file and in
+      ScanConfig — biases the sweep noise shelf in display AND relative
+      detector gates; σ/IQR estimate, dBm paths and the absolute Sens gate
+      stay RAW)
+
+SettingsManager Flow:
+  1. Load: SettingsFileManager::load(settings) → read /EDA/SETTINGS.TXT
+  2. Apply: SettingsFileManager::apply_to_config(settings, config) → ScanConfig
+  3. Extract: SettingsFileManager::extract_from_config(config, settings) → reverse
+  4. Save: SettingsFileManager::save(scanner_ptr, settings) → write SD card
+
+Threat Ladder Normalization:
+  Enforces: low <= medium <= high <= critical
+  AND: medium > detection_threshold + RSSI_MIN_MEDIUM_ABOVE_DETECTION_DB (3 dB)
+  Ensures LOW band is always reachable.
+
+================================================================================
+11. THREAD MODEL & SYNCHRONIZATION
+================================================================================
+
+ChibiOS RTOS Threading:
+
+  Thread          Priority  Stack    Purpose
+  ─────────────── ───────── ──────── ────────────────────────────────
+  UI (Main)       5         4096 B   Widget callbacks, message handlers
+  Scanner         10        2048 B   DB frequency hopping, dwell timer
+  Baseband (M0)   -         -        FFT, spectrum streaming
+
+Synchronization Primitives:
+
+  AtomicFlag (locking.hpp):
+    - Lock-free using __atomic_test_and_set
+    - Used for: sweep_transition_guard_, button_debounce_guard_,
+                pll_locked_, streaming_active_, loaded_
+
+  MutexLock<ORDER> (RAII wrapper):
+    - ChibiOS mutex with automatic unlock
+    - Template parameter enforces lock ordering at compile time
+    - Used for: DATA_MUTEX, DATABASE_MUTEX, STATE_MUTEX, PATTERN_MUTEX
+
+  MutexTryLock<ORDER> (non-blocking):
+    - Returns is_locked() flag
+    - Used where blocking would cause deadlock
+
+Message Flow (baseband → UI):
+  1. M0 baseband produces ChannelSpectrum via FIFO
+  2. DisplayFrameSync message triggers UI thread processing
+  3. UI thread reads spectrum_buffer_ (class member, not stack)
+  4. Calls process_spectrum_message() or on_sweep_spectrum()
+  5. Detection pipeline runs (see Section 6)
+  6. Tracked drones updated under DATA_MUTEX
+  7. refresh_ui() copies drone list to DisplayData at 10 Hz
+
+Shared Workspace Buffers:
+  ScanConfig g_workspace_cfg        — UI-thread only, no locking needed
+  SettingsStruct g_workspace_settings — UI-thread only, no locking needed
+  Invariant: scanner thread NEVER reads g_workspace_cfg
+
+================================================================================
+12. AUDIO ALERT SYSTEM
+================================================================================
+
+AudioAlertManager (static class):
+  - Enabled/disabled via settings
+  - Plays tones through WM8731/AK4951 audio codec
+  - Sample rate: 24 kHz
+
+Alert Types:
+  NEW_DRONE        — 1000 Hz, 150ms
+  THREAT_INCREASED — 1000 Hz, 100ms
+  THREAT_CRITICAL  — 1500 Hz, 80ms (SOS loop)
+  DRONE_APPROACHING — 1200 Hz, 200ms
+  DRONE_RECEDING   — 800 Hz, 150ms
+
+Threat-Level Audio:
+  NONE     — silence
+  LOW      — single beep (800 Hz, 150ms)
+  MEDIUM   — triple beep pattern (1000 Hz, 80ms × 3)
+  HIGH     — SOS loop (1200 Hz)
+  CRITICAL — SOS loop (1500 Hz, faster)
+
+SOS Pattern:
+  • • • — — — • • • (short-long-short-long-short)
+  SHORT_BEEP_MS = 80
+  LONG_BEEP_MS = 200
+  BEEP_GAP_MS = 80
+  LETTER_GAP_MS = 400
+  CYCLE_GAP_MS = 1000
+
+update() called at ~60 Hz from refresh_ui():
+  - Drives multi-beep patterns
+  - Handles continuous (SOS) vs one-shot (MEDIUM) modes
+  - Stops looping when no HIGH/CRITICAL threats remain
+
+================================================================================
+13. PATTERN MATCHING (REMOVED — heading kept for §14+ numbering)
+================================================================================
+
+REMOVED — this section documented the RF-fingerprinting feature: SAD-based
+16-bin matching (pattern_matcher.*, pattern_types.*, pattern_manager.*,
+PatternManagerView) against /EDA/PATTERNS/*.TXT, with PeakDetector::find()
+supplying the captured peak + noise floor. The code was deleted in commits
+"del pattern logick" and b8c29abf (peak_detector.cpp/hpp died with its last
+consumer); a tree-wide grep finds zero code references outside this README
+(verified 2026-09-27).
+
+Why heading number 13 stays: sections 14+ are cross-referenced from
+scanner.cpp comments, settings tooltips and README section 24 — renumbering
+would silently break those pointers.
+
+Where the old PeakDetector math lives now: INLINE in the section-14 chain —
+25th-percentile quickselect noise floor (Step 1), strongest-peak scan
+(Step 2) and width walk (Steps 4/6b). No separate class is needed.
+
+================================================================================
+14. DETECTION FILTER CHAIN (15 Steps: 1-12 in-frame, 13-15 tracking)
+================================================================================
+
+The spectrum shape chain is the primary false-positive rejection mechanism.
+Each step can independently reject a detection. ORDER IS DEPENDENCY-DRIVEN:
+Step 4 measures the band (left/right/signal_width) that Steps 5-11 consume,
+so width ALWAYS precedes sharpness/valley/flatness/symmetry — every signal
+reaches its target setting before any earlier step could mask the verdict.
+Steps 1-2 run in the caller (once per frame); Steps 3-12 run inside
+apply_shape_filters(); Steps 13-15 run later, AT TRACKING TIME. Numbering
+below matches the scanner.cpp comments 1:1 (DB executes 13→15, sweep
+14→15; Steps 13 and 14 are mode-exclusive, both always precede Step 15).
+
+  FRAME GATE (SWEEP FAST PREFILTER — sweep mode only; runs after Steps 1-2
+  measured the shelf and scanned the peak, BEFORE the heavy chain):
+    peak_margin < Step-3 gate / 2 → frame dropped before CFAR + shape chain
+    (~2 compares instead of ~2000+ cycles). RSSI-only mode
+    (spectrum_detection_enabled OFF) bypasses the gate entirely.
+    TBD EXEMPTION (sensitivity contract): a half-gate failure drops the frame
+    ONLY when sweep_tbd_frame_reachable() also fails — i.e. the peak is below
+    the TBD confirm floor (next block). Reachability is an EQUIVALENCE, not a
+    heuristic: such a peak cannot produce the present-now vote TBD requires,
+    so dropping it changes no TBD decision. Frames in
+    [noise + floor, gate/2) therefore still reach the integrator instead of
+    being cut outright — the weak-signal regression this contract restores.
+    The UI drain loop applies the SAME two-condition test with its min-based
+    shelf clamp(min + SWEEP_SHELF_OFFSET), a strict subset of the detector's
+    clamp(p25 + SWEEP_SHELF_OFFSET) gate: the clamp is monotone, so
+    min <= p25 survives the shared offset and the UI can never drop a frame
+    the detector would keep (this was FALSE for negative offsets before both
+    sides shared the offset — the un-biased min shelf then sat above the
+    detector's p25 + off shelf and silently cost such frames their TBD vote).
+    Contention on the shelf-offset accessor fails OPEN to the MINIMUM offset
+    (lowest shelf = loosest UI gate). Mutex contention on the RSSI/gain
+    snapshot fails OPEN (units 0 → only the noise floor applies): contention
+    can only ADD frames, never cut sensitivity.
+
+  Track-Before-Detect (multi-frame confirm — DB scan AND sweep):
+    When no single-frame candidate passed Steps 1-12 (and no gate-cleared
+    peak was shape-rejected — the user's verdict is final) and
+    waterfall_history_ holds >= TBD_MIN_FRAMES (3) of the last HISTORY_DEPTH
+    (8) frames at this frequency (see sweep_tbd_pass()):
+      candidate bin = per-bin MAX envelope over the window (DC spike skipped)
+      threshold     = MAX(RSSI threshold in units, noise_floor + 6)
+        "RSSI in units" = clamp((rssi_threshold_dbm + total_gain) * 5 + 255,
+        0..255) — the inverse of spectrum_value_to_dbm()
+      confirm       = count_above_threshold(bin, threshold) >= 3
+                      AND present-now (frame age 0 also >= threshold — stale
+                      history alone can never confirm)
+                      AND tbd_peak_is_narrowband() (narrowband guard)
+    → The noise-relative floor (TBD_MIN_ELEVATION_UNITS = 5 units = 1.0 dB ≈
+      2.5σ of the ~2-unit noise sigma) is what makes "3 of 8 frames" a
+      NOISE-RELATIVE statement: at default Sens (−105 dBm) with gain <= 54 dB
+      the absolute RSSI term clamps to 0 units, so without the floor ANY
+      non-zero bin would count as a vote. static_assert pins the floor to
+      <= DEFAULT_SPECTRUM_MARGIN / 2 so it can never outgrow the half-gate.
+    → The narrowband guard is a MAR-anchored half-power walk + MinW (only
+      in-frame peaks) + MaxW + a TBD-owned sideband BOTH-EDGES wideband rule
+      (Step 6c parity — NOT user-configurable; TBD never runs apply_shape_
+      filters()). The walk threshold is max(peak_margin/2, gate/3) above the
+      p25 shelf (audit fix W2 lowered the floor from gate/2 to gate/3): the
+      gate/3 term keeps weak (below-gate) envelopes out of the noise
+      fluctuation band. NOTE: unlike Step 4/6b, this walk stays anchored at
+      p25 — the W1 p10 demotion is scoped to apply_shape_filters() only, so
+      in a contaminated frame (Step 1) a below-gate crest sitting ON a p25
+      plateau still measures its crest curvature; the BOTH-EDGES sideband
+      rule is the wideband net there. Below-gate envelopes measure only
+      their core and are untouched by the width rules.
+    → Reachable weak band: [noise + 1.2 dB, Step-3 gate), gated by
+      persistence — this is the multi-frame path the single-frame chain
+      (Steps 1-12, gate-bound) can never see.
+    → A-4 ANALYSIS (2026-10): there is deliberately NO flatness guard in
+      the TBD path. Two candidates were evaluated and rejected as unsound:
+      (a) envelope flatness (per-bin max over the waterfall window) — a
+      slow-drifting narrow drone produces an OR-envelope plateau identical
+      to a WiFi/BT flat-top, so any usable limit would false-reject
+      legitimate slow drifters; (b) frame-domain flatness at the
+      confirmation frame — at below-gate margins (2-7 units) the 90%-bar
+      statistic cannot distinguish a WiFi plateau from a drone V-shape
+      because the plateau's ripple is a large fraction of the margin and
+      no bar separates them. The wideband holes the guard was meant to
+      plug are already covered: envelope width > MaxW (110) and the
+      BOTH-EDGES sideband rule in tbd_peak_is_narrowband; above-gate
+      candidates that failed shape are vetoed by shape_rejected_after_margin
+      / shape_blocked_tbd. The mid-width (60-110 bins) below-gate flat-top
+      that passes TBD is the documented cost of the weak-signal domain —
+      the user can raise MinW above the default floor to get below-gate
+      MinW enforcement (see tbd_peak_is_narrowband MinW exempt note).
+
+  Step 1: Noise Floor (caller — analyze_spectrum_shape_multi / sweep loop)
+    quickselect 25th percentile of the usable bins (DC spike + edge bins
+    excluded) — the shelf every margin below is measured against
+    Robust width floor "RbF" (default ON, audit fix W1): when
+      p25 - p10 >= 10 (2 dB — the band is occupied >= ~75% and p25 sits
+      INSIDE the wideband emission), the WIDTH-ANCHOR shelf (used ONLY by
+      the Step 4 walk and the Step 6b emission extent) demotes to the 10th
+      percentile, which stays inside the quiet minority and recovers the
+      true shelf. Clean spectra keep the p25 anchor byte-identical (their
+      delta is ~1-3 units). The Step-3 margin, valley/symmetry/flatness
+      margins and the Step 6c wall levels keep p25.
+
+  Step 2: Candidate Peaks (caller)
+    CFAR multi-peak (cfar_mode != OFF) OR fixed threshold: bins with
+    margin >= Step-3 gate, sorted by power, NMS by separation, top N
+    → Each candidate independently runs Steps 3-12
+
+  Step 3: Peak Margin (SNR gate)
+    peak_margin = peak_value - noise_floor
+    Must reach shape_gate_margin() — the EFFECTIVE gate:
+      normal mode, Sens <= 75: gate = spectrum_margin (default 10 ≈ 2 dB)
+      normal mode, Sens > 75:  gate = spectrum_margin + (Sens-75)/2
+                               (fresh default Sens=85 → gate = 15)
+      Sensitive ("Sens") mode: gate = clamp(3σ_IQR, 8, spectrum_margin)
+                               — NOISE-ADAPTIVE (SHAPE_ADAPT_*): 3σ of the
+                               usable-bin IQR measured per frame; opens in
+                               clean noise (floor 8 = 1.6 dB), capped by
+                               the RAW Mar so it is never STRICTER than the
+                               user asked (±5..10 on Mar cannot cliff-kill;
+                               A-5: old cap Mar−2 collapsed the clamp to
+                               [8,8] at the default Mar 10 — the 3σ
+                               measurement was dead at defaults)
+    → Rejects sub-CFAR noise spikes
+
+  Step 4: Width Measurement (walk — MEASURES, never rejects)
+    Expand left/right from the peak while bins >= width_floor + margin/3
+    (width_floor == the Step-1 p25 shelf on a clean spectrum, the p10
+    fallback in a contaminated one; /2 when Shape-Bypass very-strong);
+    DC spike = hard wall
+    → Produces left/right/signal_width consumed by Steps 5-11 — this is
+      why width ALWAYS runs before sharpness/valley/flatness/symmetry:
+      they all measure the SAME [left..right] band
+
+  Step 5: Minimum Width
+    signal_width must exceed spectrum_min_width (default 40 bins ≈ 3.13 MHz)
+    → Rejects narrow noise spikes AND narrowband links (ELRS/FrSky 2-8
+      bins die at defaults; note: below-gate TBD targets are exempt
+      while MinW sits at the default floor — see tbd_peak_is_narrowband)
+
+  Step 6: Maximum Width
+    signal_width (Step-4 fragment) AND the WHOLE emission extent (Step 6b,
+    hysteresis walk at the QUARTER-POWER level max(margin/4, gate/3), both
+    levels anchored at the Step-1 width floor — kept BELOW the fragment bar
+    (margin/3) so the extent can genuinely exceed the fragment — with a
+    HALF-POWER trim of outer noise-shelf shoulders) must both be below
+    spectrum_max_width
+    (default 110 bins ≈ 8.6 MHz — A-2: AT the DB 110-bin DC-gap extent
+     cap, so inert in DB while capping sweep extents at 111-114 bins)
+    → NOTE: in the raw-FFT chain the walk is DC-gap bounded, so the extent
+      can never exceed 110 bins in DB (10..119 / 136..245) or 114 in sweep
+      (6..119 / 136..249) — any value >= 114 is behaviorally identical in
+      BOTH modes; the default 110 sits exactly at the DB cap and tightens
+      sweep by 4 bins (extra wideband gate ahead of Step 6c). Wideband
+      (WiFi) rejection is additionally owned by Step 6c (sweep).
+    CAUTION: values below ~100 bins (7.8 MHz) reject analog FPV video
+    carriers (8-18 MHz) — the emission extent measures the FULL video band,
+    not the crest fragment
+
+  Step 6c: Edge-Clip Guard (SWEEP only, always ON — no setting)
+    ПРАВИЛО «ОБА КРАЯ»: extent отклоняется ТОЛЬКО если он упёрся в ОБА края
+    окна слайса, и оба краевых бина ещё выше порога «половина мощности»
+    (peak − 6 dB, floored at noise + gate/3 = shape_gate_margin()/3 — как в emission_extent()) — излучение перекрывает ВСЁ
+    usable-окно (≥ ~17.8 МГц) и продолжается за ОБЕ стороны → REJECT.
+    → FIX (мост через DC, аудит-D1): ходы Step 4/extent ограничены DC-гэпом,
+      поэтому ОДИН extent физически не может коснуться ОБОИХ краёв окна
+      (левый полуполос упирается в бин 119, правый начинается с 136) —
+      старое правило `clip_left && clip_right` на одном extent было
+      МЁРТВЫМ КОДОМ и не отклоняло ни одного сигнала, хотя документация
+      называла его «главным WiFi-gate свипа». Проверка теперь сквозная:
+      emission дошёл до ДАЛЬНЕГО края своего полуполоса + его DC-пограничный
+      бин (119 или 136) держит half-power + ВЕСЬ противоположный полуполос
+      идёт на half-power до СВОЕГО края — одна непрерывная «стена-в-стену»
+      эмиссия через DC-дыру. Одиночное касание края (жирный FPV) мост не
+      проходит → ПРОХОДИТ (FPV-релакс сохранён).
+    → WiFi (20-40+ МГц) перекрывает usable-окно в КАЖДОМ положении свипа
+      (касается обоих краёв всегда) — режется этим guard'ом всегда.
+    → ЖИРНЫЙ аналоговый FPV (8-15 МГц, слегка притуплённый верх) касается
+      ОДНОГО края только при неудачной ФАЗЕ относительно фиксированного
+      грида перестройки (грид одинаков между проходами!) — одиночное
+      касание теперь ПРОХОДИТ. Старое правило одного края отрезало такой
+      пик на КАЖДОМ проходе — источник симптома «пропускает почти всегда».
+    → В DB-режиме guard ВЫКЛЮЧЕН: дрейф VTX у края DB-окна допустим
+      по дизайну (SWEEP_SLICE_BW notes).
+
+  Sweep Emission Dedup (SWEEP only, always ON — no setting)
+    Гребни рябь одного и того же широкополосного излучения, попадающие в
+    уже принятый extent (Step 6b), пропускаются БЕЗ повторного прогона
+    фильтров и БЕЗ создания записи.
+    → Одно излучение = одна запись за кадр (раньше — до 8 записей за кадр,
+      десятки записей за проход свипа). Паритет с DB-режимом.
+
+  Step 7: Peak Sharpness
+    sharpness = (peak_margin * 100) / avg_margin over [left..right]
+    Must exceed spectrum_peak_sharpness (default 165)
+    → STRICT by design (2026-10 user-elected): clips the measured analog
+      FPV band 100-130 at medium range — only inverted-V / strong-carrier
+      peaks (> ~200) pass comfortably. WiFi flat-top ≈ 100-110 is rejected
+      by BOTH Sharp and Flat at defaults. Lower to 100-120 if weak/mid
+      analog FPV must be recovered (cost: flat noise leaks return).
+
+  Step 8: Peak-to-Width Ratio
+    ratio = (peak_margin * 10) / signal_width
+    Must exceed spectrum_peak_ratio (default 0 = disabled)
+    → Optional: rejects wide, low signals
+
+  Step 9: Valley Depth
+    max_valley_margin = max margin of bins flanking the signal band
+    Must stay below spectrum_valley_depth (default 0 = OFF)
+    → Mechanics (audit D-VALLEY-PROBE): each flank reads up to
+      VALLEY_PROBE_MAX_BINS (6) usable bins OUTSIDE the Step-4 fragment
+      (window end / edge_skip rolloff / DC wall stop the walk) and takes
+      the MAXIMUM margin. The FIRST bin sits below the Step-4 walk
+      threshold (noise + margin/3), so a smooth monotone skirt measures
+      <= floor((margin-1)/3) <= 84 exactly as the old 1-bin probe did —
+      what the window adds is catching terrain that RISES beyond a 1-bin
+      dip at the edge (a plateau/second lobe no longer hides behind the
+      notch). The old default 90 could NEVER fire on smooth flanks
+      (provably inert) while still paying the O(width) dual-peak scan
+      per peak per frame. Default 0 skips the block with byte-identical
+      behavior. Arming D fires on smooth flanks only at
+      margin >= 3*(D+1): 70-80 = overload guard only (>= 213) that
+      also cuts saturated close-range FPV; <= 55 cuts mid-range FPV.
+      Ordinary WiFi never reaches 213 — on smooth flanks valley cannot
+      fight it; keep D >= 6 so single-unit noise dither beyond a deep
+      valley never fires the filter.
+    → Dual-peak skip (runs INSIDE the armed block): valley abstains for a
+      dual-lobe emission — the ridge scan over [left..right] counts runs above
+      noise+margin/2; exactly ONE extra ridge <= 6 bins (DUAL_PEAK_MAX_RUN_BINS)
+      with an inter-lobe dip >= max(margin/6, 2) skips the flank veto. The dip
+      criterion is the MAXIMALLY STRICT reachable threshold: the Step-4 walk
+      invariant caps any in-fragment dip at floor(m/2)-floor(m/3) ~= margin/6
+      (the old margin/4 was inert for margin >= 15 — audit D-1 fix). Flat-top
+      (0 extra runs) and ripple-top (2+ runs) never skip; SPLIT emissions
+      (null below the bar) are invisible to the scan — their flank IS the null.
+
+  Step 10: Flatness
+    flatness_pct = (high_power_bins * 100) / signal_width
+    Must be below spectrum_flatness (default 25 = ARMED, strict —
+      flatness_pct > 25 rejects: blunt-top FPV 40-70% AND WiFi/BT 50-80%
+      die on strong peaks; weak peaks / narrow signals skip the check)
+    → Rejects WiFi flat-top (>50%), accepts sharp drone V-shape (<25%)
+    → Only applied when peak_margin >= effective guard AND signal_width > 4;
+      guard = 40 at Sens <= 75, lowered by (Sens-75)/2 at high Sens (floor 15)
+    НАПРАВЛЕНИЕ: Flat — это ВЕРХНЯЯ граница плоскостности.
+    МЕНЬШЕ Flat = ЖЁСТЧЕ (режет больше плоских сигналов),
+    БОЛЬШЕ Flat = МЯГЧЕ (пропускает более плоские), 0 = выключен.
+    (У Sharp направление ПРОТИВОПОЛОЖНОЕ: больше = жёстче.)
+
+    ЧТО ДЕЛАЕТ FLAT — ПРОСТЫМИ СЛОВАМИ (читайте, чтобы не путать):
+    Flat — фильтр ФОРМЫ, а НЕ ширины. Он НЕ измеряет ширину и НЕ
+    подавляет её. Ширину меряют другие шаги: MinW отсекает слишком
+    узкие сигналы, MaxW — слишком широкие. Flat работает ПОСЛЕ них:
+    берёт уже найденную полосу сигнала и спрашивает: «Как распределена
+    мощность ВНУТРИ этой полосы?»
+
+      flatness = (сколько бинов полосы несут ≥90% пика НАД ШУМОМ) /
+                 (вся измеренная ширина сигнала), в процентах.
+      [F2] Порог = noise_floor + 0.9 × peak_margin (noise-relative);
+           раньше был 0.9 × raw_peak (абсолютный) — verdict «плывёл»
+           с ростем gain/шумовой полки (65%→50% margin при noise 100→160).
+      [D-D] Числитель считает ВСЕ бины полосы [left..right] ≥ порога —
+           ровно диапазон знаменателя. Раньше обход от пика обрывался на
+           первом бине <90%: впадина внутри полосы прятала дальней бины,
+           двугорбый плоский верх недооценивался и уходил от Flat
+           (код был МЯГЧЕ документированного контракта).
+
+      ПЛОСКИЙ ВЕРХ (WiFi/BT): мощность размазана ровно по всей полосе,
+      почти все бины ≥90% пика → flatness высокий (50-80%) → REJECT.
+      ОСТРЫЙ ПИК (дрон/FM): мощность сосредоточена в 1-3 бинах,
+      остальное — «склоны» → flatness низкий (<30%) → PASS.
+
+    Ключевая мысль: сигнал шириной 150 бинов может быть и WiFi (плоский
+    — отклонить), и FPV (с пиком — принять). ШИРИНА ОДИНАКОВАЯ — решает
+    ФОРМА. Именно поэтому Flat работает там, где MaxW бессилен.
+
+  Step 11: Symmetry
+    symmetry = min(left_width, right_width) * 100 / max(left_width, right_width)
+    Must be >= spectrum_symmetry (default 25 = ARMED, strict — weaker flank
+      must carry >= ¼ of the stronger flank; drone V-shape > 50 passes,
+      asymmetric noise < 30 dies; skipped for very-strong peaks, abstains
+      when a flank bin was clipped, Sensitive eases toward 0 near the gate)
+    → Rejects asymmetric noise; slight analog-FM asymmetry (the historical
+      reason 35 was disabled) is clipped harder at 25 — user-elected
+
+  Step 12: Spectral Kurtosis (last IN-FRAME step — still inside
+           apply_shape_filters; runs BEFORE Steps 13-15)
+    kurtosis_x10 must exceed kurtosis_min_x10 (default 20 = 2.0)
+    → Rejects Gaussian noise (kurtosis ≈ 0), accepts drone peaks (> 3)
+    → Default OFF (opt-in); skipped for very-strong / margin < 40
+      (Sensitive eases the limit with w² instead of skipping — SHAPE_ADAPT_*)
+    → [D-A] Scope: computed over THIS emission's Step-4 segment [left..right],
+      NOT the whole frame — a second emitter in the same 20 MHz frame can no
+      longer flip peak A's verdict (segment contract shared with Steps 7-11).
+      Abstains (skips) when signal_width < 4 bins — the statistic is
+      undefined there (compute() would return a zeroed result).
+
+  ==== Sens = PARALLEL SHAPE EVALUATION (checkbox "Shape score", sensitive_mode) ====
+  ==== applies to BOTH in-frame paths (DB scan and sweep); see scanner.cpp ====
+
+  Как считается итоговый вердикт Steps 7..12, зависит от Sens:
+
+    Sens OFF  — legacy fail-fast лестница. Шаги выполняются строго в порядке
+                7 → 8 → 9 → 10 → 11 → 12; первый провалившийся шаг немедленно
+                возвращает false. Каждый предикат чист по {data, config,
+                Step-4 band}, поэтому порядок вычисления не влияет на итог.
+
+    Sens ON   — ШАГИ 7/9/10 ИЗМЕРЯЮТСЯ В ОДНОМ СЛИЯННОМ ПРОХОДЕ по фрагменту
+                [left..right] (раньше это были ТРИ прохода по одним и тем же
+                байтам). Все similarity-вердикты считаются безусловно и
+                комбинируются ОЧЕРЕДЬЮ:
+
+                  проходит <=> (каждый вооружённый HARD-шаг прошёл)      // AND
+                            && (вооружённые SIMILARITY-шаги, согласившиеся
+                                >= shape_sim_threshold_pct от вооружённых)  // SCORE
+
+    HARD      — физический конверт: амплитудный гейт (Step 3), MinW (5),
+                MaxW (6), emission extent (6b), edge-clip (6c, только sweep),
+                ratio (8). Нарушение означает «не тот класс сигнала вообще»,
+                поэтому остаётся конъюнкцией с ранним выходом. Битовая маска
+                ЕЙ НЕ НУЖНА: шаг либо return false, либо молчит.
+                ПОЧЕМУ RATIO (8) HARD, А SHARPNESS (7) SIMILARITY — оба
+                мериют «высота-против-ширины» (ratio = margin*10/width,
+                sharpness = margin*100/avg_margin), и раскол выглядит
+                произвольным. Это не так: ratio — монотонная функция ТОЙ ЖЕ
+                пары (margin, width), которую уже жёстко гейтят Steps 5
+                (MinW) и 6 (MaxW). Скоринг его посчитал бы измерение ширины
+                ДВАЖДЫ в числителе similarity — кандидат мог бы перебить
+                вердикт, согласованный с MinW/MaxW, вторым коррелированным
+                голосом по тому же измерению. Sharpness использует avg_margin
+                (статистика формы по всему фрагменту), которую ширина не
+                ограничивает, поэтому это НЕЗАВИСИМЫЙ свидетель и он в
+                скоринг-группе. Правило: коррелированные критерии → HARD
+                (они заново выводят уже прогейтанную величину),
+                независимые → SIMILARITY.
+
+    SIMILARITY— критерии V-образного шаблона: sharpness (7), valley (9),
+                flatness (10), symmetry (11), kurtosis (12). Скорятся, чтобы
+                пограничная цель переживала один разошедшийся shape-фильтр.
+                Только этой группе нужна маска — только у неё есть потребитель
+                (ShapeVerdict::similarity_pct → арминг Step 13).
+
+    ПОРОГ shape_sim_threshold_pct = 100 по умолчанию (audit D-FULL-PASS,
+    2026-10) = СТРОГИЙ AND: детекция НИКОГДА не регистрируется после
+    прохождения только ЧАСТИ настроенных similarity-гейтов — каждый
+    вооруженный гейт обязан согласиться, ровно как в Sens-OFF лестнице.
+    Считается доля = 100 × popcount(pass) / popcount(armed), НЕ значение
+    маски (0x1F дал бы 16% за идеальные 5 из 5; audit D-SCORE — деление
+    на маску отвергало каждый мульти-вооружённый кандидат, делая Sens ON
+    строже Sens OFF).
+    Диапазон 50..100 (шаг 5 = SHAPE_SIM_THRESHOLD_STEP_PCT, static_assert
+    проверяет, что шаг делит диапазон нацело и MAX достижим из MIN)
+    сохраняется ТОЛЬКО как явный opt-in пользователя на допуск
+    разногласий (дальний заход / многолучёвость). MIN 50 даёт
+    floor(100*p/n) >= 50, то есть «большинство или ничья»:
+      n=1: 1 из 1 (100)
+      n=2: 1 из 2 (ничья, 50)
+      n=3: 2 из 3 (66)            — 1 из 3 = 33 это меньшинство
+      n=4: 2 из 4 (ничья, 50) И 3 из 4 (75) — ничья тоже проходит
+      n=5: 3 из 5 (60)            — 2 из 5 = 40 это меньшинство
+    поэтому даже на MIN similarity-группа НИКОГДА не строже
+    legacy-лестницы, которую заменяет.     (Доаудитовая формулировка
+    перечисляла для n=4 только «3 из 4» и тем самым скрывала, что ничья
+    2 из 4 тоже проходит; сама ПРАВИЛОВАЯ функция — floor(100p/n) >= t
+    <=> 100p >= n*t — была реализована корректно всегда, неполной была
+    только проза.)
+    Ниже 100 поле опускает ТОЛЬКО ПОЛЬЗОВАТЕЛЬ; кнопка DEFAULT и фабричный
+    дефолт возвращают 100. Порог читается только при Sens ON и защищён
+    двойным clamp'ом (в парсере файла и в apply_shape_filters).
+
+    ВООРУЖЕНИЕ (arming) — ИНФОРМАТИВНОЕ (audit D-ARM, 2026-10): шаг
+    вооружается, только когда его вердикт СТРУКТУРНО СПОСОБЕН ОТКЛОНИТЬ
+    этот пик. Невооружённый шаг не голосует и не размывает score — ровно
+    как его старый `if` не выполнился бы. Раньше arming зеркалил только
+    ЗАПУСК legacy, и два нетерпимых к отказу режима занимали ПОСТОЯННОЕ
+    ALWAYS-PASS место в score:
+      (1) Sharpness в D5 dead-band 51..100 (avg включает peak ⇒
+          sharpness >= 100 на каждом кадре, лимит <= 100 ничего не
+          отклоняет — audit D5);
+      (2) Flatness = 100 (flatness_pct > 100 недостижимо — no-op);
+      (3) Valley с НЕДОСТИЖИМЫМ лимитом (D-ARM ext. 2026-10): margin'ы
+          проб — это data[i] − noise_floor при data[i] <= 255 (uint8),
+          т.е. max_valley структурно ограничен сверху 255 − noise_floor.
+          Когда noise_floor + eased_valley_limit(D, margin, w2) > 255 даже
+          бин на верху шкалы не дотягивает до лимита: ok ≡ true на КАЖДОМ
+          кадре — фантомное ALWAYS-PASS место (режим «высокий шум +
+          глубокая D», напр. D = 70 при noise > 185 на w = 100; шире под
+          w-easing). Формула вынесена в eased_valley_limit() (shape_gate_logic.hpp,
+          единый автор арминга и Step-9 — паттерн shared author M3 rev. 2);
+      (4) Symmetry с ОБРЕЗАННЫМ ДО НУЛЯ лимитом (D-ARM ext. 2026-10):
+          sym_limit = user·w²/10000 обрезается до 0 при user·w² < 10000
+          (напр. Y = 50 при w <= 14), и ok = (sym_pct >= 0) становится
+          вакуумно истинным для ЛЮБОЙ геометрии. Вооружение требует
+          eased_sym_limit(user, w2) > 0 (shared author: eased_sym_limit()).
+    У KURTOSIS capability-термина НАМЕРЕННО НЕТ (доказательство отсутствия
+    — не «чинить»): kurtosis_x10 = избыточная куртозис×10
+    (spectral_kurtosis.hpp) опускается до ≈ −30 (платикуртические
+    плосковершины ОТРИЦАТЕЛЬНЫ, гауссово шум ≈ 0), а settings-кламп
+    (0..200) и w-easing держат kurt_limit >= 0 в КАЖДОМ вооружённом
+    режиме — включая обрезанную до 0 полосу, где ok = (kurtosis_x10 >= 0)
+    является РЕАЛЬНЫМ «отклонить плосковершину», а не вакуумным pass'ом.
+    Любой достижимый лимит структурно нарушаем.
+    При СТАРОМ дефолте 50 («большинство или ничья») такой фантомный PASS
+    размывал любой РЕАЛЬНЫЙ отказ: {Sharp(100, инертный PASS),
+    Flat(45, честный FAIL)} = 1 из 2 = 50% => ПРОХОД — включение Flat
+    при Sens ON физически не могло отрезать WiFi-плосковершину, пока
+    Sharp сидел на дефолте 100. Теперь шаг ABSTAIN'ит: вооружён <=> 
+    eased_sharpness_limit(user, w2) > 100 (SHARPNESS_NOOP_CEILING —
+    тот же предикат, что ест EFFECTIVE-arming Step 13, audit M3 rev.2)
+    и <=> eased_flatness_limit(user, w2) < 99 (FLATNESS_EFFECTIVE_CEILING,
+    F1 2026-10: лимит 99 отклоняет только синтетический pct == 100 —
+    реальная плосковершина 40-90% его не достигает, это ABSTENTION, а
+    не вердикт; сглаженный дефолт F = 25 попадает ровно на 99 во всей
+    полосе w <= 10, и до F1 фантомное Flat(99) не давало A-1 raw
+    fallback'у включиться там — плато проходило на 100% при w = 5/10,
+    но отклонялось при w = 0 и w >= 15: немонотонность по SNR).
+    Тот же конфиг вооружает только Flat: WiFi fail = 0 из 1 = 0% =>
+    REJECT.
+    КАП СУДНОГО ЛИМИТА (FLAT_WIDE_BAR_PCT = 85, judgment cap 2026-10):
+    вооружение выше остаётся на НЕКАППЕННОМ eased-значении (кап арминга
+    открыл бы фантомное место w = 5/10 обратно), а сам PASS/FAIL-лимит
+    Step 10 считается как min(eased, max(F, 85)) — w-easing может поднять
+    лимит максимум до 85; пользовательское F >= 85 (в домене, 85..100)
+    никогда не опускается ниже того, что просил. Закрывает mid-band FP-дыру: при достижимых
+    w = 15..40 (adapt_w кратен 5 — SLACK 20) дефолтный F = 25 сидел на
+    лимитах 98..88 и пропускал плато WiFi/BT с измеренными 86-98% ровно
+    в открывшейся полосе (классы: WiFi/BT 40-90%, все легитимные классы
+    документировано ниже 70 — бар 85 не задевает ни одного). При
+    w2_eff = 10000 (Sens OFF и A-1 fallback) кап инертен: лимит = eased
+    = clamp(F) для ЛЮБОГО F 0..255 (байт-идентичность Sens-OFF лестницы;
+    = сырое F при F <= 100, домен-защищённые 100 при F > 100). Остаточная
+    ступень 25 → 85 на границе w = 10/15 —
+    это сам fail-closed fallback (см. FN-классы (a)/(b) в A-1 комментарии
+    scanner.cpp); плато 40-85% в mid-band по-прежнему отдают MaxW/Sharp/Sym.
+    Sens OFF VERDICT-IDENTICAL: у dead-band шага старый early-return
+    никогда не срабатывал (ok был безусловно true), поэтому пропуск
+    шага не меняет ни один accept/reject — убирается только фантомный
+    голос и экономится fused-loop работа. Правило «never STRICTER»
+    отнесено к ВООРУЖЁННОМУ множеству; D-ARM сужает множество до
+    информативных членов, инвариант сохраняется.
+
+    ПАРАДИКС ВОЗДЕРЖАНИЙ В Step 9 (два вида, это НЕ ошибка):
+      (a) very_strong → valley_outer == false → шаг НЕВООРУЖЁН: не входит
+          ни в знаменатель, ни в числитель — полностью нейтрально.
+      (b) has_secondary_peak → вооружён, хребты ПОСЧИТАНЫ, но вето снято
+          намеренно. Бит попадает ОДНОВРЕМЕННО в sim_armed и sim_pass, то
+          есть считается СОГЛАСИЕМ и тянет score ВВЕРХ.
+      (b) — не случайность: dual-peak skip это ПОЗИТИВНАЯ идентификация FPV
+      (ровно один узкий дополнительительный хребет с реальной впадиной =
+      видео + звуковая несущая), поэтому молчание долины — улика ЗА
+      кандидата. Это зеркалит legacy, где skip трактуется как pass.
+
+  Влияние на Step 13: кандидат, принятый по SCORE с одним разошедшимся
+  shape-фильтром (similarity_pct < 100), НЕ считается «цепочка полностью
+  владела вердиктом» — neighbor-margin post-filter для него ОБЯЗАН
+  сработать. При similarity_pct == 100 (legacy, либо полный Sens-score)
+  поведение Step 13 не меняется НИ на бит.
+
+  ВЛИЯНИЕ НА ВТОРИЧНЫЕ ОБНАРУЖЕНИЯ (известная и принятая асимметрия):
+  detections[1..] всегда шли в tracker В ОБХОД Step 13 (Step 13 существует
+  только для первичного signal_detected). Компенсация «частичный score ⇒
+  Step 13 обязан сработать» действует поэтому ТОЛЬКО на detections[0] —
+  ровно как и весь shape_chain_armed, существующий до этой правки. Вторичные
+  в Sens принимаются при score >= shape_sim_threshold_pct с защитой только от HARD-конверта +
+  confirm_count + RSSI-порога. Это консистентно с архитектурой D-B
+  (Step 13 по определению DB-primary-only) и НЕ является регрессией.
+
+  Публикация: ShapeVerdict записывается ТОЛЬКО при return true — тот же
+  success-only контракт, что и у out_extent (инвариант F3). Sweep оставляет
+  out_verdict = nullptr: у него нет ни Step 13, ни ShapeDetection, куда
+  положить score.
+
+  ==== Tracking-layer post-filters — run AT TRACKING TIME, i.e. only after
+  ==== the in-frame verdict (shape-passed Steps 1-12 OR TBD-confirmed) ====
+
+  Step 13: Neighbor Margin (DB mode only; SKIPPED for shape-validated
+           detections ONLY WHEN THE CHAIN IS ARMED — the EFFECTIVE
+           MaxW < 110 (DB_EXTENT_CAP_BINS — the DB measurable cap; F2
+           2026-10: the old local 114 was the SWEEP cap and made the
+           default MaxW = 110 read "armed" in DB where nothing measurable
+           can exceed 110 — the neighbor guard was then wrongly skipped
+           under a Sharp<=100 + Flat=0 config, the documented D-B hole),
+           or EFFECTIVE Sharp > 100, or
+           EFFECTIVE Flat in (0..99) AND Step 10 would RUN for this
+           peak (Flat > 0, margin >= flatness guard [40 at Sens <= 75],
+           w > 0) [audit M3 rev. 2: with Sens OFF / w = 100
+           the limits are the raw config; corrections vs
+           legacy — Flat limits in the abstention band 99..100 counted
+           as "armed" before although a 99-bar rejects only the synthetic
+           pct == 100 (F1: same predicate as the in-frame arming), and a
+           Flat config whose Step 10 abstained (margin < flatness guard)
+           no longer arms; both keep Step 13 guarding where the chain
+           cannot reject. Flat = 0 stays DISARMED for the legacy
+           permissive set. 2026-10 strict defaults (MaxW = 110 — inert
+           in DB, Sharp = 165, Flat = 25, Sym = 25) leave the chain
+           ARMED at Sens OFF via Sharp/Flat, so at
+           defaults Step 13 is skipped for shape-validated verdicts and
+           the chain owns the wideband verdict]. Guards RSSI-only and TBD
+           paths unconditionally; when the chain is DISARMED (Sharp <=
+           100 AND Flat = 0/99/100) it also guards
+            shape-validated verdicts [audit D-B]: otherwise DB scan has
+             NO wideband gate there, since Step 6c is sweep-only and
+             Mahalanobis / RSSI-variance then defaulted OFF)
+    center freq must exceed strongest neighbor within 10 MHz by
+    neighbor_margin_db (default 2 dB)
+    → Rejects wideband noise (WiFi, BT, microwave)
+
+  Step 14: Mahalanobis Gate (SWEEP mode only, inside apply_sweep_tracking)
+    D²_M must be < mahalanobis_threshold_x10 / 10 (default 40 → 4.0)
+    → Rejects statistical outliers (noise, spurs); default ON
+
+  Step 15: RSSI Variance (BOTH modes — runs LAST, inside the tracker update,
+           after Step 13 in DB / Step 14 in sweep)
+    calculate_rssi_variance() must be <= 100 (DEFAULT_RSSI_VARIANCE_THRESHOLD)
+    → Rejects chaotic noise (real drones have stable RSSI); default ON;
+      a rejected sample still refreshes history — only the threat upgrade
+      is withheld (observe_rssi)
+
+Very-Strong Signal Bypass (opt-in — requires Shape Bypass checkbox ON,
+default OFF; with it OFF every gate below runs at ANY signal strength):
+  When ON and peak_margin > 80 (~16 dB): skip valley/symmetry/kurtosis,
+    width walk uses /2 instead of /3 (narrower measurement)
+  When ON and peak_margin > 96 (~19 dB): additionally skip max_width
+  Flatness in Sensitive mode stays ON for all peaks above the flatness
+  margin gate — its limit eases with w² (full stringency at strong peaks,
+  ≈100 = abstain near the gate), so close-range WiFi still faces Flat
+  → Handles close-range wideband FPV signals
+
+Sensitive ("Sens") Mode — ADAPTIVE shape (self-tuning, SHAPE_ADAPT_*):
+  When ON the shape chain NEVER skips a step — instead:
+  1) the Step-3 gate becomes noise-adaptive: clamp(3σ_IQR, 8, Mar)
+     (opens in clean noise, capped by the RAW user value — Sens is never
+     stricter than the user asked; A-5: the old Mar−2 cap collapsed the
+     clamp to [8,8] at the default Mar 10 and killed the measurement);
+  2) Steps 5-12 ease their thresholds with the stringency weight
+     w = min(100, (margin − gate)·100/20) and quadratic w² easing:
+       Sharp → 100 + (user−100)·w²/10000, Ratio → user·w²/10000,
+       Valley → user + (ceil−user)·(1 − w²/10000), Flat → toward 100,
+       Sym/Kurt → user·w²/10000.
+       (MinW and MaxW are NOT eased — both are raw user band edges,
+       easings removed in the 2026-10 dependency audit.)
+     A marginal peak (just above the gate) is judged gently; a strong one
+     (gate + 4 dB → w = 100) faces the EXACT user thresholds — so Sharp/
+     Valley/Flat/Sym/Kurt still hold the line against WiFi in Sens mode.
+  When OFF: w = 100 forces every formula to the user value — the legacy
+  strict chain, byte-identical.
+  → For weak/long-range signals WITHOUT giving up the filter chain
+
+================================================================================
+15. CFAR DETECTION (All 7 Modes)
+================================================================================
+
+CFARDetector (scanner.hpp):
+
+  CA-CFAR (Cell Averaging):
+    noise_estimate = average of left + right reference windows
+    Best for: homogeneous noise environments
+
+  GO-CFAR (Greatest Of):
+    noise_estimate = max(left_avg, right_avg)
+    Best for: noise edges (sweep slice boundaries)
+
+  SO-CFAR (Smallest Of):
+    noise_estimate = min(left_avg, right_avg)
+    Best for: cluttered environments
+
+  HYBRID CFAR:
+    noise_estimate = (α × CA + β × GO + γ × SO) / 100
+    Default: α=50, β=30, γ=20
+
+  OS-CFAR (Ordered Statistic):
+    Sort reference cells, pick k-th order statistic
+    k = (N_ref × os_k_percent) / 100 (default 75%)
+    Uses insertion sort over cells[128] (O(n²), n ≤ 128 - typical 64 cells ≈ 2k ops)
+    Best for: multi-target environments (FPV swarm)
+
+  VI-CFAR (Variability Index):
+    VI = variance / mean²
+    VI < threshold → homogeneous → use CA-CFAR
+    VI > threshold → clutter edge → use GO/SO-CFAR
+    Default threshold: 2.0 (×10 = 20)
+
+  OFF:
+    CFAR disabled, use fixed threshold
+
+Parameters:
+  cfar_ref_cells     — reference window size (4-64, default 32)
+  cfar_guard_cells   — guard cells (0-8, default 3)
+  cfar_threshold_x10 — threshold offset ×10 (10-100, default 60)
+
+  Edge policy (audit M-1): reference windows observe the SAME cell set as
+  Step 1 / extract_rssi - cells outside [skip_start, bin_count-skip_end)
+  (filter-rolloff zone) are never read. When one whole window falls outside
+  the usable band (band edge) or is emptied by the DC skip, the estimate
+  degrades to the remaining side (CA = GO = SO collapse there); a CUT
+  outside the usable band fails closed. The first/last guard+1 bins stay
+  detectable via that one-sided fallback - the sweep retune grid is
+  fixed-phase, so a target could park at the same slice edge every pass.
+
+Multi-Target Detection (find_peaks):
+  - Collects all CFAR-passing bins
+  - Sorts by power descending
+  - Non-maximum suppression within CFAR_MIN_PEAK_SEPARATION (10 bins)
+  - Returns up to CFAR_MAX_CONCURRENT_PEAKS (8) peaks
+
+================================================================================
+16. MAHALANOBIS GATE FILTER
+================================================================================
+
+MahalanobisDetector (mahalanobis_gate.hpp):
+
+  Purpose: Statistical outlier detection using Mahalanobis distance.
+  Formula: D²_M = Σ((x_i - μ_i)² / σ_i²)
+  Assumes diagonal covariance (uncorrelated features).
+
+  Feature Vector (2D):
+    [0] = RSSI normalized (Q8.8, range 0-255)
+    [1] = Frequency stability (Q8.8, 0-256 = 0-100%)
+
+  Fixed-Point Arithmetic:
+    Q8.8 format: 8 integer bits, 8 fractional bits
+    Q_SCALE = 256
+    q_multiply_safe(): int64_t intermediate, clamped to INT32_MAX/MIN
+
+  Validation:
+    If sample_count < MAHALANOBIS_HISTORY_SIZE/2 (4): pass through
+    If threshold_x10 == 0: disabled (pass through)
+    Otherwise: D²_M < threshold_x10/10 → valid signal
+
+  Statistics Update (Welford's algorithm):
+    Running mean and variance per drone
+    Variance decay: every 64 samples, decay by 31/32 (3.125%)
+    → Prevents overly aggressive gate tightening during long scans
+
+  History:
+    MAHALANOBIS_HISTORY_SIZE = 8 samples
+    Circular buffer in MahalanobisStatistics struct
+
+================================================================================
+17. AUTO GAIN CONTROL (AGC)
+================================================================================
+
+AutoGainControl (auto_gain_control.hpp):
+
+  Purpose: Prevent ADC saturation while maintaining max sensitivity.
+  Rate: max 1 gain change per 500ms (prevents oscillation)
+
+  Algorithm:
+    1. Count saturated bins (power >= 250) — ADC overflow
+    2. Count dead bins (power <= 5) — insufficient gain
+    3. If >5% saturated: reduce gain
+    4. If <1% dead AND max_power < 180: increase gain
+
+  Gain Stepping:
+    Reduce: VGA first (−4 dB) → LNA (−8 dB) → RF amp (−14 dB)
+    Increase: RF amp (+14 dB) → VGA (+4 dB) → LNA (+8 dB)
+
+  Hardware Constraints:
+    LNA (MAX2837): 0-40 dB, step 8 dB
+    VGA (MAX2837): 0-62 dB, step 2 dB
+    RF AMP (HMC627A): 0 or 14 dB (binary)
+
+  Usage:
+    Enabled via adaptive_cfar_enabled in ScanConfig
+    Called from apply_agc() in DroneScannerUI::on_channel_spectrum()
+
+================================================================================
+18. MEMORY MAP & STACK BUDGETS
+================================================================================
+
+BSS Allocation:
+  Static RAM Budget: 8,550 bytes
+  Stack Budget: 4,096 bytes (UI thread)
+  Scanner Thread: 2,048 bytes
+  Total: ~12,646 bytes
+
+Key BSS Structures:
+  s_hardware          — HardwareController
+  s_database          — DatabaseManager (entries[100])
+  s_scanner           — DroneScanner (tracked_drones_[25], incl. envelope_buf_[256],
+                       cfar_hist_buf_[256])
+  s_scanner_thread    — ScannerThread (wa_[2048])
+  g_workspace_cfg     — ScanConfig (368 bytes)
+  g_workspace_settings — SettingsStruct (360 bytes)
+  spectrum_buffer_    — ChannelSpectrum (256 bytes)
+  sweep_[4]           — SweepWindow array (~1,200 bytes)
+  auto_gain_control_  — AutoGainControl (~16 bytes)
+  (refresh_drones_ TrackedDrone scratch REMOVED — drone list snapshot now
+   built directly as compact DisplayDroneEntry[12] via
+   DroneScanner::get_display_entries(), ~1.9 KB heap returned)
+
+Stack-Heavy Functions (monitored):
+  CFARDetector::find_peaks()   — ~104 bytes (FrameState ~72 + candidates[16]);
+                                 sliding-window engine, O(1) per CUT
+                                 (~12-16x faster than legacy per-CUT recompute)
+  OS-CFAR fallback detect()    — ~240 bytes (cells[128] + FrameState; cold
+                                 path used only without cfar_hist_buf_)
+  SpectralKurtosis::compute()  — ~32 bytes (accumulators)
+  absorb_from()                — ~128 bytes (merged[12])
+  refresh_ui()                 — snapshot via get_display_entries() (no scratch array)
+  DroneSettingsView ctor       — ~480B (all widgets in class)
+
+================================================================================
+19. ERROR HANDLING STRATEGY
+================================================================================
+
+Error Codes (drone_types.hpp):
+  SUCCESS = 0
+  Hardware: HARDWARE_NOT_INITIALIZED, HARDWARE_TIMEOUT, HARDWARE_FAILURE,
+            SPI_FAILURE, PLL_LOCK_FAILURE
+  Database: DATABASE_NOT_LOADED, DATABASE_LOAD_TIMEOUT, DATABASE_CORRUPTED,
+            DATABASE_EMPTY, DATABASE_FORMAT_INVALID
+  Buffer: BUFFER_EMPTY, BUFFER_FULL, BUFFER_INVALID
+  Sync: MUTEX_TIMEOUT, MUTEX_LOCK_FAILED, SEMAPHORE_TIMEOUT
+  Init: INITIALIZATION_FAILED, INITIALIZATION_INCOMPLETE
+  General: INVALID_PARAMETER, NOT_IMPLEMENTED, FILE_SYSTEM_ERROR
+
+Pattern:
+  - All public methods return ErrorCode or ErrorResult<T>
+  - [[nodiscard]] on all return values
+  - No exceptions (not supported on this platform)
+  - Fallback behavior on errors (never crash)
+  - UI shows error via show_error() for 3 seconds
+
+ErrorResult<T> (optional-like):
+  has_value() / is_valid() / error() / value() / value_or()
+  Static factories: success(value) / failure(error)
+  Specialization for void (no value, just error code)
+
+================================================================================
+20. SD CARD FILE LAYOUT
+================================================================================
+
+  /FREQMAN/
+    DRONES.TXT           — Default drone frequency database
+    *.TXT                — User-uploaded freqman files
+
+  /EDA/
+    SETTINGS.TXT         — EDA settings (all fields)
+
+File Format — SETTINGS.TXT:
+  Version: 1
+  Key=Value pairs (one per line)
+  Keys match SettingsStruct field names
+
+File Format — DRONES.TXT:
+  freqman format: f=frequency,d=description
+  OR CSV format: frequency,description
+
+================================================================================
+21. BUILD & TEST INSTRUCTIONS
+================================================================================
+
+Build:
+  # From repository root
+  mkdir -p build && cd build
+  cmake -G Ninja ..
+  ninja
+
+  # Or target-specific
+  cmake --build . --target firmware
+
+Test:
+  # Build test executable
+  cmake --build . --target enhanced_drone_analyzer_test
+
+  # Run tests
+  cd build
+  ctest --output-on-failure
+
+  # Run specific test
+  ./firmware/test/enhanced_drone_analyzer/enhanced_drone_analyzer_test
+
+Test Coverage (4 test files):
+  test_database_parser.cpp (842 lines):
+    - safe_strlen, safe_strcpy, skip_whitespace
+    - parse_uint64, freqman/CSV format parsing
+    - Auto-detection, comment skipping
+    - Edge cases: null pointers, small buffers, overflow
+
+  test_settings_persistence.cpp (982 lines):
+    - strnlen_wrapper, safe_strcpy
+    - safe_str_to_uint64/int64/bool
+    - dispatch_by_type for all setting types
+    - serialize_setting for all types
+
+  test_stack_usage.cpp (730 lines):
+    - Validates struct sizes (TrackedDrone, SettingsStruct)
+    - Validates buffer sizes (parser buffers, signal processing)
+    - Validates UI component sizes
+    - Validates total RAM < 128KB
+
+  test_shape_filters_phase_a.cpp (480 lines, 21 TEST_CASEs; host-clean:
+  constants.hpp + shape_gate_logic.hpp only — no scanner.cpp/ch.h):
+    - A-1 similarity ratio + shared raw_fallback_engages() decision
+    - A-2/F2 extent caps (DB 110 vs sweep 114) + Step-13 MaxW arming
+    - A-3 wide-fragment flatness waiver (shared flatness_structural())
+    - A-5 3σ IQR auto-gate clamp (shared auto_gate_from_iqr())
+    - F1 eased-flat abstention band w ∈ {0,5,10}, re-arm at w = 15
+    - F1+ FLAT_WIDE_BAR_PCT judgment cap (mid-band FP hole; byte-identity
+      at w2 = 10000; arming stays uncapped)
+    - Wired in BOTH paths: ctest (build_tests) and the workflow g++ line
+
+Code Quality:
+  ./format-code.sh          — clang-format-18
+  ./run_cppcheck.sh         — static analysis
+  clang-tidy file.cpp -checks=-*,thread-*,bugprone-*
+
+================================================================================
+22. KNOWN LIMITATIONS
+================================================================================
+
+  1. Single scanning mode (SEQUENTIAL only)
+     - Wideband/hybrid/panoramic modes removed for simplicity
+     - Sweep mode covers the wideband use case
+
+  2. Pattern matching (RF fingerprinting) REMOVED
+     - pattern_* files, PatternManagerView and PeakDetector were deleted;
+       §13 heading is kept only so §14+ cross-reference numbering stays stable
+
+  3. Database limited to 100 entries
+     - Fixed array, no dynamic expansion
+     - Large databases need manual trimming
+
+  4. No FHSS detection
+     - Removed in current version
+     - Sweep mode partially addresses hopping signals
+
+  5. Audio alerts block during DAC write
+     - WM8731/AK4951 DAC write is blocking
+     - Brief audio glitches possible during heavy UI updates
+
+  6. Sweep mode disables scanner thread
+     - DB scanning stops during sweep
+     - Resume from exact DB position after sweep
+
+  7. Settings UI limited to ~40 widgets
+     - Screen real estate constrains visible options
+     - Some settings only accessible via SD card editing
+
+  8. No real-time FFT overlay in normal mode
+     - Only sweep mode shows composite spectrum
+     - Normal mode shows drone list + big frequency
+
+================================================================================
+23. CONFIGURATION REFERENCE
+================================================================================
+
+RSSI Thresholds (dBm):
+  RSSI_DETECTION_THRESHOLD_DBM     = -95   (rssi_sens formula anchor only)
+  DEFAULT_ALERT_RSSI_THRESHOLD_DBM = -105  (fresh detection gate, Sens 85)
+  DEFAULT_THREAT_LOW_DBM           = -105  (weak but active; = fresh gate)
+  DEFAULT_THREAT_MEDIUM_DBM        = -89   (moderate signal)
+  RSSI_HIGH_THREAT_THRESHOLD_DBM   = -85   (strong signal)
+  RSSI_CRITICAL_THREAT_THRESHOLD_DBM = -82  (very strong, close range)
+  RSSI_NOISE_FLOOR_DBM             = -100  (noise floor)
+  RSSI_MIN_MEDIUM_ABOVE_DETECTION_DB = 3   (LOW band guarantee)
+
+Timing (ms):
+  SCAN_CYCLE_INTERVAL_MS     = 50    (DB scan interval)
+  DRONE_STALE_TIMEOUT_MS     = 5000  (5 seconds)
+  DRONE_REMOVAL_TIMEOUT_MS   = 30000 (30 seconds)
+  PLL_LOCK_TIMEOUT_MS        = 100
+  HARDWARE_RETRY_DELAY_MS    = 10
+  SD_CARD_TIMEOUT_MS         = 1000
+  DATABASE_LOAD_TIMEOUT_MS   = 2000
+  TARGET_UI_FPS              = 60
+  UI_REFRESH_INTERVAL_MS     = 16
+
+FFT Bin Layout:
+  FFT_BIN_COUNT              = 256
+  FFT_DC_SPIKE_START         = 120
+  FFT_DC_SPIKE_END           = 136
+  FFT_EDGE_SKIP              = 10
+  FFT_EDGE_SKIP_NARROW       = 6
+  FFT_USABLE_BINS            = 220
+  FFT_USABLE_BINS_NARROW     = 228
+  SWEEP_BIN_SIZE             = 78,125 Hz
+
+Spectrum Shape Defaults (STRICT SHAPE SET — 2026-10 user-elected: wide
+video-bearing signals pass on width, sharp-peaked shapes pass on profile;
+narrowband links, blunt-top FPV and flat-top WiFi are all clipped; the
+width/margin frames remain user-tunable):
+  DEFAULT_SPECTRUM_MARGIN         = 10    (≈2 dB — permissive gate; CFAR +
+                                           post-filters own FP rejection.
+                                           Floor: ≥ 2×TBD_MIN_ELEVATION_UNITS
+                                           and ≥ SHAPE_ADAPT_GATE_FLOOR+2)
+  DEFAULT_SPECTRUM_MIN_WIDTH      = 40    (≈3.13 MHz — rejects narrowband
+                                           control links & narrow spikes;
+                                           below-gate TBD exempt at this
+                                           floor, see Step 5 note; flatness
+                                           wide-waiver follows this floor)
+  DEFAULT_SPECTRUM_MAX_WIDTH      = 110   (≈8.6 MHz — A-2: AT the DB
+                                            110-bin extent cap (inert in
+                                            DB); real cap in sweep where
+                                            sidebands measure ≤114 bins)
+  DEFAULT_SPECTRUM_PEAK_SHARPNESS = 165   (STRICT — clips the measured FPV
+                                           100-130 band at medium range by
+                                           design; inverted-V > 200 passes)
+  DEFAULT_SPECTRUM_PEAK_RATIO     = 0     (disabled)
+  DEFAULT_SPECTRUM_VALLEY_DEPTH   = 0     (OFF — the old 90 was provably
+                                           inert: flank < margin/3 <= 84;
+                                           arming <=84 cuts close FPV)
+  DEFAULT_SPECTRUM_FLATNESS       = 25    (ARMED, strict — flatness_pct > 25
+                                           rejects: blunt-top FPV 40-70% AND
+                                           WiFi/BT 50-80% die on strong
+                                           peaks. МЕНЬШЕ = жёстче!)
+  DEFAULT_SPECTRUM_SYMMETRY       = 25    (ARMED, strict — weaker flank must
+                                           carry >= ¼ of the stronger; slight
+                                           FM asymmetry clips by design)
+  DEFAULT_SHAPE_SIM_THRESHOLD_PCT = 100   (Shape score — STRICT AND: every
+                                           armed similarity step must agree
+                                           (= legacy Sens-OFF verdict); the
+                                           4-of-5 middle ground 75 stays a
+                                           settings-UI opt-in)
+
+CFAR Defaults:
+  DEFAULT_CFAR_MODE           = CFARMode::OFF (USER DEFAULT; fixed threshold.
+                                OS was the previous FPV-optimized default)
+  DEFAULT_CFAR_REF_CELLS      = 32
+  DEFAULT_CFAR_GUARD_CELLS    = 3
+  DEFAULT_CFAR_THRESHOLD_X10  = 60 (6.0 ≈ 1.2 dB)
+
+Mahalanobis Defaults:
+  DEFAULT_MAHALOBIS_THRESHOLD_X10 = 40 (4.0)
+  MAHALANOBIS_DIMENSIONS          = 2
+  MAHALANOBIS_HISTORY_SIZE        = 8
+  MAHALANOBIS_Q_FORMAT            = 8 (Q8.8)
+
+Movement Trend:
+  MOVEMENT_TREND_THRESHOLD_APPROACHING_DB = 3
+  MOVEMENT_TREND_THRESHOLD_RECEEDING_DB   = -3
+  SWEEP_TREND_THRESHOLD_DB                = 2
+  MOVEMENT_TREND_MIN_HISTORY              = 3
+  TREND_HYSTERESIS_COUNT                  = 3
+
+Thread Priorities:
+  SCANNER_THREAD_PRIORITY  = 10
+  UI_THREAD_PRIORITY       = 5
+
+Stack Sizes:
+  SCANNER_THREAD_STACK_SIZE = 2048
+  UI_THREAD_STACK_SIZE      = 4096
+
+Colors (RGBA):
+  COLOR_LOW_THREAT      = 0xFF00FF00 (green)
+  COLOR_MEDIUM_THREAT   = 0xFFFFFF00 (yellow)
+  COLOR_HIGH_THREAT     = 0xFFFF8000 (orange)
+  COLOR_CRITICAL_THREAT = 0xFFFF0000 (red)
+  COLOR_UNKNOWN_THREAT  = 0xFF808080 (gray)
+  COLOR_BACKGROUND      = 0xFF000000 (black)
+  COLOR_TEXT            = 0xFFFFFFFF (white)
+
+================================================================================
+  24. КАК ОТСЕЧЬ WiFi — ПРАКТИЧЕСКОЕ РУКОВОДСТВО (СЦЕНАРИИ)
+================================================================================
+
+КОРОТКО: ПОЧЕМУ WiFi РАНЬШЕ «ДРОБИЛСЯ» НА ДЕСЯТКИ ЗАПИСЕЙ
+------------------------------------------------------------
+WiFi — ШИРОКОПОЛОСНЫЙ сигнал (20-40+ МГц), а окно детектора — всего 20 МГц.
+Раньше конвейер видел не «один широкий сигнал», а его ОБРЕЗКИ, и каждый
+обрезок считал отдельным дроном:
+
+  1) EDGE-ОБРЕЗКА. В sweep-режиме WiFi лежал ПОПЕРЁК границы 20-МГц слайса.
+     Детектор мерил только кусок, «не знал», что сигнал продолжается за
+     краем окна, и пропускал его как «узкий» (MaxW=200 не срабатывал).
+  2) РЯБЬ. Спектр WiFi гребнистый. Каждый острый гребень рябь проходил
+     форму-фильтры как «отдельный сигнал» — до 8 гребней за кадр.
+  3) НЕТ СКЛЕЙКИ. В sweep-режиме не было dedup — каждый прошедший гребень
+     становился ОТДЕЛЬНОЙ записью → десятки записей за проход свипа.
+
+ЧТО УЖЕ ИСПРАВЛЕНО В ЭТОЙ ВЕРСИИ (работает само, настроек не требует):
+  * EDGE-CLIP GUARD (шаг 6c, sweep): излучение, упёршееся в край окна и
+    продолжающееся за ним, ОТКЛОНЯЕТСЯ. WiFi обрезан краем почти в каждом
+    слайсе → отсекается. FPV умещается по центру слайса → не теряется.
+  * EMISSION DEDUP (sweep): гребни одного излучения внутри одного extent'а
+    склеиваются. Одно излучение = одна запись за кадр.
+
+Оставшиеся ложные WiFi-срабатывания убираются НАСТРОЙКАМИ — см. сценарии.
+
+ГЛАВНЫЙ ПРИНЦИП (прочитайте, это сэкономит час)
+------------------------------------------------------------
+ШИРИНА (MaxW) НЕ УМЕЕТ отличать 18-МГц аналоговый FPV от 20-МГц WiFi —
+их полосы перекрываются почти полностью. Не пытайтесь «задушить WiFi
+максимальной шириной» — задушите и дрон. Работают ДРУГИЕ признаки:
+
+  1. FLATNESS (Flat) — фильтр ФОРМЫ внутри полосы, а НЕ фильтр ширины.
+     Он НЕ определяет ширину и НЕ подавляет её — ширину меряют MinW
+     (слишком узкие) и MaxW (слишком широкие). Flat смотрит на профиль
+     УЖЕ найденного сигнала: какой процент бинов полосы несёт ≥90%
+     пиковой мощности. Плоский верх (WiFi: 50-80%) → отсев; острый пик
+     (FPV: <30%) → пропуск. Ширина у «плоского» и «острого» сигнала
+     может быть ОДИНАКОВАЯ — решает форма, поэтому Flat работает там,
+     где ширина бессильна.
+     ГЛАВНЫЙ фильтр. Дефолт теперь 0 (ВЫКЛ): притуплённые жирные FPV-пики
+     измерялись в 45-70% и отсекались им на ≥8 dB SNR (шаг активен только
+     на СИЛЬНЫХ пиках — т.е. ровно на видимых на спектре). НАПРАВЛЕНИЕ —
+     ВЕРХНЯЯ граница: МЕНЬШЕ = жёстче, БОЛЬШЕ = мягче, 0 = выкл.
+     Для борьбы с WiFi ВКЛЮЧИТЕ его вручную (45) в Settings.
+  2. SHARPNESS (Sharp) — WiFi ≈ 100-110, FPV ≈ 100-130. Тонкая настройка.
+  3. RSSI-порог — близкий WiFi сильный; поднимите порог.
+  4. Статистика (RSSI variance, Mahalanobis) — уже работают сами.
+
+Порядок настройки при ложных WiFi: Flat → Sharp → RSSI-порог. MaxW НЕ трогать.
+
+СЦЕНАРИЙ 1. SWEEP-режим, WiFi рядом: «десятки записей по всей полосе»
+------------------------------------------------------------
+Признаки: записи «россыпью» частот внутри одного куска полосы (2.4 или
+5.8 ГГц), RSSI у всех скачет, список забит.
+
+Действия:
+  1) Убедитесь, что стоит ЭТА сборка (edge-clip guard + dedup). Это уже
+     убирает основной поток мусора.
+  2) Settings → spectrum_flatness: ВКЛЮЧИТЕ (дефолт теперь 0 = выкл) —
+     поставьте 45, при необходимости опустите до 35-40.
+     НЕ ЗАБЫВАЙТЕ НАПРАВЛЕНИЕ: меньше = жёстче.
+       WiFi имеет flatness 50-80% (плоский верх), аналоговый FPV < 30%.
+       Значение 60 = «отклонить сигнал, у которого >60% бинов в полосе
+       несут ≥90% пиковой мощности» — плоские верхи отсеиваются.
+  3) spectrum_peak_sharpness: 100 → 140 (дополнительно, WiFi-плотное место).
+  4) rssi_threshold_dbm: -95 → -85 … -80, если WiFi близко и сильный.
+       Близкий WiFi «заорёт» на любом пороге — порог режет именно его,
+       а подлетающий дрон быстро выйдет из шума.
+  5) spectrum_max_width оставить 255 (дефолт = без потолка). НЕ снижайте
+     ниже ~130 — отрежете реальный FPV-видеоканал (8-18 МГц).
+
+Ожидаемый результат: WiFi-полоса либо не даёт записей вовсе, либо даёт
+ОДНУ консолидированную запись вместо десятков.
+
+СЦЕНАРИЙ 2. DB-режим: стойкая «ложная цель» на частоте роутера
+------------------------------------------------------------
+Признаки: одна-две записи висят на одних частотах постоянно, рядом
+работает ваш/соседский роутер.
+
+Действия:
+  1) spectrum_flatness: ВКЛЮЧИТЕ 45 (дефолт теперь 0 = выкл; меньше =
+     жёстче). Это главный инструмент и в DB-режиме.
+  2) Сверьте частоту записи с таблицей WiFi-каналов:
+       2.4 ГГц: 2412, 2417, 2422 … 2472 МГц (каналы 1-13, шаг 5 МГц)
+       5 ГГц:   5180, 5200, 5220, 5240, 5500, 5520 … 5745 МГц
+     Попадание «в канальную сетку» = почти наверняка WiFi.
+  3) spectrum_peak_sharpness: 100 → 140.
+  4) Радикально и безопасно: исключите эту частоту из DRONES.TXT (DB) или
+     поставьте Detection Window (sweep), не покрывающую каналы роутера.
+
+СЦЕНАРИЙ 3. Bluetooth (наушники, колонки, пульты): короткие плоские помехи
+------------------------------------------------------------
+Признаки: узкая (~1 МГц ≈ 13 бинов) помеха, «прыгающая» по частоте
+(BT прыгает каналами — AFH), короткие вспышки записей.
+
+Действия:
+  1) MaxW тут НЕ поможет (BT узкий) — работают flatness + sharpness.
+  2) spectrum_flatness: ВКЛЮЧИТЕ 45 (дефолт 0 = выкл); spectrum_peak_sharpness: 100 → 140.
+  3) BT-пакеты короткие и скачут по частоте — RSSI-variance (шаг 15
+     цепочки) и консолидация по радиусу сами давят «мусорность».
+  4) Если BT-фон постоянный (колонка стоит рядом) — поднимите
+     rssi_threshold_dbm на 5-10 дБ.
+
+СЦЕНАРИЙ 4. Слабый дрон НА ФОНЕ WiFi (не хочу терять дальность)
+------------------------------------------------------------
+Задача: давить WiFi, но не потерять слабый FPV за сотню метров.
+
+Действия:
+  1) НЕ задирайте rssi_threshold_dbm выше -85 без нужды.
+  2) flatness держите умеренно: 50-60 (не 80+).
+     Механика на вашей стороне: фильтр flatness НЕ применяется к слабым
+     пикам (peak_margin < FLATNESS_MIN_PEAK_MARGIN ≈ 8 дБ) — слабый FPV
+     проходит мимо flatness, а сильный близкий WiFi (у которого margin
+     большой) flatness режет. Это ровно то разделение, которое нужно.
+  3) Sensitive mode НЕ отключает фильтры (адаптивная переделка): sharpness,
+     valley, flatness, симметрия и эксцесс продолжают работать — их пороги
+     смягчаются пропорционально SNR (w²), а на сильных пиках действуют в
+     полную силу. На WiFi-плотных местах Sensitive теперь допустим, но
+     осторожный: открытый гейт (3σ, пол 10) пускает больше кандидатов —
+     держите CFAR/neighbor включёнными и не задирайте Mar.
+  4) valley_depth (Vly): дефолт 0 (выкл). Старый порог 90 был математически
+     недостижим (фланк хода всегда < margin/3 ≤ 84) и не защищал ни от чего.
+     Включать 70-80 стоит только против перегрузки приёмника (сценарий 5):
+     порог срабатывает лишь при margin ≥ 213 — он режет и насыщенный
+     близкий FPV (история: «80 резал на ~10 м»), а на обычный WiFi не
+     срабатывает вовсе.
+
+СЦЕНАРИЙ 5. Микроволновка / широкополосный шум / «поднялась вся полоса»
+------------------------------------------------------------
+Признаки: шумовое поле растёт по ВСЕЙ полосе, детектор «взбесился».
+
+Действия:
+  1) Это ПЕРЕГРУЗКА приёмника, а не вопрос «формы спектра». Снизьте
+     усиление (LNA/VGA/RF gain) на 5-10 дБ — шумовой пол опустится,
+     пороги снова заработают.
+  2) После нормализации усиления верните настройки по сценарию 1.
+
+ТАБЛИЦА ПРЕСЕТОВ (файл /EDA/SETTINGS.TXT)
+------------------------------------------------------------
+  Профиль                 Flat  Sharp  MaxW  Mar  RSSI_thr   Sym
+  --------------------------------------------------------------
+  Чистое поле (FPV)         0    120    200   20   -95        0
+  Город с WiFi (базовый)   45    140    200   20   -85        0
+  WiFi-ад (офис, плотная    40    150    200   25   -80        0
+  застройка)
+  BT-помехи + WiFi         45    140    200   20   -85        0
+  Слабый дрон, WiFi рядом  45    130    200   20   -88        0
+  (Flat у слабых пиков не применяется — margin guard; поэтому 45 безопасен)
+
+  Ключи SETTINGS.TXT:
+    spectrum_flatness, spectrum_peak_sharpness, spectrum_max_width,
+    spectrum_margin, rssi_threshold_dbm, spectrum_symmetry.
+
+  Как читать таблицу:
+    Flat      = фильтр ФОРМЫ, не ширины: доля бинов полосы сигнала с
+                ≥90% пиковой мощности. ВЕРХНЯЯ граница: сигнал плоскее
+                порога отклоняется. МЕНЬШЕ = жёстче, БОЛЬШЕ = мягче
+                (у Sharp наоборот). Плоский верх (WiFi/BT) 50-80% →
+                отсев; острый пик (FPV) <30% → пропуск. Ширину не меряет
+                и не ограничивает (это MinW/MaxW). 0 = выключен.
+    Sharp     = минимальная «острота» пика. WiFi ≈ 100-110, FPV ≈ 100-130.
+    MaxW      = максимальная ширина излучения в бинах (78.125 кГц/бин);
+                200 ≈ 15.6 МГц. НЕ СНИЖАТЬ ниже 130 — убьёт реальный FPV.
+    Mar       = минимальный запас пика над шумом (5 ед. = 1 дБ).
+    RSSI_thr  = порог срабатывания по уровню, дБм.
+    Sym       = лево/право симметрия. Держите 0 (аналог FPV несимметричен).
+
+ЕСЛИ ПОСЛЕ ВСЕГО WiFi ВСЁ РАВНО ПРОСКАКИВАЕТ
+------------------------------------------------------------
+  1) Проверьте, что сборка содержит Step 6c и Sweep Dedup (раздел 14).
+  2) ПОНИЗЬТЕ Flat (45 → 40 → 35). ВНИМАНИЕ: у Flat направление
+     ОБРАТНОЕ Sharp — МЕНЬШЕ = жёстче (режет больше плоских), БОЛЬШЕ =
+     мягче. Плата: близкий FPV с очень плоским блоком (flatness 30-40%)
+     может начать теряться — проверяйте на тестовом полёте.
+  3) Поднимите Sharp на 10 (140 → 150 → 160). Плата: слабый FPV на грани
+     шума начнёт теряться — проверьте на тестовом полёте.
+  4) Последний рубеж: Detection Windows (sweep) — физически не сканируйте
+     каналы, где живёт WiFi, если там не ждёте дрона.
+
+================================================================================
+  END OF DOCUMENTATION
+  Generated: 2026-09-06
+  Updated:   2026-10-22 (defaults re-elected: MinW 60→40 (≈3.13 MHz, the
+             flatness wide-waiver FLATNESS_WIDE_WAIVER_BINS follows it
+             automatically), Shape score 75→100 (STRICT AND — every armed
+             similarity step must agree; 75 remains a settings-UI opt-in),
+             Demo preset stages W2/W3/W4 OFF — only W1 enabled on apply,
+             spans/slots of all four windows preserved; upgraders with a
+             saved MinW of 60 now count as "raised" and get full
+             below-gate TBD MinW enforcement)
+  Updated:   2026-10-20 (STRICT SHAPE SET defaults, user-elected: MinW
+             20→60 (≈4.69 MHz), Mar 20→10 (permissive gate; TBD floor 6→5
+             and shape-adapt floor 10→8 retuned for the noise-model
+             static_asserts), MaxW 255→120→110 (A-2: at the DB 110-bin
+             extent cap — inert in DB, real cap in sweep), Sharp 100→165
+             (clips FPV 100-130 band by design), Flat 0→25
+             (ARMED), Sym 0→25 (ARMED), Shape score 100→75 (4-of-5); Demo
+             preset renamed from
+             DANGER DRONES; Demo preset band plan re-elected: W1 5300..6000
+             (5 priority zones 5645..5950), W2 2300..2600, W3 900..1400,
+             W4 400..1000 — one full-span slot each, 2100 MHz total;
+             W4's earlier 433..928 tightening superseded by the explicit
+             400..1000 span (manual entry still available)
+  History:   2026-09-25 (FPV-relaxed defaults: MinW 9→2, MaxW 200→255,
+             Flat 45→0; Step 6c → BOTH-EDGES rule so fat blunt FPV peaks
+             are no longer clipped at the fixed retune-grid phase)
+  History:   2026-09-23 (§14 renumbered 1:1 to scanner.cpp — 15 steps, in-frame
+             vs tracking split; дефолты Sharp=100 / Valley=90 / Flat=45;
+             effective Step-3 gate formula; mode scope 13/14/15)
+             2026-09-21 (Step 6c edge-clip guard + sweep emission dedup +
+             раздел 24 «Как отсечь WiFi»)
+  Codebase: 42 files, ~7,000+ lines C++
+  Platform: HackRF One / PortaPack Mayhem / STM32F405RG
+================================================================================

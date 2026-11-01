@@ -1,0 +1,244 @@
+#ifndef SETTINGS_MANAGER_HPP
+#define SETTINGS_MANAGER_HPP
+
+#include <cstdint>
+#include <cstddef>
+
+#include "drone_types.hpp"
+#include "constants.hpp"
+#include "scanner.hpp"
+
+namespace drone_analyzer {
+
+/**
+ * @brief Unified settings data structure (all settings + sweep in one POD)
+ * @note Single source of truth — replaces duplicated DroneSettings + ScanConfig sweep fields
+ * @note ~360 bytes total (14×FreqHz=112B + sweep_det_win_*_mhz[4][5]×2=160B + other=~88B)
+ * @note Sweep detection windows are stored as an MHz MIRROR (uint32),
+ *       SHARED with ScanConfig (identical field names/types): full-range
+ *       FreqRangeHz pairs would add 320B and break the
+ *       ≤512B static_assert below. No conversion is needed between the
+ *       two structures — apply_to_config()/extract_from_config() copy the
+ *       mirror verbatim; MHz→Hz expansion happens only in the detection gate.
+ * @note Use static locals in functions to avoid stack overflow on 4KB main thread stack
+ * @note No heap allocation, no virtual functions
+ */
+struct SettingsStruct {
+    // Scanning
+    ScanningMode scanning_mode;
+    uint32_t scan_interval_ms;
+    uint8_t scan_sensitivity;
+    int32_t alert_rssi_threshold_dbm;
+    int32_t threat_low_dbm;
+    int32_t threat_medium_dbm;
+    int32_t threat_high_dbm;
+    int32_t threat_critical_dbm;
+
+    // Display
+    bool spectrum_visible;
+    bool timeline_visible;
+
+
+    // Alerts
+    bool audio_alerts_enabled;
+    uint8_t volume{50};
+
+    // Detection features
+    bool dwell_enabled;
+    bool confirm_count_enabled;
+    bool noise_blacklist_enabled;
+    bool spectrum_detection_enabled;
+    bool median_enabled{true};  // Median filter (Md+) — ON by default
+
+    // Spectrum shape filter
+    uint8_t spectrum_margin;
+    uint8_t spectrum_min_width;
+    uint8_t spectrum_max_width;
+    uint8_t spectrum_peak_sharpness;
+    uint8_t spectrum_peak_ratio;
+    uint8_t spectrum_valley_depth;
+    uint8_t spectrum_flatness;
+    uint8_t spectrum_symmetry;
+
+    // CFAR detection
+    CFARMode cfar_mode;
+    uint8_t cfar_ref_cells;
+    uint8_t cfar_guard_cells;
+    uint8_t cfar_threshold_x10;
+
+    // CFAR extended parameters (Hybrid weights, OS-CFAR k, VI-CFAR threshold)
+    uint8_t cfar_hybrid_alpha{DEFAULT_CFAR_HYBRID_ALPHA};
+    uint8_t cfar_hybrid_beta{DEFAULT_CFAR_HYBRID_BETA};
+    uint8_t cfar_hybrid_gamma{DEFAULT_CFAR_HYBRID_GAMMA};
+    uint8_t os_cfar_k_percent{DEFAULT_OS_CFAR_K_PERCENT};
+    uint8_t vi_cfar_threshold_x10{DEFAULT_VI_CFAR_THRESHOLD_X10};
+
+    // Anti-false-positive
+    int32_t neighbor_margin_db;
+    bool rssi_variance_enabled{true};
+    uint8_t confirm_count;
+    uint8_t miss_tolerance{DEFAULT_MISS_TOLERANCE};  // Consecutive misses before breaking lock
+
+    // Mahalanobis Gate Filter
+    bool mahalanobis_enabled{true};
+    uint8_t mahalanobis_threshold_x10;
+
+    // Sensitive mode — relaxes shape filters for weak/long-range signals
+    bool sensitive_mode{true};
+    // Minimum SHARE (%) of the ARMED shape-similarity steps that must agree
+    // while sensitive_mode is ON ("Shape score" in the settings UI).
+    // 100 (DEFAULT, audit D-FULL-PASS) = strict AND — every armed gate must
+    // pass, a detection can never register after only part of them; 50..95
+    // = explicit dissent opt-in ("majority or tie" at 50). Ignored when OFF.
+    uint8_t shape_sim_threshold_pct{DEFAULT_SHAPE_SIM_THRESHOLD_PCT};
+
+    // Very-strong signal shape-filter bypass (default OFF) — mirrors
+    // ScanConfig::shape_bypass_enabled. When OFF, MaxW/Vly/Sym shape filters
+    // are enforced on every signal regardless of strength.
+    bool shape_bypass_enabled{false};
+
+    // Robust width-anchor floor (default ON — audit fix W1 kill switch) —
+    // mirrors ScanConfig::robust_width_floor_enabled. When ON, the width
+    // gates anchor at the p10 shelf in an occupied band (p25 - p10 >=
+    // WIDTH_FLOOR_CONTAM_DELTA_UNITS); when OFF, the legacy p25 anchor is
+    // restored byte-for-byte. UI: "RbF" checkbox. Old settings files lack
+    // the key and load the default (ON).
+    bool robust_width_floor_enabled{true};
+
+    // Spatial envelope kill switch (default ON — staircase fix) —
+    // mirrors ScanConfig::spectrum_envelope_enabled. When ON, a 3-tap
+    // max-of-neighbours envelope (spectrum_envelope.hpp) is fed to the crest
+    // topology test and the shape chain, filling one-bin notches on jagged
+    // slopes so phantom crests and truncated peak edges stop spawning false
+    // detections inside one physical emission. When OFF, the raw bins are
+    // read byte-for-byte (legacy path). UI: "Env" checkbox. Old settings
+    // files lack the key and load the default (ON).
+    bool spectrum_envelope_enabled{true};
+
+    // Advanced detection — persisted for round-trip but NOT exposed in the
+    // settings UI (file-only opt-in; defaults preserve previous behavior)
+    bool kurtosis_enabled{false};        // Shape-filter step 12 (default OFF)
+    int16_t kurtosis_min_x10{20};        // Minimum kurtosis ×10 (2.0)
+    bool adaptive_cfar_enabled{false};   // Auto-tune CFAR threshold (default OFF)
+
+    // Sweep window 1
+    FreqHz sweep_start_freq;
+    FreqHz sweep_end_freq;
+    FreqHz sweep_step_freq;
+
+    // Sweep window 2
+    FreqHz sweep2_start_freq;
+    FreqHz sweep2_end_freq;
+    FreqHz sweep2_step_freq;
+    bool sweep2_enabled;
+
+    // Sweep window 3
+    FreqHz sweep3_start_freq;
+    FreqHz sweep3_end_freq;
+    FreqHz sweep3_step_freq;
+    bool sweep3_enabled;
+
+    // Sweep window 4
+    FreqHz sweep4_start_freq;
+    FreqHz sweep4_end_freq;
+    FreqHz sweep4_step_freq;
+    bool sweep4_enabled;
+
+    // User shelf offset (-9..+9 units, default 0) — biases the sweep noise
+    // shelf in BOTH the display (composite floor subtraction) and the
+    // detector (per-frame p25 floor + width anchor). Mirrors
+    // ScanConfig::sweep_shelf_offset; file key "sweep_shelf_offset".
+    // Old settings files lack the key and load the default (0 = pure auto).
+    int8_t sweep_shelf_offset{SWEEP_SHELF_OFFSET_DEFAULT};
+
+    // Sweep detection windows — MHz file-format mirror (keeps sizeof ≤ 512B).
+    // Slot i of window w is ACTIVE iff start>0 && end>0 && start<=end.
+    // When ALL 5 slots of a window are 0 (default), detection runs over the
+    // window's ENTIRE range; otherwise ONLY inside the active ranges.
+    uint32_t sweep_det_win_start_mhz[MAX_SWEEP_WINDOWS][DETECTION_WINDOWS_PER_WINDOW]{};
+    uint32_t sweep_det_win_end_mhz[MAX_SWEEP_WINDOWS][DETECTION_WINDOWS_PER_WINDOW]{};
+    // Detection-range LABELS — per-slot index into RANGE_NAMES (range_names.hpp);
+    // shared with ScanConfig (identical field), 0 = no label.
+    // SRAM: +20 B — sizeof ~380 B, headroom inside the 512 B static_assert.
+    uint8_t sweep_det_win_name_idx[MAX_SWEEP_WINDOWS][DETECTION_WINDOWS_PER_WINDOW]{};
+    uint8_t rssi_decrease_cycles{5};  // Normal mode: seconds before RSSI decay. Sweep mode: missed full-pass budget (CYC; HIGH/CRIT 2xCYC)
+    uint8_t freq_match_radius_mhz{DEFAULT_FREQ_MATCH_RADIUS_MHZ};  // 0-100 MHz, drone detection merge radius (0=disabled)
+
+    // TRANSIENT (never saved): the settings_version line of the file just
+    // loaded, scaled x10 ("1.4" → 14). 0 = no version line seen (hand-
+    // edited / pre-version file). Consumed by the load()-time D-FULL-PASS
+    // migration, then cleared — it never reaches the save path.
+    uint8_t file_version_x10{0};
+
+    SettingsStruct() noexcept;
+};
+
+static_assert(sizeof(SettingsStruct) <= 512, "SettingsStruct too large for stack — exceeds 512 bytes");
+
+/**
+ * @brief Centralized settings file manager for EDA
+ * @note Single parser, single save path — replaces 3 duplicated parsers
+ * @note All settings (general + sweep) in one file: SETTINGS/eda_settings.txt
+ * @note No heap allocation, no exceptions
+ */
+class SettingsFileManager {
+public:
+    /**
+     * @brief Load all settings from SD card into SettingsStruct
+     * @param out Destination for loaded settings
+     * @return ErrorCode::SUCCESS if loaded, error code otherwise
+     * @note Missing file is not an error — out retains constructor defaults
+     * @note Bounded by SD_CARD_TIMEOUT_MS (1000 ms) — corrupted/slow SD
+     *       cannot hang the caller
+     * @invariant NOT reentrant: uses static scratch buffers (384 B BSS) to
+     *           keep them off the 4 KB process stack (File alone = 556 B,
+     *           see file.hpp). Safe because every caller (DroneScannerUI
+     *           ctor, DroneSettingsView ctor) runs synchronously on the UI
+     *           thread — a second load() can never overlap the first.
+     * @pre Called from the UI thread only; never from ScannerThread or an ISR.
+     */
+    [[nodiscard]] static ErrorCode load(SettingsStruct& out) noexcept;
+
+    /**
+     * @brief Save all settings (general + sweep) to SD card
+     * @param scanner_ptr Scanner to read current config from (may be nullptr)
+     * @param general_settings General settings to save
+     * @return ErrorCode::SUCCESS if saved, error code otherwise
+     * @note Sweep fields (windows 1-4 + detection-range MHz mirrors + labels)
+     *       are taken from general_settings DIRECTLY — callers must keep them
+     *       in sync with the scanner before calling:
+     *       DroneSweepView::save_settings() runs extract_from_config() first;
+     *       DroneSettingsView::button_save_ stashes the scanner's sweep
+     *       fields into settings_ (Step 1) before save_settings_to_sd().
+     *       There is intentionally NO file-scope ScanConfig scratch copy
+     *       here anymore (was: 384 B of BSS).
+     */
+    [[nodiscard]] static ErrorCode save(
+        DroneScanner* scanner_ptr,
+        const SettingsStruct& general_settings
+    ) noexcept;
+
+    /**
+     * @brief Apply loaded settings to ScanConfig
+     * @param settings Source settings
+     * @param config Destination ScanConfig to update
+     */
+    static void apply_to_config(
+        const SettingsStruct& settings,
+        ScanConfig& config
+    ) noexcept;
+
+    /**
+     * @brief Extract settings from ScanConfig (for view initialization)
+     * @param config Source ScanConfig
+     * @param settings Destination SettingsStruct to update
+     */
+    static void extract_from_config(
+        const ScanConfig& config,
+        SettingsStruct& settings
+    ) noexcept;
+};
+
+} // namespace drone_analyzer
+
+#endif // SETTINGS_MANAGER_HPP

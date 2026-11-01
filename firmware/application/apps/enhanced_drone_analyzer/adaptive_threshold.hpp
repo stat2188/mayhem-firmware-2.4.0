@@ -1,0 +1,137 @@
+#ifndef ADAPTIVE_THRESHOLD_HPP
+#define ADAPTIVE_THRESHOLD_HPP
+
+#include <cstdint>
+#include <cstddef>
+#include <array>
+
+#include "constants.hpp"
+
+namespace drone_analyzer {
+
+/**
+ * @brief Self-tuning CFAR threshold based on observed false alarm rate.
+ *
+ * Maintains a rolling window of detection results and adapts the threshold
+ * to maintain a target false alarm rate. When noise increases (urban, WiFi
+ * dense), threshold rises automatically. When noise decreases (rural),
+ * threshold drops for maximum sensitivity.
+ *
+ * Algorithm: Compute false alarm rate from detections where RSSI was below
+ * noise_floor + margin (likely noise, not real signal). If rate exceeds
+ * target, raise threshold. If rate drops below half-target, lower threshold.
+ *
+ * SRAM: ~40 bytes (rolling window + state)
+ * Stack: ~4 bytes per call
+ * Flash: ~120 bytes code
+ */
+class AdaptiveThreshold {
+public:
+    /**
+     * @brief Update threshold based on latest detection result.
+     * @param detected Whether signal was detected this frame
+     * @param rssi RSSI of detection (dBm), used to estimate if it's noise
+     * @param noise_floor_dBm Current noise floor estimate (dBm) — must be in same
+     *        domain as rssi for correct false-alarm classification
+     * @param current_threshold_x10 Current CFAR threshold × 10
+     */
+    void update(
+        bool detected,
+        int32_t rssi,
+        int32_t noise_floor_dBm,
+        uint8_t current_threshold_x10
+    ) noexcept {
+        // Audit C2 fix: the old classifier `rssi < floor_dBm + 20 dB`
+        // labelled nearly every REAL detection as a false alarm (typical
+        // drone detection margins are 6-15 dB, all below +20), driving the
+        // observed FA rate to ~100% and ratcheting the adapted threshold to
+        // CFAR_THRESHOLD_MAX_X10 — a total sensitivity collapse. A
+        // detection is a likely false alarm only when its margin BARELY
+        // exceeds the CFAR threshold it just passed (within 2x + 1 dB):
+        // noise spikes sit at 1-3 dB margin, real signals at 6+ dB. The
+        // comparison uses the ADAPTED threshold (current_threshold_x10_,
+        // the value find_peaks actually enforced this frame), converted
+        // raw-units->dB at 5 units/dB (spectrum_value_to_dbm scale).
+        // Both operands are dBm-domain (call sites pass raw peak + p25
+        // shelf in dBm), so the difference is a true dB margin.
+        const int32_t margin_dB = rssi - noise_floor_dBm;
+        const int32_t thresh_dB = (static_cast<int32_t>(current_threshold_x10_) / 50) + 1;
+        const bool likely_false_alarm = detected && (margin_dB <= 2 * thresh_dB);
+
+        history_[history_index_] = likely_false_alarm ? 1 : 0;
+        history_index_ = (history_index_ + 1) % HISTORY_SIZE;
+        if (history_count_ < HISTORY_SIZE) history_count_++;
+
+        // Only adapt after filling the history window
+        if (history_count_ < HISTORY_SIZE) return;
+
+        // Compute false alarm rate
+        uint32_t fa_count = 0;
+        for (size_t i = 0; i < HISTORY_SIZE; ++i) {
+            fa_count += history_[i];
+        }
+
+        const uint32_t fa_rate_percent = (fa_count * 100) / HISTORY_SIZE;
+
+        // Adapt threshold
+        if (fa_rate_percent > false_alarm_target_) {
+            // Too many false alarms — raise threshold (more selective)
+            if (current_threshold_x10_ < CFAR_THRESHOLD_MAX_X10) {
+                current_threshold_x10_++;
+            }
+        } else if (fa_rate_percent < (false_alarm_target_ / 2)) {
+            // Very few false alarms — lower threshold (more sensitive)
+            if (current_threshold_x10_ > CFAR_THRESHOLD_MIN_X10) {
+                current_threshold_x10_--;
+            }
+        }
+
+        // Apply smoothing: blend with current config value
+        // This prevents the adaptive threshold from diverging too far
+        // from the user-configured value.
+        if (current_threshold_x10 > current_threshold_x10_ + 20) {
+            current_threshold_x10_ = current_threshold_x10 - 20;
+        } else if (current_threshold_x10 < current_threshold_x10_ - 20) {
+            current_threshold_x10_ = current_threshold_x10 + 20;
+        }
+    }
+
+    /**
+     * @brief Get the adapted threshold value.
+     * @return Threshold × 10 (e.g., 60 = 6.0 units ≈ 1.2 dB)
+     */
+    [[nodiscard]] uint8_t get_optimal_threshold() const noexcept {
+        return current_threshold_x10_;
+    }
+
+    /**
+     * @brief Reset to initial state (call on frequency change).
+     */
+    void reset() noexcept {
+        history_.fill(0);
+        history_index_ = 0;
+        history_count_ = 0;
+        current_threshold_x10_ = DEFAULT_CFAR_THRESHOLD_X10;
+    }
+
+    /**
+     * @brief Set target false alarm rate (percent, 1-20).
+     */
+    void set_target_rate(uint8_t target_percent) noexcept {
+        if (target_percent < 1) target_percent = 1;
+        if (target_percent > 20) target_percent = 20;
+        false_alarm_target_ = target_percent;
+    }
+
+private:
+    static constexpr size_t HISTORY_SIZE = 32;
+    std::array<uint8_t, HISTORY_SIZE> history_{};
+    uint8_t history_index_{0};
+    uint8_t history_count_{0};
+    uint8_t current_threshold_x10_{DEFAULT_CFAR_THRESHOLD_X10};
+    uint8_t false_alarm_target_{5};  // Target: ≤5% false alarm rate
+};
+
+} // namespace drone_analyzer
+
+#endif // ADAPTIVE_THRESHOLD_HPP
