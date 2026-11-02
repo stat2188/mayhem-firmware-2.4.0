@@ -77,7 +77,7 @@ public:
 
     ~MutexLock() noexcept {
         if (locked_) {
-            chMtxUnlock();
+            chMtxUnlock(&mutex_);  // FIXED: was chMtxUnlock() — missing mutex argument, caused HardFault
         }
     }
 
@@ -99,7 +99,7 @@ public:
 
     ~MutexTryLock() noexcept {
         if (locked_) {
-            chMtxUnlock();
+            chMtxUnlock(&mutex_);  // FIXED: was chMtxUnlock() — missing mutex argument, caused HardFault
         }
     }
 

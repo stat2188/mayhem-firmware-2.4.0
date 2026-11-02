@@ -319,6 +319,21 @@ set(CPPSRC
 	apps/ui_touch_calibration.cpp
 	apps/ui_touchtunes.cpp
 	apps/ui_weatherstation.cpp
+	apps/enhanced_drone_analyzer/audio_alerts.cpp
+	apps/enhanced_drone_analyzer/database.cpp
+	apps/enhanced_drone_analyzer/drone_display.cpp
+	apps/enhanced_drone_analyzer/drone_settings.cpp
+	apps/enhanced_drone_analyzer/drone_scanner_ui.cpp
+	apps/enhanced_drone_analyzer/drone_sweep_view.cpp
+	apps/enhanced_drone_analyzer/hardware_controller.cpp
+	apps/enhanced_drone_analyzer/mahalanobis_gate.cpp
+	apps/enhanced_drone_analyzer/rssi_detector.cpp
+	apps/enhanced_drone_analyzer/scanner.cpp
+	apps/enhanced_drone_analyzer/scanner_thread.cpp
+	apps/enhanced_drone_analyzer/settings_manager.cpp
+	apps/enhanced_drone_analyzer/spectrum_preview_widget.cpp
+	apps/enhanced_drone_analyzer/sweep_processor.cpp
+	apps/enhanced_drone_analyzer/drone_types.cpp
 	protocols/aprs.cpp
 	protocols/ax25.cpp
 	protocols/dcs.cpp

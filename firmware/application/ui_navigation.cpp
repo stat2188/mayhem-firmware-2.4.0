@@ -65,6 +65,7 @@
 #include "ble_tx_app.hpp"
 #include "capture_app.hpp"
 #include "pocsag_app.hpp"
+#include "apps/enhanced_drone_analyzer/drone_scanner_ui.hpp"
 
 #include "core_control.hpp"
 #include "file.hpp"
@@ -114,6 +115,7 @@ const NavigationView::AppList NavigationView::appList = {
     {"capture", "Capture", HOME, Color::red(), &bitmap_icon_capture, new ViewFactory<CaptureAppView>()},
     {"replay", "Replay", HOME, Color::green(), &bitmap_icon_replay, new ViewFactory<PlaylistView>()},
     {"lookingglass", "Looking Glass", HOME, Color::green(), &bitmap_icon_looking, new ViewFactory<GlassView>()},
+    {"enhanced_drone_analyzer", "RSA", HOME, Color::green(), &bitmap_icon_tools_antenna, new ViewFactory<drone_analyzer::DroneScannerUI>()},
     {nullptr, "Utilities", HOME, Color::cyan(), &bitmap_icon_utilities, new ViewFactory<UtilitiesMenuView>()},
     {nullptr, "Games", HOME, Color::cyan(), &bitmap_icon_games, new ViewFactory<GamesMenuView>()},
     {nullptr, "Settings", HOME, Color::cyan(), &bitmap_icon_setup, new ViewFactory<SettingsMenuView>()},
