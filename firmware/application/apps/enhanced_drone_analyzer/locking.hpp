@@ -77,7 +77,11 @@ public:
 
     ~MutexLock() noexcept {
         if (locked_) {
-            chMtxUnlock(&mutex_);  // FIXED: was chMtxUnlock() — missing mutex argument, caused HardFault
+            // ChibiOS 3.0 API used by this firmware: chMtxUnlock() takes NO
+            // argument and releases the most recently acquired mutex of the
+            // calling thread. Passing &mutex_ does not compile against
+            // firmware/chibios/os/kernel/include/chmtx.h (Mutex *chMtxUnlock(void)).
+            (void)chMtxUnlock();
         }
     }
 
@@ -99,7 +103,9 @@ public:
 
     ~MutexTryLock() noexcept {
         if (locked_) {
-            chMtxUnlock(&mutex_);  // FIXED: was chMtxUnlock() — missing mutex argument, caused HardFault
+            // Same ChibiOS 3.0 contract as MutexLock: unlock the last mutex
+            // acquired by this thread (no argument).
+            (void)chMtxUnlock();
         }
     }
 
