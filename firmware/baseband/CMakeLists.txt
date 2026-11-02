@@ -766,8 +766,10 @@ set(MODE_CPPSRC
 	${HACKRF_PATH}/firmware/libopencm3/lib/lpc43xx/timer.c
 	${HACKRF_PATH}/firmware/libopencm3/lib/lpc43xx/i2c.c
 )
-# sd_over_usb has type conflicts with PRALINE (HackRF Pro) - disable for now
-if(NOT BOARD STREQUAL "PRALINE")
+# sd_over_usb has known compilation issues (empty max283x_variant_t enum in
+# hackrf/firmware/common/max283x.h when no IS_* macro is defined; missing
+# <string.h> and GPIO includes in scsi.c) - disabled until fixed upstream.
+if(FALSE)
 DeclareTargets(PUSB sd_over_usb)
 endif()
 
