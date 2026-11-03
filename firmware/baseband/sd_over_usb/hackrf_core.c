@@ -45,10 +45,11 @@
 #include "portapack.h"
 #endif
 
+#include "gpio.h"
 #include "gpio_lpc.h"
 
 /* GPIO Output PinMux */
-static struct gpio_t gpio_led[] = {
+static struct gpio gpio_led[] = {
     GPIO(2, 1),
     GPIO(2, 2),
     GPIO(2, 8),
@@ -58,90 +59,90 @@ static struct gpio_t gpio_led[] = {
 };
 
 // clang-format off
-static struct gpio_t gpio_1v8_enable        = GPIO(3,  6);
+static struct gpio gpio_1v8_enable        = GPIO(3,  6);
 
 /* MAX283x GPIO (XCVR_CTL) PinMux */
-static struct gpio_t gpio_max283x_select    = GPIO(0, 15);
+static struct gpio gpio_max283x_select    = GPIO(0, 15);
 
 /* MAX5864 SPI chip select (AD_CS) GPIO PinMux */
-static struct gpio_t gpio_max5864_select    = GPIO(2,  7);
+static struct gpio gpio_max5864_select    = GPIO(2,  7);
 
 /* RFFC5071 GPIO serial interface PinMux */
 // #ifdef RAD1O
-// static struct gpio_t gpio_rffc5072_select   = GPIO(2, 13);
-// static struct gpio_t gpio_rffc5072_clock    = GPIO(5,  6);
-// static struct gpio_t gpio_rffc5072_data     = GPIO(3,  3);
-// static struct gpio_t gpio_rffc5072_reset    = GPIO(2, 14);
+// static struct gpio gpio_rffc5072_select   = GPIO(2, 13);
+// static struct gpio gpio_rffc5072_clock    = GPIO(5,  6);
+// static struct gpio gpio_rffc5072_data     = GPIO(3,  3);
+// static struct gpio gpio_rffc5072_reset    = GPIO(2, 14);
 // #endif
 
 /* RF supply (VAA) control */
 #ifdef HACKRF_ONE
-static struct gpio_t gpio_vaa_disable       = GPIO(2, 9);
+static struct gpio gpio_vaa_disable       = GPIO(2, 9);
 #endif
 #ifdef RAD1O
-static struct gpio_t gpio_vaa_enable        = GPIO(2, 9);
+static struct gpio gpio_vaa_enable        = GPIO(2, 9);
 #endif
 
-static struct gpio_t gpio_w25q80bv_hold     = GPIO(1, 14);
-static struct gpio_t gpio_w25q80bv_wp       = GPIO(1, 15);
-static struct gpio_t gpio_w25q80bv_select   = GPIO(5, 11);
+static struct gpio gpio_w25q80bv_hold     = GPIO(1, 14);
+static struct gpio gpio_w25q80bv_wp       = GPIO(1, 15);
+static struct gpio gpio_w25q80bv_select   = GPIO(5, 11);
 
 /* RF switch control */
 #ifdef HACKRF_ONE
-static struct gpio_t gpio_hp                = GPIO(2,  0);
-static struct gpio_t gpio_lp                = GPIO(2, 10);
-static struct gpio_t gpio_tx_mix_bp         = GPIO(2, 11);
-static struct gpio_t gpio_no_mix_bypass     = GPIO(1,  0);
-static struct gpio_t gpio_rx_mix_bp         = GPIO(2, 12);
-static struct gpio_t gpio_tx_amp            = GPIO(2, 15);
-static struct gpio_t gpio_tx                = GPIO(5, 15);
-static struct gpio_t gpio_mix_bypass        = GPIO(5, 16);
-static struct gpio_t gpio_rx                = GPIO(5,  5);
-static struct gpio_t gpio_no_tx_amp_pwr     = GPIO(3,  5);
-static struct gpio_t gpio_amp_bypass        = GPIO(0, 14);
-static struct gpio_t gpio_rx_amp            = GPIO(1, 11);
-static struct gpio_t gpio_no_rx_amp_pwr     = GPIO(1, 12);
+static struct gpio gpio_hp                = GPIO(2,  0);
+static struct gpio gpio_lp                = GPIO(2, 10);
+static struct gpio gpio_tx_mix_bp         = GPIO(2, 11);
+static struct gpio gpio_no_mix_bypass     = GPIO(1,  0);
+static struct gpio gpio_rx_mix_bp         = GPIO(2, 12);
+static struct gpio gpio_tx_amp            = GPIO(2, 15);
+static struct gpio gpio_tx                = GPIO(5, 15);
+static struct gpio gpio_mix_bypass        = GPIO(5, 16);
+static struct gpio gpio_rx                = GPIO(5,  5);
+static struct gpio gpio_no_tx_amp_pwr     = GPIO(3,  5);
+static struct gpio gpio_amp_bypass        = GPIO(0, 14);
+static struct gpio gpio_rx_amp            = GPIO(1, 11);
+static struct gpio gpio_no_rx_amp_pwr     = GPIO(1, 12);
 #endif
 #ifdef RAD1O
-static struct gpio_t gpio_tx_rx_n           = GPIO(1,  11);
-static struct gpio_t gpio_tx_rx             = GPIO(0,  14);
-static struct gpio_t gpio_by_mix            = GPIO(1,  12);
-static struct gpio_t gpio_by_mix_n          = GPIO(2,  10);
-static struct gpio_t gpio_by_amp            = GPIO(1,  0);
-static struct gpio_t gpio_by_amp_n          = GPIO(5,  5);
-static struct gpio_t gpio_mixer_en          = GPIO(5,  16);
-static struct gpio_t gpio_low_high_filt     = GPIO(2,  11);
-static struct gpio_t gpio_low_high_filt_n   = GPIO(2,  12);
-static struct gpio_t gpio_tx_amp            = GPIO(2,  15);
-static struct gpio_t gpio_rx_lna            = GPIO(5,  15);
+static struct gpio gpio_tx_rx_n           = GPIO(1,  11);
+static struct gpio gpio_tx_rx             = GPIO(0,  14);
+static struct gpio gpio_by_mix            = GPIO(1,  12);
+static struct gpio gpio_by_mix_n          = GPIO(2,  10);
+static struct gpio gpio_by_amp            = GPIO(1,  0);
+static struct gpio gpio_by_amp_n          = GPIO(5,  5);
+static struct gpio gpio_mixer_en          = GPIO(5,  16);
+static struct gpio gpio_low_high_filt     = GPIO(2,  11);
+static struct gpio gpio_low_high_filt_n   = GPIO(2,  12);
+static struct gpio gpio_tx_amp            = GPIO(2,  15);
+static struct gpio gpio_rx_lna            = GPIO(5,  15);
 #endif
 
 /* CPLD JTAG interface GPIO pins */
-static struct gpio_t gpio_cpld_tdo          = GPIO(5, 18);
-static struct gpio_t gpio_cpld_tck          = GPIO(3,  0);
+static struct gpio gpio_cpld_tdo          = GPIO(5, 18);
+static struct gpio gpio_cpld_tck          = GPIO(3,  0);
 #if (defined HACKRF_ONE || defined RAD1O)
-static struct gpio_t gpio_cpld_tms          = GPIO(3,  4);
-static struct gpio_t gpio_cpld_tdi          = GPIO(3,  1);
+static struct gpio gpio_cpld_tms          = GPIO(3,  4);
+static struct gpio gpio_cpld_tdi          = GPIO(3,  1);
 #else
-static struct gpio_t gpio_cpld_tms          = GPIO(3,  1);
-static struct gpio_t gpio_cpld_tdi          = GPIO(3,  4);
+static struct gpio gpio_cpld_tms          = GPIO(3,  1);
+static struct gpio gpio_cpld_tdi          = GPIO(3,  4);
 #endif
 
 #ifdef HACKRF_ONE
-static struct gpio_t gpio_cpld_pp_tms       = GPIO(1,  1);
-static struct gpio_t gpio_cpld_pp_tdo       = GPIO(1,  8);
+static struct gpio gpio_cpld_pp_tms       = GPIO(1,  1);
+static struct gpio gpio_cpld_pp_tdo       = GPIO(1,  8);
 #endif
 
 /* other CPLD interface GPIO pins */
-static struct gpio_t gpio_hw_sync_enable    = GPIO(5, 12);
-static struct gpio_t gpio_q_invert          = GPIO(0, 13);
+static struct gpio gpio_hw_sync_enable    = GPIO(5, 12);
+static struct gpio gpio_q_invert          = GPIO(0, 13);
 
 /* HackRF One r9 */
 #ifdef HACKRF_ONE
-static struct gpio_t gpio_h1r9_rx             = GPIO(0, 7);
-static struct gpio_t gpio_h1r9_1v8_enable     = GPIO(2, 9);
-static struct gpio_t gpio_h1r9_vaa_disable    = GPIO(3, 6);
-static struct gpio_t gpio_h1r9_hw_sync_enable = GPIO(5, 5);
+static struct gpio gpio_h1r9_rx             = GPIO(0, 7);
+static struct gpio gpio_h1r9_1v8_enable     = GPIO(2, 9);
+static struct gpio gpio_h1r9_vaa_disable    = GPIO(3, 6);
+static struct gpio gpio_h1r9_hw_sync_enable = GPIO(5, 5);
 #endif
 // clang-format on
 
