@@ -1,9 +1,9 @@
 name: Nightly Release
 
 on:
-  schedule:
-    - cron: "0 0 * * *"
-
+  # The scheduled nightly build lives in create_nightly_release.yml.
+  # Keep this one as a manual fallback only: two scheduled workflows would
+  # race to create the same nightly-tag-<date> release.
   workflow_dispatch:
 
 permissions:

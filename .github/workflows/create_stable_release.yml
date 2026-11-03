@@ -6,47 +6,39 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
-    name: build (${{ matrix.device_name }})
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - device: default
-            device_name: HackRF
-            cmake_args: ""
-            artifact_suffix: "_hackrf"
-          - device: portarf
-            device_name: PortaRF
-            cmake_args: "-DFLASH_MB_SIZE=2 -DFLASH_MB_LIMIT_SIZE=2"
-            artifact_suffix: "_portarf"
-          - device: hpro
-            device_name: HackRF Pro
-            cmake_args: "-DBOARD=PRALINE"
-            artifact_suffix: "_hpro"
+    name: build (HackRF)
     steps:
       - name: Get current date
         id: date
         run: echo "date=$(date +'%Y-%m-%d')" >> $GITHUB_OUTPUT
       - name: Checkout
-        uses: actions/checkout@master
+        uses: actions/checkout@v4
         with:
           fetch-depth: 0
           submodules: true
-      - name: Git Sumbodule Update
+      - name: Git Submodule Update
         run: |
           git submodule update --init --recursive
+      # CMake runs these via `COMMAND ${MAKE_SPI_IMAGE} ...` (direct exec, not
+      # `python3 script.py`), but git stores them as 100644 -> "Permission denied".
+      # chmod every script in tools/ so a newly added tool cannot break CI again.
+      - name: Fix permissions for build scripts
+        run: find firmware/tools -type f \( -name '*.py' -o -name '*.sh' \) -exec chmod +x {} +
       - name: Get version
         id: version
         run: echo "version=$(cat .github/workflows/version.txt)" >> $GITHUB_OUTPUT
+      - name: Get past version
+        id: past_version
+        run: echo "past_version=$(cat .github/workflows/past_version.txt)" >> $GITHUB_OUTPUT
       - name: Build the Docker image
-        run: docker build -t portapack-dev -f dockerfile-nogit . --tag my-image-name:$(date +%s)
+        run: docker build -t portapack-dev -f dockerfile-nogit .
       - name: Make build folder
-        run: mkdir ${{ github.workspace }}/build
+        run: mkdir -p ${{ github.workspace }}/build
       - name: Run the Docker image
-        run: docker run -e VERSION_STRING=${{ steps.version.outputs.version }} -i -v ${{ github.workspace }}:/havoc portapack-dev ${{ matrix.cmake_args }}
+        run: docker run -e VERSION_STRING=${{ steps.version.outputs.version }} -i -v ${{ github.workspace }}:/havoc portapack-dev
       - name: Create Small SD Card ZIP - No World Map
         run: |
-          mkdir -p sdcard/FIRMWARE && cp build/firmware/portapack-mayhem-firmware.bin sdcard/FIRMWARE/portapack-mayhem_${{ steps.version.outputs.version }}.bin && cp build/firmware/portapack-mayhem_OCI.ppfw.tar sdcard/FIRMWARE/mayhem_${{ steps.version.outputs.version }}${{ matrix.artifact_suffix }}_OCI.ppfw.tar && mkdir -p sdcard/APPS && cp build/firmware/application/*.ppma sdcard/APPS && cp build/firmware/standalone/*/*.ppmp sdcard/APPS && cd sdcard && zip -r ../sdcard-no-map.zip . && cd ..
+          mkdir -p sdcard/FIRMWARE && cp build/firmware/portapack-mayhem-firmware.bin sdcard/FIRMWARE/portapack-mayhem_${{ steps.version.outputs.version }}.bin && cp build/firmware/portapack-mayhem_OCI.ppfw.tar sdcard/FIRMWARE/mayhem_${{ steps.version.outputs.version }}_OCI.ppfw.tar && mkdir -p sdcard/APPS && cp build/firmware/application/*.ppma sdcard/APPS && cp build/firmware/standalone/*/*.ppmp sdcard/APPS && cd sdcard && zip -r ../sdcard-no-map.zip . && cd ..
       - name: Download world map
         run: |
           wget https://github.com/portapack-mayhem/mayhem-firmware/releases/download/world_map/world_map.zip
@@ -61,26 +53,26 @@ jobs:
           zip -j firmware.zip build/firmware/portapack-mayhem-firmware.bin && cd flashing && zip -r ../firmware.zip *
       - name: Create SD Card ZIP
         run: |
-          mkdir -p sdcard/FIRMWARE && cp build/firmware/portapack-mayhem-firmware.bin sdcard/FIRMWARE/portapack-mayhem_${{ steps.version.outputs.version }}.bin && cp build/firmware/portapack-mayhem_OCI.ppfw.tar sdcard/FIRMWARE/mayhem_${{ steps.version.outputs.version }}${{ matrix.artifact_suffix }}_OCI.ppfw.tar && mkdir -p sdcard/APPS && cp build/firmware/application/*.ppma sdcard/APPS && cp build/firmware/standalone/*/*.ppmp sdcard/APPS && cd sdcard && zip -r ../sdcard.zip . && cd ..
+          mkdir -p sdcard/FIRMWARE && cp build/firmware/portapack-mayhem-firmware.bin sdcard/FIRMWARE/portapack-mayhem_${{ steps.version.outputs.version }}.bin && cp build/firmware/portapack-mayhem_OCI.ppfw.tar sdcard/FIRMWARE/mayhem_${{ steps.version.outputs.version }}_OCI.ppfw.tar && mkdir -p sdcard/APPS && cp build/firmware/application/*.ppma sdcard/APPS && cp build/firmware/standalone/*/*.ppmp sdcard/APPS && cd sdcard && zip -r ../sdcard.zip . && cd ..
       - name: Upload firmware zip artifact
         uses: actions/upload-artifact@v4
         with:
-          name: firmware-${{ matrix.device }}
+          name: firmware
           path: ./firmware.zip
       - name: Upload SD card artifact
         uses: actions/upload-artifact@v4
         with:
-          name: sdcard-${{ matrix.device }}
+          name: sdcard
           path: ./sdcard.zip
       - name: Upload SD card no-map artifact
         uses: actions/upload-artifact@v4
         with:
-          name: sdcard-no-map-${{ matrix.device }}
+          name: sdcard-no-map
           path: ./sdcard-no-map.zip
       - name: Upload OCI tar artifact
         uses: actions/upload-artifact@v4
         with:
-          name: oci-tar-${{ matrix.device }}
+          name: oci-tar
           path: build/firmware/portapack-mayhem_OCI.ppfw.tar
 
   release:
@@ -93,7 +85,7 @@ jobs:
         id: date
         run: echo "date=$(date +'%Y-%m-%d')" >> $GITHUB_OUTPUT
       - name: Checkout
-        uses: actions/checkout@master
+        uses: actions/checkout@v4
         with:
           fetch-depth: 0
           submodules: true
@@ -117,37 +109,22 @@ jobs:
             echo EOF
           } >> "$GITHUB_OUTPUT"
         id: changelog
-      # Combine all 3 device firmware bins into a single zip with device selector bat
-      - name: Create Combined Firmware ZIP
-        run: |
-          mkdir -p firmware_combined
-          unzip artifacts/firmware-default/firmware.zip -d firmware_combined
-          mv firmware_combined/portapack-mayhem-firmware.bin firmware_combined/firmware/firmware_hackrf.bin
-          unzip -j artifacts/firmware-portarf/firmware.zip portapack-mayhem-firmware.bin -d firmware_combined/firmware
-          mv firmware_combined/firmware/portapack-mayhem-firmware.bin firmware_combined/firmware/firmware_portarf.bin
-          unzip -j artifacts/firmware-hpro/firmware.zip portapack-mayhem-firmware.bin -d firmware_combined/firmware
-          mv firmware_combined/firmware/portapack-mayhem-firmware.bin firmware_combined/firmware/firmware_hpro.bin
-          unzip -j artifacts/firmware-hpro/firmware.zip firmware/hackrf_usb.dfu firmware/hackrf_usb.bin -d firmware_combined_hpro
-          mv firmware_combined_hpro/hackrf_usb.dfu firmware_combined/firmware/hackrf_hpro_usb.dfu
-          mv firmware_combined_hpro/hackrf_usb.bin firmware_combined/firmware/hackrf_hpro_usb.bin
-          cd firmware_combined && zip -r ../firmware_all_devices.zip . && cd ..
       - name: Prepare release assets
         run: |
           VER="${{ steps.version.outputs.version }}"
           mkdir -p release_assets
-          # OCI tar assets
-          cp artifacts/oci-tar-default/portapack-mayhem_OCI.ppfw.tar "release_assets/OCI_hackrf_mayhem_${VER}.ppfw.tar"
-          cp artifacts/oci-tar-portarf/portapack-mayhem_OCI.ppfw.tar "release_assets/OCI_portarf_mayhem_${VER}.ppfw.tar"
-          cp artifacts/oci-tar-hpro/portapack-mayhem_OCI.ppfw.tar "release_assets/OCI_hpro_mayhem_${VER}.ppfw.tar"
-          # Combined firmware
-          cp firmware_all_devices.zip "release_assets/FIRMWARE_mayhem_${VER}.zip"
-          # SD card assets
-          cp artifacts/sdcard-default/sdcard.zip "release_assets/COPY_TO_SDCARD_hackrf_mayhem_${VER}.zip"
-          cp artifacts/sdcard-no-map-default/sdcard-no-map.zip "release_assets/COPY_TO_SDCARD_hackrf_mayhem_${VER}-no-world-map.zip"
-          cp artifacts/sdcard-portarf/sdcard.zip "release_assets/COPY_TO_SDCARD_portarf_mayhem_${VER}.zip"
-          cp artifacts/sdcard-no-map-portarf/sdcard-no-map.zip "release_assets/COPY_TO_SDCARD_portarf_mayhem_${VER}-no-world-map.zip"
-          cp artifacts/sdcard-hpro/sdcard.zip "release_assets/COPY_TO_SDCARD_hpro_mayhem_${VER}.zip"
-          cp artifacts/sdcard-no-map-hpro/sdcard-no-map.zip "release_assets/COPY_TO_SDCARD_hpro_mayhem_${VER}-no-world-map.zip"
+
+          # Rebuild the firmware zip so it matches the layout expected by
+          # flashing/mayhem_flasher.bat (firmware/firmware_hackrf.bin + DFU files).
+          mkdir -p firmware_combined
+          unzip -q artifacts/firmware/firmware.zip -d firmware_combined
+          mv firmware_combined/portapack-mayhem-firmware.bin firmware_combined/firmware/firmware_hackrf.bin
+          cd firmware_combined && zip -qr ../firmware_hackrf.zip . && cd ..
+
+          cp firmware_hackrf.zip "release_assets/mayhem_${VER}_FIRMWARE.zip"
+          cp artifacts/oci-tar/portapack-mayhem_OCI.ppfw.tar "release_assets/mayhem_${VER}_OCI.ppfw.tar"
+          cp artifacts/sdcard/sdcard.zip "release_assets/mayhem_${VER}_COPY_TO_SDCARD.zip"
+          cp artifacts/sdcard-no-map/sdcard-no-map.zip "release_assets/mayhem_${VER}_COPY_TO_SDCARD-no-world-map.zip"
       - name: Create Release
         uses: softprops/action-gh-release@v2
         with:
