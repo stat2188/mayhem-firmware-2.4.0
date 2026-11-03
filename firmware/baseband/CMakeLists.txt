@@ -771,10 +771,13 @@ set(MODE_CPPSRC
 	${HACKRF_PATH}/firmware/libopencm3/lib/lpc43xx/timer.c
 	${HACKRF_PATH}/firmware/libopencm3/lib/lpc43xx/i2c.c
 )
-# sd_over_usb has type conflicts with PRALINE (HackRF Pro) - disable for now
-if(NOT BOARD STREQUAL "PRALINE")
-DeclareTargets(PUSB sd_over_usb)
-endif()
+# sd_over_usb has type conflicts with current hackrf submodule (b80cddb).
+# Broken for HackRF One: struct gpio_t vs struct gpio, missing PLL_SOURCE_*,
+# missing si5351c_*, rf_path_t/jtag_gpio_t member mismatches, ssp_config_*
+# const qualifier conflicts, etc. Disable until synced with submodule API.
+#if(NOT BOARD STREQUAL "PRALINE")
+#DeclareTargets(PUSB sd_over_usb)
+#endif()
 
 
 ### HackRF "factory" firmware
