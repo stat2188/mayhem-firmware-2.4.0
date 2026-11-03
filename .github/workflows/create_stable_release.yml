@@ -6,7 +6,7 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
-    name: build (HackRF)
+    name: build (HackRF One Portapack, 1 MB SPI flash)
     steps:
       - name: Get current date
         id: date
@@ -19,6 +19,11 @@ jobs:
       - name: Git Submodule Update
         run: |
           git submodule update --init --recursive
+      - name: Validate hackrf submodule contents
+        run: |
+          test -f hackrf/firmware/common/clock_io.c || { echo "ERROR: hackrf submodule missing clock_io.c"; exit 1; }
+          test -f hackrf/firmware/common/clkin.h || { echo "ERROR: hackrf submodule missing clkin.h"; exit 1; }
+          echo "✅ hackrf submodule populated"
       # CMake runs these via `COMMAND ${MAKE_SPI_IMAGE} ...` (direct exec, not
       # `python3 script.py`), but git stores them as 100644 -> "Permission denied".
       # chmod every script in tools/ so a newly added tool cannot break CI again.
@@ -31,11 +36,12 @@ jobs:
         id: past_version
         run: echo "past_version=$(cat .github/workflows/past_version.txt)" >> $GITHUB_OUTPUT
       - name: Build the Docker image
-        run: docker build -t portapack-dev -f dockerfile-nogit .
+        run: docker build -t portapack-dev:${{ steps.version.outputs.version }} -f dockerfile-nogit .
       - name: Make build folder
         run: mkdir -p ${{ github.workspace }}/build
       - name: Run the Docker image
-        run: docker run -e VERSION_STRING=${{ steps.version.outputs.version }} -i -v ${{ github.workspace }}:/havoc portapack-dev
+        # -DFLASH_MB_LIMIT_SIZE=1 = 1 MB SPI flash for HackRF One Portapack target.
+        run: docker run -e VERSION_STRING=${{ steps.version.outputs.version }} -i -v ${{ github.workspace }}:/havoc portapack-dev:${{ steps.version.outputs.version }} -DFLASH_MB_LIMIT_SIZE=1
       - name: Create Small SD Card ZIP - No World Map
         run: |
           mkdir -p sdcard/FIRMWARE && cp build/firmware/portapack-mayhem-firmware.bin sdcard/FIRMWARE/portapack-mayhem_${{ steps.version.outputs.version }}.bin && cp build/firmware/portapack-mayhem_OCI.ppfw.tar sdcard/FIRMWARE/mayhem_${{ steps.version.outputs.version }}_OCI.ppfw.tar && mkdir -p sdcard/APPS && cp build/firmware/application/*.ppma sdcard/APPS && cp build/firmware/standalone/*/*.ppmp sdcard/APPS && cd sdcard && zip -r ../sdcard-no-map.zip . && cd ..

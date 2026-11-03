@@ -751,7 +751,6 @@ set(MODE_CPPSRC
 	${HACKRF_PATH}/firmware/common/si5351c.c
 	${HACKRF_PATH}/firmware/common/i2c_bus.c
 	${HACKRF_PATH}/firmware/common/mixer.c
-	${HACKRF_PATH}/firmware/common/clkin.c
 	${HACKRF_PATH}/firmware/common/spi_bus.c
 	${HACKRF_PATH}/firmware/common/sgpio.c
 	${HACKRF_PATH}/firmware/common/rf_path.c
@@ -759,7 +758,7 @@ set(MODE_CPPSRC
 	${HACKRF_PATH}/firmware/common/spi_ssp.c
 	${HACKRF_PATH}/firmware/common/rffc5071_spi.c
 	${HACKRF_PATH}/firmware/common/rffc5071.c
-	${HACKRF_PATH}/firmware/common/clkin.c
+	${HACKRF_PATH}/firmware/common/clock_io.c
 	${HACKRF_PATH}/firmware/common/gpdma.c
 
 	${HACKRF_PATH}/firmware/libopencm3/lib/cm3/nvic.c
