@@ -132,9 +132,8 @@ jobs:
             -Ifirmware/chibios-portapack/ext/fatfs/src \
             -Ifirmware/chibios-portapack/boards/PORTAPACK_APPLICATION \
             -Ifirmware/application/hw \
-            -Ifirmware/apps \
+            -Ifirmware/application/apps \
             -Ifirmware/application/protocols \
-            -Ifirmware/bmps \
             -Ifirmware/chibios/os/various \
             -Ifirmware/hackrf/firmware/libopencm3/include \
             -Ifirmware/hackrf/firmware/common \
