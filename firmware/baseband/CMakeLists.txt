@@ -293,7 +293,7 @@ macro(DeclareTargets chunk_tag name)
 			OUTPUT ${chunk_tag}.bin ${PROJECT_NAME}.img
 			COMMAND ${CMAKE_OBJCOPY} -O binary ${PROJECT_NAME}.elf ${chunk_tag}.bin
 			COMMAND ${LZ4} -f -9 ${chunk_tag}.bin ${PROJECT_NAME}.lz4
-			COMMAND python3 ${MAKE_IMAGE_CHUNK} ${PROJECT_NAME}.lz4 ${chunk_tag} ${PROJECT_NAME}.img
+			COMMAND ${MAKE_IMAGE_CHUNK} ${PROJECT_NAME}.lz4 ${chunk_tag} ${PROJECT_NAME}.img
 			DEPENDS ${PROJECT_NAME}.elf ${MAKE_IMAGE_CHUNK}
 			VERBATIM
 		)
@@ -751,6 +751,7 @@ set(MODE_CPPSRC
 	${HACKRF_PATH}/firmware/common/si5351c.c
 	${HACKRF_PATH}/firmware/common/i2c_bus.c
 	${HACKRF_PATH}/firmware/common/mixer.c
+	${HACKRF_PATH}/firmware/common/clkin.c
 	${HACKRF_PATH}/firmware/common/spi_bus.c
 	${HACKRF_PATH}/firmware/common/sgpio.c
 	${HACKRF_PATH}/firmware/common/rf_path.c
@@ -758,6 +759,7 @@ set(MODE_CPPSRC
 	${HACKRF_PATH}/firmware/common/spi_ssp.c
 	${HACKRF_PATH}/firmware/common/rffc5071_spi.c
 	${HACKRF_PATH}/firmware/common/rffc5071.c
+	${HACKRF_PATH}/firmware/common/clkin.c
 	${HACKRF_PATH}/firmware/common/gpdma.c
 
 	${HACKRF_PATH}/firmware/libopencm3/lib/cm3/nvic.c
@@ -766,10 +768,8 @@ set(MODE_CPPSRC
 	${HACKRF_PATH}/firmware/libopencm3/lib/lpc43xx/timer.c
 	${HACKRF_PATH}/firmware/libopencm3/lib/lpc43xx/i2c.c
 )
-# sd_over_usb has known compilation issues (empty max283x_variant_t enum in
-# hackrf/firmware/common/max283x.h when no IS_* macro is defined; missing
-# <string.h> and GPIO includes in scsi.c) - disabled until fixed upstream.
-if(FALSE)
+# sd_over_usb has type conflicts with PRALINE (HackRF Pro) - disable for now
+if(NOT BOARD STREQUAL "PRALINE")
 DeclareTargets(PUSB sd_over_usb)
 endif()
 
@@ -779,7 +779,7 @@ endif()
 add_custom_command(
 	OUTPUT hackrf.img
 	COMMAND ${LZ4} -f -9 ${HACKRF_FIRMWARE_BIN_IMAGE} hackrf.lz4
-	COMMAND python3 ${MAKE_IMAGE_CHUNK} hackrf.lz4 HRF1 hackrf.img
+	COMMAND ${MAKE_IMAGE_CHUNK} hackrf.lz4 HRF1 hackrf.img
 	DEPENDS ${HACKRF_FIRMWARE_BIN_FILENAME} ${MAKE_IMAGE_CHUNK}
 	VERBATIM
 )
@@ -790,7 +790,7 @@ set(BASEBAND_IMAGES ${BASEBAND_IMAGES} hackrf.img)
 
 add_custom_command(
 	OUTPUT terminator.img
-	COMMAND python3 ${MAKE_IMAGE_CHUNK} terminator.img
+	COMMAND ${MAKE_IMAGE_CHUNK} terminator.img
 	DEPENDS ${MAKE_IMAGE_CHUNK}
 	VERBATIM
 )
