@@ -22,10 +22,13 @@
 
 #include "scsi.h"
 #include "diskio.h"
+#include <common/gpio.h>
+#include <common/gpio_lpc.h>
 #include <libopencm3/lpc43xx/scu.h>
 #include <libopencm3/lpc43xx/rgu.h>
 #include <libopencm3/lpc43xx/wwdt.h>
 #include "delay.h"
+#include <string.h>
 
 volatile bool usb_bulk_block_done = false;
 
@@ -286,11 +289,11 @@ void scsi_command(msd_cbw_t* msd_cbw_data) {
 
         case SCSI_CMD_START_STOP_UNIT:
             SCU_SFSP2_8 = (SCU_SFSP2_8 & ~(7)) | 4;
-            struct gpio_t dfu = GPIO(5, 7);
-            gpio_output(&dfu);
-            gpio_clear(&dfu);
+            const struct gpio dfu = GPIO(5, 7);
+            gpio_output((gpio_t)&dfu);
+            gpio_clear((gpio_t)&dfu);
 
-            delay(50 * 40800);
+            delay_us(50 * 40800);
 
             RESET_CTRL0 = (1 << 0);
             break;
