@@ -130,6 +130,8 @@ set(CSRC
 	${HACKRF_PATH}/firmware/common/usb_standard_request.c
 	${HACKRF_PATH}/firmware/libopencm3/lib/lpc43xx/scu.c
 	${HACKRF_PATH}/firmware/common/gpio_lpc.c
+	${HACKRF_PATH}/firmware/common/delay.c
+	${HACKRF_PATH}/firmware/common/cpu_clock.c
 	${HACKRF_PATH}/firmware/common/platform_detect.c
 	${CHIBIOS}/os/various/chprintf.c
 )
