@@ -65,7 +65,7 @@ if(BOARD STREQUAL "PRALINE")
 	# NOTE: Dependencies break if the .bin files aren't included in DEPENDS. WTF, CMake?
 	add_custom_command(
 		OUTPUT ${FIRMWARE_FILENAME}
-		COMMAND ${MAKE_SPI_IMAGE} ${application_BINARY_DIR}/application.bin ${baseband_BINARY_DIR}/baseband.img ${FIRMWARE_FILENAME} ${FLASH_BYTES_LIMIT_SIZE}
+		COMMAND python3 ${MAKE_SPI_IMAGE} ${application_BINARY_DIR}/application.bin ${baseband_BINARY_DIR}/baseband.img ${FIRMWARE_FILENAME} ${FLASH_BYTES_LIMIT_SIZE}
 		# PRALINE: Append FPGA bitstream to firmware at offset 0x380000
 		# The base firmware is 3.5MB, FPGA bitstream gets appended at the end of it, final size is 4MB
 		COMMAND ${CMAKE_COMMAND} -E echo "Appending PRALINE FPGA bitstream to firmware..."
@@ -80,7 +80,7 @@ else() # Sadly this part had to be duplicated (or at least I couldn't find a bet
 	# NOTE: Dependencies break if the .bin files aren't included in DEPENDS. WTF, CMake?
 	add_custom_command(
 		OUTPUT ${FIRMWARE_FILENAME}
-		COMMAND ${MAKE_SPI_IMAGE} ${application_BINARY_DIR}/application.bin ${baseband_BINARY_DIR}/baseband.img ${FIRMWARE_FILENAME} ${FLASH_BYTES_LIMIT_SIZE}
+		COMMAND python3 ${MAKE_SPI_IMAGE} ${application_BINARY_DIR}/application.bin ${baseband_BINARY_DIR}/baseband.img ${FIRMWARE_FILENAME} ${FLASH_BYTES_LIMIT_SIZE}
 		DEPENDS baseband application ${MAKE_SPI_IMAGE}
 			${baseband_BINARY_DIR}/baseband.img ${application_BINARY_DIR}/application.bin
 		VERBATIM
