@@ -1,3 +1,5 @@
+#include <stddef.h>
+
 #include "gpio.h"
 #include "gpio_lpc.h"
 
@@ -36,7 +38,7 @@ static struct gpio gpio_led[] = {
  * Flash: ~24 bytes
  */
 static void leds_init(void) {
-    for (size_t i = 0; i < sizeof(gpio_led) / sizeof(gpio_led[0]); i++) {
+    for (size_t i = 0u; i < sizeof(gpio_led) / sizeof(gpio_led[0]); i++) {
         gpio_output((gpio_t)&gpio_led[i]);
     }
 }
