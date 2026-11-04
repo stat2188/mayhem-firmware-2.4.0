@@ -433,6 +433,5 @@ if(NOT BOARD STREQUAL "PRALINE")
                external/sdusb/main.cpp
                external/sdusb/ui_sd_over_usb.cpp
        )
-       list(APPEND EXTAPPLIST sdusb)
 endif()
 
