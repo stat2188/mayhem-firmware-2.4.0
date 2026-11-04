@@ -71,18 +71,15 @@ template<LockOrder ORDER>
 class MutexLock {
 public:
     explicit MutexLock(Mutex& mutex) noexcept
-        : mutex_(mutex), locked_(true) {
+        : mutex_(mutex) {
         chMtxLock(&mutex_);
     }
 
     ~MutexLock() noexcept {
-        if (locked_) {
-            // ChibiOS 3.0 API used by this firmware: chMtxUnlock() takes NO
-            // argument and releases the most recently acquired mutex of the
-            // calling thread. Passing &mutex_ does not compile against
-            // firmware/chibios/os/kernel/include/chmtx.h (Mutex *chMtxUnlock(void)).
-            (void)chMtxUnlock();
-        }
+        // Unconditional unlock: chMtxLock() does not return on failure, so
+        // the object always owns exactly one lock on construction (the old
+        // locked_ flag was a constant true — dead state).
+        chMtxUnlock();
     }
 
     MutexLock(const MutexLock&) = delete;
@@ -92,7 +89,6 @@ public:
 
 private:
     Mutex& mutex_;
-    bool locked_;
 };
 
 template<LockOrder ORDER>
@@ -103,9 +99,7 @@ public:
 
     ~MutexTryLock() noexcept {
         if (locked_) {
-            // Same ChibiOS 3.0 contract as MutexLock: unlock the last mutex
-            // acquired by this thread (no argument).
-            (void)chMtxUnlock();
+            chMtxUnlock();
         }
     }
 
