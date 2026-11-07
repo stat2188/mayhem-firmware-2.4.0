@@ -147,7 +147,7 @@ set(CPPSRC
 	${COMMON}/adsb.cpp
 	${COMMON}/adsb_frame.cpp
 	${COMMON}/ais_baseband.cpp
-	${COMMON}/ais_packet.cpp
+	# ${COMMON}/ais_packet.cpp
 	${COMMON}/ak4951.cpp
 	${COMMON}/backlight.cpp
 	${COMMON}/baseband_cpld.cpp
@@ -178,7 +178,7 @@ set(CPPSRC
 	${COMMON}/portapack_io.cpp
 	${COMMON}/portapack_persistent_memory.cpp
 	${COMMON}/portapack_shared_memory.cpp
-	${COMMON}/sonde_packet.cpp
+	# ${COMMON}/sonde_packet.cpp
 	# ${COMMON}/test_packet.cpp
 	${COMMON}/tpms_packet.cpp
 	${COMMON}/ui.cpp
@@ -281,14 +281,14 @@ set(CPPSRC
 	ui/ui_tone_key.cpp
 	ui/ui_transmitter.cpp
 	ui/ui_bmpview.cpp
-	apps/ais_app.cpp
+	# apps/ais_app.cpp
 	apps/analog_audio_app.cpp
 	apps/ble_rx_app.cpp
 	apps/ble_tx_app.cpp
 	apps/capture_app.cpp
 	apps/pocsag_app.cpp
 	apps/ui_about_simple.cpp
-	apps/ui_adsb_rx.cpp
+	# apps/ui_adsb_rx.cpp
 	apps/ui_aprs_rx.cpp
 	apps/ui_aprs_tx.cpp
 	apps/ui_battinfo.cpp
@@ -312,7 +312,7 @@ set(CPPSRC
 	apps/ui_recon.cpp
 	apps/ui_search.cpp
 	apps/ui_settings.cpp
-	apps/ui_sonde.cpp
+	# apps/ui_sonde.cpp
 	apps/ui_ss_viewer.cpp
 	apps/ui_standalone_view.cpp
 	apps/ui_subghzd.cpp
@@ -320,7 +320,7 @@ set(CPPSRC
 	apps/ui_text_editor.cpp
 	apps/ui_touch_calibration.cpp
 	apps/ui_touchtunes.cpp
-	apps/ui_weatherstation.cpp
+	# apps/ui_weatherstation.cpp
 	apps/enhanced_drone_analyzer/audio_alerts.cpp
 	apps/enhanced_drone_analyzer/database.cpp
 	apps/enhanced_drone_analyzer/drone_display.cpp

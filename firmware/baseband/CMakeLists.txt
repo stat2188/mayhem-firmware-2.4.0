@@ -282,7 +282,15 @@ macro(DeclareTargets chunk_tag name)
 	set_source_files_properties(${MODE_CPPSRC} PROPERTIES COMPILE_FLAGS "${MODE_FLAGS}")
 	add_executable(${PROJECT_NAME}.elf $<TARGET_OBJECTS:baseband_shared> ${MODE_CPPSRC} ${HALSRC} ${PLATFORMSRC})
 	set_target_properties(${PROJECT_NAME}.elf PROPERTIES LINK_DEPENDS ${LDSCRIPT})
-	add_definitions(${DEFS})
+	# NOTE: rules.cmake is re-included on every DeclareTargets() call and it
+	# re-appends DDEFS each time. add_definitions() with a value containing
+	# spaces/quotes lands in COMPILE_OPTIONS (not deduplicated), so the whole
+	# define string would be repeated ~53x and exceed the Windows 8191-char
+	# command line limit. Add it only once for the whole directory.
+	if(NOT BASEBAND_DEFS_ADDED)
+		add_definitions(${DEFS})
+		set(BASEBAND_DEFS_ADDED TRUE)
+	endif()
 	target_compile_definitions(${PROJECT_NAME}.elf PUBLIC "-DBASEBAND_${name}")
 	include_directories(. ${INCDIR} ${MODE_INCDIR})
 	link_directories(${LLIBDIR})
@@ -327,10 +335,10 @@ set(MODE_FLAGS "-O3")
 
 ### ADS-B RX
 
-set(MODE_CPPSRC
-	proc_adsbrx.cpp
-)
-DeclareTargets(PADR adsbrx)
+# set(MODE_CPPSRC
+# 	proc_adsbrx.cpp
+# )
+# DeclareTargets(PADR adsbrx)
 
 
 ### AFSK TX
@@ -364,10 +372,10 @@ DeclareTargets(PBTT btletx)
 
 ### AIS
 
-set(MODE_CPPSRC
-	proc_ais.cpp
-)
-DeclareTargets(PAIS ais)
+# set(MODE_CPPSRC
+# 	proc_ais.cpp
+# )
+# DeclareTargets(PAIS ais)
 
 ### AM Audio
 
@@ -393,17 +401,18 @@ DeclareTargets(PERT ert)
 
 ### Radiosonde
 
-set(MODE_CPPSRC
-	proc_sonde.cpp
-)
-DeclareTargets(PSON sonde)
+# set(MODE_CPPSRC
+# 	proc_sonde.cpp
+# )
+# DeclareTargets(PSON sonde)
 
 ### FSK RX
 
-set(MODE_CPPSRC
-	proc_fsk_rx.cpp
-)
-DeclareTargets(PFSR fskrx)
+# Dead image: no run_image() caller anywhere in the tree (tag PFSR).
+# set(MODE_CPPSRC
+# 	proc_fsk_rx.cpp
+# )
+# DeclareTargets(PFSR fskrx)
 
 ### FSK TX
 
@@ -488,10 +497,10 @@ DeclareTargets(PSGD subghzd)
 
 
 ### Weather Stations
-set(MODE_CPPSRC
-	proc_weather.cpp
-)
-DeclareTargets(PWTH weather)
+# set(MODE_CPPSRC
+# 	proc_weather.cpp
+# )
+# DeclareTargets(PWTH weather)
 
 set(MODE_FLAGS "-Os")
 
